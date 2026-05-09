@@ -27,7 +27,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-from src.config import DB_PATH, TOP_N_SELECTION
+import joblib
+
+from src.config import DB_PATH, FEATURE_COLUMNS, MODEL_PATH, TOP_N_SELECTION
 from src.config_manager import CONFIG_PATH, config_manager
 from src.database import init_db, query_df
 from src.kline_chart import draw_candlestick, get_stock_kline_data
@@ -751,10 +753,10 @@ with tab_backtest:
                             st.code(st.session_state.backtest_last_log, language="text")
 
 with tab_perf:
-    st.subheader("📊 模型表现概览")
+    st.subheader("📊 模型表现与特征贡献度分析")
+    st.caption("分析当前激活模型的特征重要性（Feature Importance）以及回填收益率后的多维度胜率统计。")
 
     conn = sqlite3.connect(str(DB_PATH))
-
     perf_df = pd.read_sql_query(
         """
         SELECT trade_date, rank, stock_code, stock_name,
@@ -765,26 +767,91 @@ with tab_perf:
         """,
         conn,
     )
-
     model_df = pd.read_sql_query(
         """
-        SELECT version, train_end_date, is_active, created_at
+        SELECT version, train_end_date, is_active, features, metrics, created_at
         FROM model_versions
         ORDER BY created_at DESC
         LIMIT 5
         """,
         conn,
     )
-
     conn.close()
 
+    # ================= 1. 特征重要性分析模块 (Feature Importance) =================
+    st.subheader("🎯 因子贡献度排行 (Feature Importance)")
+
+    # 尝试加载当前磁盘模型并提取特征重要性（与 train 侧 joblib.dump 一致，使用 joblib.load）
+    if not MODEL_PATH.exists():
+        st.warning("⚠️ 找不到本地模型文件，请先在终端运行 train_model.py 训练模型。")
+    else:
+        try:
+            model = joblib.load(MODEL_PATH)
+
+            # 获取特征重要性
+            if hasattr(model, "feature_importances_"):
+                importances = model.feature_importances_
+            elif hasattr(model, "feature_importance"):
+                importances = model.feature_importance()
+            else:
+                importances = None
+
+            if importances is not None:
+                # 构造特征重要性 DataFrame
+                feat_imp_df = pd.DataFrame({
+                    "Feature": FEATURE_COLUMNS,
+                    "Importance": importances
+                })
+                # 按重要性从大到小排序
+                feat_imp_df = feat_imp_df.sort_values("Importance", ascending=True)
+
+                # 使用 Plotly 绘制霓虹风格的水平条形图
+                import plotly.graph_objects as go
+
+                fig_imp = go.Figure()
+                fig_imp.add_trace(go.Bar(
+                    y=feat_imp_df["Feature"],
+                    x=feat_imp_df["Importance"],
+                    orientation='h',
+                    marker=dict(
+                        color=feat_imp_df["Importance"],
+                        colorscale=[[0, 'rgba(0, 255, 204, 0.2)'], [1, 'rgba(0, 255, 204, 1.0)']],
+                        line=dict(color='#00FFCC', width=1.5)
+                    ),
+                    name="因子分裂次数"
+                ))
+
+                fig_imp.update_layout(
+                    title="模型决策树分裂频次排行 (分值越高代表因子越核心)",
+                    template="plotly_dark",
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.08)'),
+                    yaxis=dict(showgrid=False),
+                    height=450,
+                    margin=dict(l=120, r=20, t=40, b=40)
+                )
+                st.plotly_chart(fig_imp, use_container_width=True)
+            else:
+                st.info("无法从当前保存的模型中解析特征重要性指标。")
+        except Exception as e:
+            st.error(f"解析特征重要性时出错: {e}")
+
+    st.markdown("---")
+
+    # ================= 2. 最近模型版本展示 =================
     if len(model_df) > 0:
-        st.subheader("🧩 最近模型版本")
-        st.dataframe(model_df, use_container_width=True, hide_index=True)
+        st.subheader("🧩 最近模型版本历史")
+        # 简单清洗数据展示
+        display_model_df = model_df.copy()
+        if "features" in display_model_df.columns:
+            display_model_df = display_model_df.drop(columns=["features"], errors="ignore")
+        st.dataframe(display_model_df, use_container_width=True, hide_index=True)
         st.markdown("---")
 
+    # ================= 3. 回填数据统计看板 =================
     if len(perf_df) > 0:
-        st.subheader("📈 核心指标")
+        st.subheader("📈 历史回填数据核心指标")
 
         col1, col2, col3, col4, col5 = st.columns(5)
 
@@ -857,14 +924,19 @@ with tab_perf:
                 nbins=30,
                 title="次日收益率分布",
                 labels={"next_day_return": "次日收益率", "count": "频次"},
-                color_discrete_sequence=["#667eea"],
+                color_discrete_sequence=["#00FFCC"], # 统一为霓虹青色
             )
             fig_hist.add_vline(x=0, line_dash="dash", line_color="red")
-            fig_hist.update_layout(height=400)
+            fig_hist.update_layout(
+                template="plotly_dark",
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                height=400
+            )
             st.plotly_chart(fig_hist, use_container_width=True)
-        except ImportError:
+        except Exception:
             fig, ax = plt.subplots(figsize=(10, 4))
-            ax.hist(perf_df["next_day_return"], bins=20, edgecolor="black", color="#667eea")
+            ax.hist(perf_df["next_day_return"], bins=20, edgecolor="black", color="#00FFCC")
             ax.axvline(x=0, color="r", linestyle="--", linewidth=2)
             ax.set_xlabel("次日收益率")
             ax.set_ylabel("频次")
@@ -896,21 +968,26 @@ with tab_perf:
                     markers=True,
                 )
                 fig_line.add_hline(y=0, line_dash="dash", line_color="red")
+                fig_line.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                )
                 st.plotly_chart(fig_line, use_container_width=True)
-            except ImportError:
+            except Exception:
                 st.line_chart(daily_avg.set_index("日期")["平均收益"])
         else:
             st.info("需要至少2个交易日的数据才能显示趋势图")
 
     else:
-        st.info("📭 暂无收益率数据")
+        st.info("📭 暂无真实选股后回填的收益率数据。")
         st.markdown(
             """
-### 如何获取收益率数据？
+### 如何获取实际收益率数据？
 
-1. **等待下一个交易日**：选股后需要等到次日收盘才能计算收益。
-2. **手动运行更新脚本**：在项目目录执行 `python scripts/update_returns.py`。
-3. **查看选股记录**：切换到「历史复盘」查看已选股票。
+1. **执行每日选股**：运行 `run_daily.py` 写入预测股票。
+2. **等待下一个交易日**：选股后需要等到次日收盘才能计算真实收益。
+3. **点击更新**：在「数据管理」Tab 下点击「手动回填收益」按钮，或在项目根目录执行 `python scripts/update_returns.py`。
 """
         )
 

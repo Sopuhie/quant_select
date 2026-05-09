@@ -95,19 +95,30 @@ def train_lgbm_regressor(
     test_size: float = 0.15,
     random_state: int = 42,
 ) -> tuple[LGBMRegressor, dict[str, Any]]:
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLUMNS + ["label_ret"])
-    X = df[FEATURE_COLUMNS].to_numpy(dtype=np.float64)
-    y = df["label_ret"].to_numpy(dtype=np.float64)
-    finite = np.isfinite(X).all(axis=1) & np.isfinite(y)
-    X = X[finite]
-    y = y[finite]
+    """
+    使用带列名的 DataFrame 训练，保证底层 Booster 记录 feature_name，
+    落盘后的 pkl 可在 Streamlit 中通过 booster.feature_importance() / feature_name_ 读取重要性。
+    """
+    work = df.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=FEATURE_COLUMNS + ["label_ret"]
+    )
+    X_df = work[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    y_s = pd.to_numeric(work["label_ret"], errors="coerce")
+    x_vals = X_df.to_numpy(dtype=np.float64)
+    y_vals = y_s.to_numpy(dtype=np.float64)
+    finite = np.isfinite(x_vals).all(axis=1) & np.isfinite(y_vals)
+    X_df = X_df.loc[finite].reset_index(drop=True)
+    y = y_vals[finite]
     if len(y) < 100:
         raise RuntimeError(
             f"有效训练样本过少（{len(y)}），多为异常价或缺失导致；请换截止日期或增大股票池。"
         )
-    X_df = pd.DataFrame(X, columns=FEATURE_COLUMNS)
     X_train, X_val, y_train, y_val = train_test_split(
-        X_df, y, test_size=test_size, shuffle=True, random_state=random_state
+        X_df,
+        y,
+        test_size=test_size,
+        shuffle=True,
+        random_state=random_state,
     )
     model = LGBMRegressor(**LGB_PARAMS, n_estimators=500)
     model.fit(
@@ -133,7 +144,29 @@ def train_lgbm_regressor(
     return model, metrics
 
 
+def feature_importance_table(
+    model: LGBMRegressor,
+    importance_type: str = "gain",
+) -> pd.DataFrame:
+    """
+    从已拟合的 LGBMRegressor 读取特征重要性，供 UI 展示。
+    名称以 Booster.feature_name() 为准；若为 Column_* 且长度与 FEATURE_COLUMNS 一致则回退为配置列名。
+    """
+    booster = model.booster_
+    names = list(booster.feature_name())
+    imp = booster.feature_importance(importance_type=importance_type)
+    if (
+        names
+        and all(str(n).startswith("Column_") for n in names)
+        and len(names) == len(FEATURE_COLUMNS)
+    ):
+        names = list(FEATURE_COLUMNS)
+    out = pd.DataFrame({"feature": names, "importance": imp.astype(float)})
+    return out.sort_values("importance", ascending=False).reset_index(drop=True)
+
+
 def save_model(model: LGBMRegressor, path: Path | None = None) -> Path:
+    """序列化 LGBMRegressor（含 Booster 与特征名）。训练时请传入列名为 FEATURE_COLUMNS 的 DataFrame。"""
     p = path or MODEL_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, p)
