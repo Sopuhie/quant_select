@@ -1,12 +1,16 @@
 """
-Streamlit 复盘界面（暗黑霓虹科技风最终整合版）。
-
-启动（在 quant_select 目录下）:
-  streamlit run app.py
+Streamlit 复盘与全功能控制台（暗黑霓虹科技风最终整合版）。
+支持一键在界面运行：
+  1. 增量/全量数据拉取（连通性探测）
+  2. 模型重新训练
+  3. 每日选股预测
+  4. 历史收益回填
+  5. 2024 滚动回测
 """
 from __future__ import annotations
 
 import io
+import locale
 import os
 import platform
 import sqlite3
@@ -22,7 +26,6 @@ import joblib
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
@@ -32,9 +35,8 @@ from src.config import DATA_DIR, DB_PATH, FEATURE_COLUMNS, MODEL_PATH, TOP_N_SEL
 from src.config_manager import config_manager
 from src.database import init_db, query_df
 from src.kline_chart import draw_candlestick, get_stock_kline_data
-from src.predictor import is_st_stock_row
 
-BACKTEST_CSV_PATH = DATA_DIR / "backtest_results.csv"
+DEFAULT_TRAIN_END_DATE = os.environ.get("QUANT_TRAIN_END_DATE", "2024-12-31")
 
 # ================= 1. 全局页面配置 =================
 st.set_page_config(
@@ -45,35 +47,31 @@ st.set_page_config(
 init_db()
 
 # ================= 2. 定义全局酷炫 Plotly 绘图模板 =================
-PLOTLY_CYBER_TEMPLATE = "plotly_dark"
-COLOR_CYBER_TEAL = "#00FFCC"
-COLOR_CYBER_ORANGE = "#FF9900"
+COLOR_CYBER_TEAL = "#00FFCC"  # 霓虹青色
+COLOR_CYBER_ORANGE = "#FF9900"  # 基准橙色线
 COLOR_TEXT = "#8f9cae"
-COLOR_GRID = "rgba(255, 255, 255, 0.05)"
+COLOR_GRID = "rgba(255, 255, 255, 0.04)"  # 非常淡的网格
 
 
-def get_cyber_layout(title: str = "图表名称", *, y_pct_suffix: bool = True) -> go.Layout:
-    y_axis = dict(
-        showgrid=True,
-        gridcolor=COLOR_GRID,
-        zeroline=False,
-        linecolor=COLOR_GRID,
-    )
-    if y_pct_suffix:
-        y_axis["suffix"] = "%"
+def get_cyber_layout(title: str = "图表名称") -> go.Layout:
     return go.Layout(
         title=title,
-        template=PLOTLY_CYBER_TEMPLATE,
+        template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color=COLOR_TEXT),
         xaxis=dict(
+            showgrid=False,
+            linecolor=COLOR_GRID,
+            tickfont=dict(color="#8f9cae"),
+        ),
+        yaxis=dict(
             showgrid=True,
             gridcolor=COLOR_GRID,
             zeroline=False,
             linecolor=COLOR_GRID,
+            tickfont=dict(color="#8f9cae"),
         ),
-        yaxis=y_axis,
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -119,10 +117,11 @@ st.markdown(
         background-color: #0d0e15;
     }
 
+    /* 指标卡片玻璃拟态 */
     [data-testid="stMetricValue"] {
         font-family: 'Courier New', Courier, monospace;
         color: #00FFCC !important;
-        text-shadow: 0 0 10px rgba(0, 255, 204, 0.5);
+        text-shadow: 0 0 10px rgba(0, 255, 204, 0.4);
         font-size: 1.8rem !important;
         font-weight: bold;
     }
@@ -131,18 +130,14 @@ st.markdown(
         font-size: 0.9rem !important;
     }
     [data-testid="stMetric"] {
-        background: rgba(30, 34, 51, 0.4);
+        background: rgba(30, 34, 51, 0.3);
         border: 1px solid rgba(0, 255, 204, 0.15);
         border-radius: 10px;
         padding: 12px 20px;
         box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-        transition: all 0.3s ease;
-    }
-    [data-testid="stMetric"]:hover {
-        border-color: rgba(0, 255, 204, 0.6);
-        box-shadow: 0 0 15px rgba(0, 255, 204, 0.2);
     }
 
+    /* 选项卡美化 */
     .stTabs [data-baseweb="tab-list"] {
         gap: 10px;
         background-color: rgba(30, 34, 51, 0.3);
@@ -164,17 +159,89 @@ st.markdown(
         border-bottom: 2px solid #00FFCC !important;
         text-shadow: 0 0 5px rgba(0, 255, 204, 0.3);
     }
+
+    /* 按钮微调：突出主按钮的霓虹感 */
+    .stButton>button {
+        background-color: rgba(30, 34, 51, 0.5);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        color: #ffffff;
+        transition: all 0.3s;
+    }
+    .stButton>button:hover {
+        border-color: #00FFCC;
+        color: #00FFCC;
+        box-shadow: 0 0 8px rgba(0, 255, 204, 0.2);
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ================= 4. 头部标题栏 =================
+
+# ================= 4. 辅助执行函数 (带实时日志捕获) =================
+def _decode_subprocess_stdout(chunk: bytes) -> str:
+    """Windows 控制台常为 GBK/CP936，子进程若未开 UTF-8 模式会乱码；此处做多编码兜底。"""
+    if not chunk:
+        return ""
+    for enc in ("utf-8-sig", "utf-8"):
+        try:
+            return chunk.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    pref = (locale.getpreferredencoding(False) or "").strip()
+    if pref and pref.lower() not in ("utf-8", "utf8"):
+        try:
+            return chunk.decode(pref)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    for enc in ("gbk", "cp936"):
+        try:
+            return chunk.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return chunk.decode("utf-8", errors="replace")
+
+
+def run_command_interactive(args: list[str]) -> tuple[int, str]:
+    """执行后台脚本，实时捕获标准输出并在 streamlit 端展示。"""
+    placeholder = st.empty()
+    log_stream: list[str] = []
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    # 强制子进程 Python 使用 UTF-8 标准输出（Windows 默认常为 GBK，会导致父进程按 UTF-8 读时乱码）
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    if sys.platform == "win32":
+        env.setdefault("PYTHONUTF8", "1")
+
+    process = subprocess.Popen(
+        args,
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        env=env,
+    )
+
+    assert process.stdout is not None
+    while True:
+        raw = process.stdout.readline()
+        if not raw and process.poll() is not None:
+            break
+        if raw:
+            line = _decode_subprocess_stdout(raw)
+            log_stream.append(line)
+            placeholder.code("".join(log_stream[-25:]), language="bash")
+
+    returncode = process.wait()
+    return returncode, "".join(log_stream)
+
+
+# ================= 5. 头部标题栏 =================
 st.markdown(
     """
     <div style="display: flex; align-items: center; margin-bottom: 25px;">
         <div style="background-color: #00FFCC; width: 6px; height: 35px; border-radius: 3px; margin-right: 15px; box-shadow: 0 0 10px #00FFCC;"></div>
-        <h1 style="color: #ffffff; margin: 0; font-family: 'Segoe UI', sans-serif; font-weight: 800; letter-spacing: 1px;">A-QUANT LITE <span style="color: #00FFCC; font-size: 1.2rem; font-weight: 400;">智能选股控制台</span></h1>
+        <h1 style="color: #ffffff; margin: 0; font-family: 'Segoe UI', sans-serif; font-weight: 800; letter-spacing: 1px;">A-QUANT LITE <span style="color: #00FFCC; font-size: 1.2rem; font-weight: 400;">智能选股控制舱</span></h1>
     </div>
     """,
     unsafe_allow_html=True,
@@ -211,15 +278,17 @@ def _sanitize_latest_selection(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str
         msgs.append("检测到同一 rank 对应多只股票，已保留该 rank 下 score 较高的一条。")
 
     if len(out) > TOP_N_SELECTION:
-        msgs.append(f"检测到超过 {TOP_N_SELECTION} 条有效记录，仅展示前 {TOP_N_SELECTION} 条。")
+        msgs.append(
+            f"检测到超过 {TOP_N_SELECTION} 条有效记录，仅展示前 {TOP_N_SELECTION} 条。"
+        )
         out = out.head(TOP_N_SELECTION).reset_index(drop=True)
 
     return out, msgs
 
 
-# ================= 5. 核心功能选项卡定义 =================
-tab_today, tab_hist, tab_backtest, tab_perf, tab_data, tab_pred, tab_settings = st.tabs(
-    ["今日推荐", "历史复盘", "📈 历史回测", "模型表现", "数据管理", "全市场预测", "⚙️ 系统设置"]
+# ================= 6. 选项卡定义 =================
+tab_today, tab_hist, tab_backtest, tab_perf, tab_data, tab_settings = st.tabs(
+    ["🎯 今日推荐", "📜 历史复盘", "📈 历史回测", "⚡ 模型表现", "⚙️ 系统控制台", "🔧 环境设置"]
 )
 
 # ----------------- TAB 1: 今日推荐 -----------------
@@ -227,16 +296,13 @@ with tab_today:
     t3 = _latest_top3()
     today_df, selection_warnings = _sanitize_latest_selection(t3)
     if t3.empty:
-        st.info("暂无选股记录。请先完成训练并运行 run_daily.py。")
+        st.info("暂无选股记录。请先在「系统控制台」中运行数据更新与预测。")
     else:
         latest_date = t3.iloc[0]["trade_date"]
         st.subheader(f"📅 最近交易日 · {latest_date}")
 
         for w in selection_warnings:
             st.warning(w)
-
-        if len(today_df) != TOP_N_SELECTION:
-            st.info(f"{latest_date} 暂无完整的 Top{TOP_N_SELECTION} 选股展示数据。")
 
         if "selected_stock" not in st.session_state:
             st.session_state.selected_stock = None
@@ -256,7 +322,6 @@ with tab_today:
                             margin: 10px 0;
                             text-align: center;
                             box-shadow: 0 4px 20px rgba(0, 255, 204, 0.15);
-                            transition: transform 0.3s ease;
                         ">
                             <span style="
                                 background-color: #00FFCC;
@@ -307,8 +372,11 @@ with tab_today:
                     st.session_state.selected_stock = None
                     st.rerun()
 
-            with st.spinner("加载约一年（默认 365 日窗口）K 线数据…"):
-                df_kline = get_stock_kline_data(st.session_state.selected_stock["code"])
+            with st.spinner("加载K线数据中..."):
+                df_kline = get_stock_kline_data(
+                    st.session_state.selected_stock["code"],
+                    days=365,
+                )
 
             if df_kline is not None and len(df_kline) > 0:
                 fig = draw_candlestick(
@@ -317,11 +385,6 @@ with tab_today:
                     st.session_state.selected_stock["name"],
                 )
                 if fig:
-                    cyber = get_cyber_layout(
-                        f"{st.session_state.selected_stock['code']} K线",
-                        y_pct_suffix=False,
-                    )
-                    fig.update_layout(cyber, height=600)
                     st.plotly_chart(fig, use_container_width=True)
 
                     latest = df_kline.iloc[-1]
@@ -351,8 +414,6 @@ with tab_today:
                         )
                 else:
                     st.error("绘制K线图失败")
-            else:
-                st.error("无法获取K线数据，请检查网络或数据源")
 
 # ----------------- TAB 2: 历史复盘 -----------------
 with tab_hist:
@@ -389,22 +450,14 @@ with tab_hist:
             selected_code = sel_row["stock_code"]
             selected_name = sel_row["stock_name"]
 
-            with st.spinner(
-                f"加载 {selected_code} {selected_name} 约一年（默认 365 日）K 线…"
-            ):
-                df_kline = get_stock_kline_data(selected_code)
+            with st.spinner(f"加载 {selected_code} {selected_name} K线数据..."):
+                df_kline = get_stock_kline_data(selected_code, days=365)
             if df_kline is not None and len(df_kline) > 0:
                 fig = draw_candlestick(df_kline, selected_code, selected_name)
                 if fig:
-                    fig.update_layout(
-                        get_cyber_layout(f"{selected_code} K线复盘", y_pct_suffix=False),
-                        height=600,
-                    )
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.error("绘制K线图失败")
-            else:
-                st.error("无法获取K线数据，请检查网络或数据源")
 
         st.markdown("---")
         display_df = history_df.drop(columns=["display"], errors="ignore").copy()
@@ -420,48 +473,13 @@ with tab_backtest:
     st.subheader("📈 策略历史回测分析")
     st.caption("基于 LightGBM 历史滚动预测与周期换仓策略（2024 样本外滚动）。")
 
-    if not BACKTEST_CSV_PATH.exists():
-        st.info("📊 尚未生成历史回测数据。点击下方按钮运行 2024 全年滚动回测。")
-        col_run, _ = st.columns([2, 3])
-        with col_run:
-            if st.button(
-                "🚀 开始历史滚动回测 (LGB + 周期换仓)",
-                type="primary",
-                use_container_width=True,
-            ):
-                with st.spinner("回测执行中，请耐心等待..."):
-                    try:
-                        res = subprocess.run(
-                            [
-                                sys.executable,
-                                str(ROOT / "scripts" / "backtest.py"),
-                                "--start-date",
-                                "2024-01-01",
-                                "--end-date",
-                                "2024-12-31",
-                            ],
-                            cwd=str(ROOT),
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                            check=False,
-                        )
-                        if res.returncode == 0:
-                            st.success(
-                                "✅ 回测执行成功！已成功生成 data/backtest_results.csv"
-                            )
-                            st.rerun()
-                        else:
-                            st.error("❌ 回测执行失败，错误日志如下：")
-                            log = (res.stderr or "") + "\n" + (res.stdout or "")
-                            st.code(log.strip() or "(无输出)")
-                    except Exception as ex:
-                        st.error(f"❌ 执行异常: {ex}")
+    backtest_csv_path = DATA_DIR / "backtest_results.csv"
+
+    if not backtest_csv_path.exists():
+        st.info("📊 尚未生成历史回测数据。请前往「系统控制台」中运行历史回测。")
     else:
         try:
-            df_res = pd.read_csv(BACKTEST_CSV_PATH)
-
+            df_res = pd.read_csv(backtest_csv_path)
             df_res["strategy_cum"] = (
                 df_res["nav"] / df_res["nav"].iloc[0] - 1.0
             ) * 100
@@ -481,9 +499,13 @@ with tab_backtest:
             peak = df_res["nav"].cummax()
             mdd = (df_res["nav"] / peak - 1.0).min()
 
-            col_m1, col_m2 = st.columns(2)
-            col_m1.metric("策略累计收益", f"{cum_ret * 100:.2f}%")
-            col_m2.metric("最大回撤 (MDD)", f"{mdd * 100:.2f}%")
+            col_m1, col_m2, col_m3 = st.columns(3)
+            with col_m1:
+                st.metric("策略累计收益", f"{cum_ret * 100:.2f}%")
+            with col_m2:
+                st.metric("最大回撤 (MDD)", f"{mdd * 100:.2f}%")
+            with col_m3:
+                st.metric("回测交易日数", f"{len(df_res)}")
 
             fig = go.Figure()
             draw_cyber_area_trace(
@@ -506,37 +528,25 @@ with tab_backtest:
                 )
 
             fig.update_layout(
-                get_cyber_layout("策略 vs 沪深300 累计收益率 (%)", y_pct_suffix=True),
-                height=550,
+                get_cyber_layout("策略 vs 沪深300 累计收益率 (%)"), height=550
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("---")
-            c_btn1, c_btn2, _ = st.columns([1.5, 1.5, 7])
-            with c_btn1:
-                if st.button("🔄 重新执行回测", use_container_width=True):
-                    BACKTEST_CSV_PATH.unlink(missing_ok=True)
-                    st.rerun()
-            with c_btn2:
-                buf_res = io.StringIO()
-                df_res.to_csv(buf_res, index=False)
-                st.download_button(
-                    "💾 导出回测 CSV",
-                    data=buf_res.getvalue().encode("utf-8-sig"),
-                    file_name="backtest_results_export.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+            buf_res = io.StringIO()
+            df_res.to_csv(buf_res, index=False)
+            st.download_button(
+                "💾 导出回测 CSV",
+                data=buf_res.getvalue().encode("utf-8-sig"),
+                file_name="backtest_results_export.csv",
+                mime="text/csv",
+            )
 
         except Exception as err:
             st.error(f"解析回测数据出错: {err}")
-            if st.button("🧹 清理损坏的回测缓存"):
-                BACKTEST_CSV_PATH.unlink(missing_ok=True)
-                st.rerun()
 
 # ----------------- TAB 4: 模型表现 -----------------
 with tab_perf:
-    st.subheader("📊 模型特征贡献度分析")
+    st.subheader("⚡ 模型特征贡献度分析")
 
     conn = sqlite3.connect(str(DB_PATH))
     model_df = pd.read_sql_query(
@@ -548,7 +558,7 @@ with tab_perf:
     st.subheader("🎯 因子贡献度排行 (Feature Importance)")
 
     if not MODEL_PATH.exists():
-        st.warning("⚠️ 找不到本地模型文件。")
+        st.warning("⚠️ 找不到本地模型文件。请在「系统控制台」中启动模型训练。")
     else:
         try:
             model = joblib.load(MODEL_PATH)
@@ -561,38 +571,55 @@ with tab_perf:
                 importances = None
 
             if importances is not None:
-                feat_imp_df = pd.DataFrame(
-                    {"Feature": FEATURE_COLUMNS, "Importance": importances}
+                imp_arr = (
+                    importances
+                    if hasattr(importances, "__len__")
+                    else list(importances)
                 )
-                feat_imp_df = feat_imp_df.sort_values("Importance", ascending=True)
-
-                fig_imp = go.Figure()
-                fig_imp.add_trace(
-                    go.Bar(
-                        y=feat_imp_df["Feature"],
-                        x=feat_imp_df["Importance"],
-                        orientation="h",
-                        marker=dict(
-                            color=feat_imp_df["Importance"],
-                            colorscale=[
-                                [0, "rgba(0, 255, 204, 0.2)"],
-                                [1, "rgba(0, 255, 204, 1.0)"],
-                            ],
-                            line=dict(color=COLOR_CYBER_TEAL, width=1.5),
-                        ),
-                        name="因子分裂次数",
+                n = min(len(imp_arr), len(FEATURE_COLUMNS))
+                if n == 0:
+                    st.info("特征重要性长度为 0。")
+                else:
+                    if len(imp_arr) != len(FEATURE_COLUMNS):
+                        st.warning(
+                            "模型特征数与配置 FEATURE_COLUMNS 不一致，已按较短一侧截取展示。"
+                        )
+                    feat_imp_df = pd.DataFrame(
+                        {
+                            "Feature": FEATURE_COLUMNS[:n],
+                            "Importance": list(imp_arr)[:n],
+                        }
                     )
-                )
+                    feat_imp_df = feat_imp_df.sort_values(
+                        "Importance", ascending=True
+                    )
 
-                fig_imp.update_layout(
-                    get_cyber_layout(
-                        "模型决策树分裂频次排行 (分值越高代表因子越核心)",
-                        y_pct_suffix=False,
-                    ),
-                    xaxis=dict(showgrid=True, gridcolor=COLOR_GRID),
-                    height=500,
-                )
-                st.plotly_chart(fig_imp, use_container_width=True)
+                    fig_imp = go.Figure()
+                    fig_imp.add_trace(
+                        go.Bar(
+                            y=feat_imp_df["Feature"],
+                            x=feat_imp_df["Importance"],
+                            orientation="h",
+                            marker=dict(
+                                color=feat_imp_df["Importance"],
+                                colorscale=[
+                                    [0, "rgba(0, 255, 204, 0.2)"],
+                                    [1, "rgba(0, 255, 204, 1.0)"],
+                                ],
+                                line=dict(color=COLOR_CYBER_TEAL, width=1.5),
+                            ),
+                            name="因子分裂次数",
+                        )
+                    )
+
+                    fig_imp.update_layout(
+                        get_cyber_layout(
+                            "模型决策树分裂频次排行 (分值越高代表因子越核心)"
+                        ),
+                        xaxis=dict(showgrid=True, gridcolor=COLOR_GRID),
+                        height=500,
+                    )
+                    st.plotly_chart(fig_imp, use_container_width=True)
             else:
                 st.info("无法解析特征重要性指标。")
         except Exception as e:
@@ -602,185 +629,184 @@ with tab_perf:
     st.subheader("🧩 模型版本历史")
     st.dataframe(model_df, hide_index=True, use_container_width=True)
 
-# ----------------- TAB 5: 数据管理 -----------------
+# ----------------- TAB 5: ⚙️ 系统控制台 -----------------
 with tab_data:
-    n_sel = int(query_df("SELECT COUNT(*) AS c FROM daily_selections")["c"].iloc[0])
-    n_pred = int(query_df("SELECT COUNT(*) AS c FROM daily_predictions")["c"].iloc[0])
-    n_mv = int(query_df("SELECT COUNT(*) AS c FROM model_versions")["c"].iloc[0])
-    mx = query_df("SELECT MAX(trade_date) AS m FROM daily_selections")
-    mx_d = mx.iloc[0]["m"] if not mx.empty else None
+    st.subheader("⚙️ 量化核心任务总控制台")
+    st.caption("无需打开终端，在这里一键调度并监视所有后台算法与数据任务。")
 
-    st.markdown(f"**当前本地 SQLite 数据库路径**：`{DB_PATH}`")
+    row1_col1, row1_col2 = st.columns(2)
+    row2_col1, row2_col2 = st.columns(2)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("已选股票总记录", n_sel)
-    c2.metric("全市场预测总记录", n_pred)
-    c3.metric("训练模型总版本", n_mv)
-    c4.metric("最新选股日期", mx_d or "—")
-
-    mv_all = query_df(
-        "SELECT version, train_end_date, is_active, created_at FROM model_versions ORDER BY id DESC LIMIT 5"
-    )
-    st.subheader("🧩 最近注册的模型版本状态")
-    st.dataframe(mv_all, hide_index=True, use_container_width=True)
-
-    if st.button("🔄 手动回填历史推荐股票的真实收益率（次日 + 5日）", type="primary"):
-        try:
-            from src.return_updater import update_all_returns
-
-            with st.spinner("正在拉取行情并更新数据库…"):
-                out = update_all_returns()
-            st.success(f"收益率回填更新完成：{out}")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
-
-    full = query_df(
-        """
-        SELECT trade_date, rank, stock_code, stock_name, score, close_price,
-               next_day_return, hold_5d_return
-        FROM daily_selections
-        ORDER BY trade_date DESC, rank ASC
-        """
-    )
-    buf = io.StringIO()
-    full.to_csv(buf, index=False)
-    st.markdown("---")
-    st.download_button(
-        "💾 导出全部历史选股记录 CSV 文件",
-        data=buf.getvalue().encode("utf-8-sig"),
-        file_name="daily_selections_all.csv",
-        mime="text/csv",
-    )
-
-# ----------------- TAB 6: 全市场预测 -----------------
-with tab_pred:
-    st.caption(
-        "展示每日全市场股票打分结果（最近 30 个交易日）。历史数据已过滤并排除 ST 股票。"
-    )
-    hide_st = st.checkbox("隐藏 ST / 风险警示股票", value=True, key="hide_st_pred")
-    dates = query_df(
-        "SELECT DISTINCT trade_date FROM daily_predictions ORDER BY trade_date DESC LIMIT 30"
-    )
-    if dates.empty:
-        st.info("暂无预测记录。请先运行每日预测脚本。")
-    else:
-        pick = st.selectbox(
-            "选择交易日进行打分溯源", dates["trade_date"].tolist(), key="pred_date"
-        )
-        pred = query_df(
+    with row1_col1:
+        st.markdown(
             """
-            SELECT rank_in_market, stock_code, stock_name, score
-            FROM daily_predictions
-            WHERE trade_date = ?
-            ORDER BY rank_in_market ASC
-            LIMIT 500
+            <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
+                <h4 style="color: #00FFCC; margin-top:0;">📊 任务 A：更新本地数据池</h4>
+                <p style="font-size: 0.85rem; color: #8f9cae;">校验股票池与行情拉取连通性（并发拉 K 线样本）；不写入选股表。完整训练/预测会按需在线拉取并计算因子。</p>
+            </div>
             """,
-            (pick,),
+            unsafe_allow_html=True,
         )
-        if hide_st and not pred.empty:
-            mask = ~pred.apply(
-                lambda r: is_st_stock_row(r.get("stock_code"), r.get("stock_name")),
-                axis=1,
-            )
-            pred = pred[mask].reset_index(drop=True)
-            pred["rank_in_market"] = range(1, len(pred) + 1)
-        st.dataframe(pred, use_container_width=True, hide_index=True)
-
-# ----------------- TAB 7: 系统设置 -----------------
-with tab_settings:
-    st.subheader("⚙️ 系统状态与配置管理")
-
-    with st.expander("🔌 钉钉群机器人集成设置（暂不启用）"):
-        ding_config = config_manager.get_dingtalk_config()
-        time_options = ["09:30", "15:00", "16:00", "17:00", "18:00", "20:00"]
-        try:
-            send_time_index = time_options.index(ding_config.get("send_time", "16:00"))
-        except ValueError:
-            send_time_index = 2
-
-        with st.form("dingtalk_config_form"):
-            enabled = st.checkbox(
-                "启用钉钉自动推送", value=bool(ding_config.get("enabled", False))
-            )
-            webhook_url = st.text_input(
-                "Webhook 地址", value=ding_config.get("webhook_url", "")
-            )
-            secret = st.text_input(
-                "加签密钥（可选）",
-                value=ding_config.get("secret", ""),
-                type="password",
-            )
-            send_time = st.selectbox(
-                "期望推送时间（备忘）", options=time_options, index=send_time_index
-            )
-
-            c_save, c_test = st.columns(2)
-            with c_save:
-                submitted = st.form_submit_button(
-                    "💾 保存配置", use_container_width=True
+        data_btn = st.button(
+            "🚀 开始数据更新", key="run_data_update", use_container_width=True
+        )
+        if data_btn:
+            with st.spinner("正在拉取行情样本并校验连通性..."):
+                ret_code, _log = run_command_interactive(
+                    [sys.executable, str(ROOT / "run_daily.py"), "--only-data"]
                 )
-            with c_test:
-                test_btn = st.form_submit_button(
-                    "🔔 测试推送", use_container_width=True
-                )
-
-        if submitted:
-            if config_manager.set_dingtalk_config(
-                enabled, webhook_url, secret, send_time
-            ):
-                st.success("✅ 配置已保存")
-                st.rerun()
-
-        if test_btn:
-            try:
-                from src.dingtalk_notifier import DingTalkNotifier
-
-                if not webhook_url.strip():
-                    st.warning("请先填写 Webhook")
+                if ret_code == 0:
+                    st.success("✅ 数据连通性校验完成！")
                 else:
-                    DingTalkNotifier(
-                        webhook_url.strip(), secret.strip() or None
-                    ).send_text("A-Quant Lite：钉钉测试推送")
-                    st.success("已发送测试消息（若机器人正常应秒内收到）")
-            except Exception as ex:
-                st.error(f"测试失败: {ex}")
+                    st.error("❌ 任务执行异常，请查看上方实时日志")
+
+    with row1_col2:
+        st.markdown(
+            """
+            <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
+                <h4 style="color: #00FFCC; margin-top:0;">🎯 任务 B：重新训练选股模型</h4>
+                <p style="font-size: 0.85rem; color: #8f9cae;">读取本地流程采集的历史因子面板，使用 LightGBM 重训模型。截止日期默认 2024-12-31，可用环境变量 QUANT_TRAIN_END_DATE 覆盖。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        train_btn = st.button(
+            "🚀 开始模型训练", key="run_train", use_container_width=True
+        )
+        if train_btn:
+            with st.spinner("正在重新计算因子并重训模型..."):
+                ret_code, _log = run_command_interactive(
+                    [
+                        sys.executable,
+                        str(ROOT / "train_model.py"),
+                        "--train-end-date",
+                        DEFAULT_TRAIN_END_DATE,
+                    ]
+                )
+                if ret_code == 0:
+                    st.success("✅ 模型重训完成，最新模型权重已保存！")
+                else:
+                    st.error("❌ 训练执行异常，请查看日志")
+
+    with row2_col1:
+        st.markdown(
+            """
+            <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
+                <h4 style="color: #00FFCC; margin-top:0;">📡 任务 C：执行每日智能选股</h4>
+                <p style="font-size: 0.85rem; color: #8f9cae;">一键计算最新因子的中位数去极值（MAD）与标准化，并跑出今日 Top 推荐。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        predict_btn = st.button(
+            "🚀 运行每日预测", key="run_predict", use_container_width=True
+        )
+        if predict_btn:
+            with st.spinner("提取全市场实时因子，进行 LightGBM 测算中..."):
+                ret_code, _log = run_command_interactive(
+                    [sys.executable, str(ROOT / "run_daily.py")]
+                )
+                if ret_code == 0:
+                    st.success(
+                        "✅ 今日推荐选股计算完成！请前往「今日推荐」卡片查看。"
+                    )
+                else:
+                    st.error("❌ 预测执行异常，请查阅控制台")
+
+    with row2_col2:
+        st.markdown(
+            """
+            <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
+                <h4 style="color: #00FFCC; margin-top:0;">📈 任务 D：运行策略历史滚动回测</h4>
+                <p style="font-size: 0.85rem; color: #8f9cae;">执行 2024 全年样本外滚动回测，并自动输出累计收益与基准超额资产曲线。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        backtest_btn = st.button(
+            "🚀 启动历史滚动回测",
+            key="run_backtest_tab",
+            use_container_width=True,
+        )
+        if backtest_btn:
+            with st.spinner("滚动回测执行中，请耐心等待..."):
+                ret_code, _log = run_command_interactive(
+                    [sys.executable, str(ROOT / "scripts" / "backtest.py")]
+                )
+                if ret_code == 0:
+                    st.success(
+                        "✅ 回测完成！已成功生成 data/backtest_results.csv"
+                    )
+                else:
+                    st.error("❌ 回测异常，请查阅上方调试日志")
 
     st.markdown("---")
-    st.subheader("🖥️ 宿主运行环境状态检测")
+    st.subheader("🔄 任务 E：历史选股收益回填")
+    st.caption("对数据库中的历史推荐股票进行持股收益率自动追踪和数据补全。")
 
-    col_sys1, col_sys2, col_sys3 = st.columns(3)
+    col_ret1, col_ret2 = st.columns([3, 1])
+    with col_ret1:
+        st.info(
+            "回填工具会自动追踪历史选股后的 +1日收益率 和 +5日持有期累计收益率，从而精确评估算法胜率。"
+        )
+    with col_ret2:
+        return_btn = st.button(
+            "🚀 开始收益率回填",
+            key="run_return_update",
+            use_container_width=True,
+        )
+    if return_btn:
+        with st.spinner("正在调取接口，更新并回填历史选股收益率数据..."):
+            ret_code, _log = run_command_interactive(
+                [sys.executable, str(ROOT / "update_returns.py")]
+            )
+            if ret_code == 0:
+                st.success("✅ 历史收益率数据回填完成！")
+            else:
+                st.error("❌ 回填发生异常")
 
-    with col_sys1:
-        st.markdown(
-            f"""
-            <div style="background-color: #141622; border: 1px solid rgba(255, 255, 255, 0.05); padding: 15px; border-radius: 8px;">
-                <div style="color: #6272a4; font-size: 0.85rem;">操作系统架构</div>
-                <div style="color: #ffffff; font-weight: bold; font-family: monospace; font-size: 1.1rem; margin-top: 5px;">{platform.system()} ({platform.machine()})</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+# ----------------- TAB 6: 🔧 环境设置 -----------------
+with tab_settings:
+    st.subheader("⚙️ 宿主运行环境与系统配置")
+
+    with st.expander("🔔 钉钉报警推送设置"):
+        ding = config_manager.get_dingtalk_config()
+        enabled = st.checkbox(
+            "启用通知", value=bool(ding.get("enabled", False))
         )
-    with col_sys2:
-        st.markdown(
-            f"""
-            <div style="background-color: #141622; border: 1px solid rgba(255, 255, 255, 0.05); padding: 15px; border-radius: 8px;">
-                <div style="color: #6272a4; font-size: 0.85rem;">Python 解释器版本</div>
-                <div style="color: #ffffff; font-weight: bold; font-family: monospace; font-size: 1.1rem; margin-top: 5px;">{platform.python_version()}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        webhook_url = st.text_input(
+            "Webhook URL（完整 webhook 地址）",
+            value=str(ding.get("webhook_url", "") or ""),
         )
-    with col_sys3:
-        db_size_mb = 0.0
-        if Path(DB_PATH).exists():
-            db_size_mb = os.path.getsize(DB_PATH) / (1024 * 1024)
-        st.markdown(
-            f"""
-            <div style="background-color: #141622; border: 1px solid rgba(255, 255, 255, 0.05); padding: 15px; border-radius: 8px;">
-                <div style="color: #6272a4; font-size: 0.85rem;">SQLite 数据库占用</div>
-                <div style="color: #00FFCC; font-weight: bold; font-family: monospace; font-size: 1.1rem; margin-top: 5px;">{db_size_mb:.2f} MB</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        secret = st.text_input(
+            "安全密钥 (Secret)",
+            value=str(ding.get("secret", "") or ""),
+            type="password",
         )
+        send_time = st.text_input(
+            "推送时间过滤",
+            value=str(ding.get("send_time", "16:00") or "16:00"),
+        )
+        if st.button("💾 保存通知设置"):
+            ok = config_manager.set_dingtalk_config(
+                enabled=enabled,
+                webhook_url=webhook_url,
+                secret=secret,
+                send_time=send_time or "16:00",
+            )
+            if ok:
+                st.success("配置已保存到 config.json！")
+            else:
+                st.error("保存失败，请检查磁盘权限或路径。")
+
+    st.markdown("---")
+    st.subheader("💻 宿主运行环境监控")
+
+    col_s1, col_s2, col_s3 = st.columns(3)
+    col_s1.metric("操作系统", platform.system())
+    col_s2.metric("Python 版本", platform.python_version())
+
+    db_size = 0.0
+    if DB_PATH.exists():
+        db_size = DB_PATH.stat().st_size / (1024 * 1024)
+    col_s3.metric("SQLite 数据库大小", f"{db_size:.2f} MB")

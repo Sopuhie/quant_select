@@ -5,6 +5,7 @@
   python run_daily.py
   python run_daily.py --trade-date 2026-05-08
   python run_daily.py --force --max-stocks 300 --pool hs300 --workers 8
+  python run_daily.py --only-data   # 仅校验股票池与行情拉取，不写入选股表
 """
 from __future__ import annotations
 
@@ -82,6 +83,60 @@ def _fetch_one_predict_row(
         row_dict["pct_prev_day"] = 0.0
 
     return row_dict
+
+
+def run_only_data_probe(
+    max_stocks: int,
+    pool_type: str,
+    *,
+    max_workers: int | None = None,
+    verbose: bool = True,
+) -> None:
+    """仅校验股票池与行情拉取连通性，不写入选股表。"""
+    print("📊 任务：数据连通性探测（不写入选股表 / daily_predictions）...")
+    pairs = get_stock_pool(pool_type=pool_type, max_count=max_stocks)
+    if not pairs:
+        print("❌ 股票池为空，请检查 AkShare / Baostock / 网络。")
+        raise SystemExit(1)
+    print(f"股票池样本数: {len(pairs)}（上限 max_stocks={max_stocks}）")
+
+    workers = max_workers if max_workers is not None else PREDICT_FETCH_WORKERS
+    workers = max(1, min(workers, len(pairs)))
+    end_compact = datetime.now().strftime("%Y%m%d")
+
+    ok = 0
+    failed = 0
+
+    def _one(code_name: tuple[str, str]) -> tuple[str, int, str | None]:
+        code, _name = code_name
+        try:
+            df = fetch_daily_hist(code, start_date="20230101", end_date=end_compact)
+            return code, len(df), None
+        except Exception as exc:  # noqa: BLE001
+            return code, 0, str(exc)
+
+    if verbose:
+        print(f"并发拉取 K 线（workers={workers}）...")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_one, p): p for p in pairs}
+        for i, fut in enumerate(as_completed(futs), start=1):
+            code, n, err = fut.result()
+            if err:
+                failed += 1
+                if verbose:
+                    print(f"  [{i}/{len(pairs)}] {code} 失败: {err}")
+            else:
+                ok += 1
+                if verbose:
+                    print(f"  [{i}/{len(pairs)}] {code} OK，bars={n}")
+
+    print(f"✅ 探测结束：成功 {ok}，失败 {failed}。")
+    print(
+        "提示：原始 K 线在本项目中主要在线用于因子计算；"
+        "选股结果写入请使用「运行每日预测」。"
+    )
+    if failed == len(pairs):
+        raise SystemExit(1)
 
 
 def predict_daily(
@@ -232,9 +287,23 @@ def main() -> None:
         action="store_true",
         help="不打印拉取进度",
     )
+    parser.add_argument(
+        "--only-data",
+        action="store_true",
+        help="仅校验股票池与行情拉取连通性，不执行选股写入",
+    )
     args = parser.parse_args()
 
     init_db()
+
+    if args.only_data:
+        run_only_data_probe(
+            max_stocks=args.max_stocks,
+            pool_type=args.pool,
+            max_workers=args.workers,
+            verbose=not args.quiet,
+        )
+        return
 
     target_date = args.trade_date
     if not target_date:
