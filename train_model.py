@@ -1,6 +1,10 @@
 """
 手动训练 LightGBM 模型并写入 models/lgb_model.pkl 与 model_versions 表。
 
+多股样本在 src.model_trainer.collect_training_samples 中合并后，会调用
+factor_calculator.clean_cross_sectional_features 做截面 MAD 去极值与标准化，
+再在 train_lgbm_regressor 中 dropna / 划分数据集。
+
 用法（在 quant_select 目录下）:
   python train_model.py --train-end-date 2024-12-31
   python train_model.py --train-end-date 2024-12-31 --max-stocks 200 --version v1.0.0

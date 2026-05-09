@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split
 from .config import FEATURE_COLUMNS, LGB_PARAMS, MODEL_PATH
 from .data_fetcher import fetch_daily_hist, has_enough_history
 from .database import register_model_version
-from .factor_calculator import build_stock_panel_features
+from .factor_calculator import build_stock_panel_features, clean_cross_sectional_features
 
 
 def calculate_ic(factor_values: pd.Series, future_returns: pd.Series) -> float:
@@ -63,7 +63,9 @@ def collect_training_samples(
             parts.append(panel)
     if not parts:
         return pd.DataFrame()
-    return pd.concat(parts, ignore_index=True)
+    all_features = pd.concat(parts, ignore_index=True)
+    all_features = clean_cross_sectional_features(all_features)
+    return all_features
 
 
 def train_lgbm_regressor(

@@ -33,7 +33,7 @@ from .database import (
     insert_daily_selections,
     selection_exists_for_date,
 )
-from .factor_calculator import compute_factors_for_history
+from .factor_calculator import clean_cross_sectional_features, compute_factors_for_history
 from .model_trainer import load_model
 
 
@@ -209,6 +209,8 @@ def predict_universe_scores(
     feat_df = feat_df[feat_df["trade_date"] == as_of].reset_index(drop=True)
     if feat_df.empty:
         raise RuntimeError("过滤到统一交易日后样本为空。")
+
+    feat_df = clean_cross_sectional_features(feat_df)
 
     feat_df = filter_predictions(feat_df)
     if EXCLUDE_ST:

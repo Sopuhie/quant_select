@@ -46,7 +46,10 @@ from src.config import (  # noqa: E402
 )
 from src.data_fetcher import fetch_daily_hist, get_stock_pool  # noqa: E402
 from src.database import get_active_model_version  # noqa: E402
-from src.factor_calculator import compute_factors_for_history  # noqa: E402
+from src.factor_calculator import (  # noqa: E402
+    clean_cross_sectional_features,
+    compute_factors_for_history,
+)
 from src.model_trainer import load_model  # noqa: E402
 from src.predictor import filter_predictions  # noqa: E402
 
@@ -260,6 +263,7 @@ def _score_universe_for_date(
     if not rows:
         return []
     feat_df = pd.DataFrame(rows)
+    feat_df = clean_cross_sectional_features(feat_df)
     feat_df = filter_predictions(feat_df)
     if feat_df.empty:
         return []
