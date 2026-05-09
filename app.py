@@ -307,11 +307,8 @@ with tab_today:
                     st.session_state.selected_stock = None
                     st.rerun()
 
-            with st.spinner("加载K线数据中..."):
-                df_kline = get_stock_kline_data(
-                    st.session_state.selected_stock["code"],
-                    days=90,
-                )
+            with st.spinner("加载约一年（默认 365 日窗口）K 线数据…"):
+                df_kline = get_stock_kline_data(st.session_state.selected_stock["code"])
 
             if df_kline is not None and len(df_kline) > 0:
                 fig = draw_candlestick(
@@ -392,8 +389,10 @@ with tab_hist:
             selected_code = sel_row["stock_code"]
             selected_name = sel_row["stock_name"]
 
-            with st.spinner(f"加载 {selected_code} {selected_name} K线数据..."):
-                df_kline = get_stock_kline_data(selected_code, days=90)
+            with st.spinner(
+                f"加载 {selected_code} {selected_name} 约一年（默认 365 日）K 线…"
+            ):
+                df_kline = get_stock_kline_data(selected_code)
             if df_kline is not None and len(df_kline) > 0:
                 fig = draw_candlestick(df_kline, selected_code, selected_name)
                 if fig:
