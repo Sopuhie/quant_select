@@ -47,25 +47,47 @@ def collect_training_samples(
     stock_pairs: list[tuple[str, str]],
     train_end_date: str,
     start_date: str = "20180101",
+    *,
+    progress: bool = False,
 ) -> pd.DataFrame:
     """
     多只股票纵向合并训练样本；只保留 date <= train_end_date 的行。
+
+    progress=True 时每只股票拉取前后打印一行，避免长时间无输出误以为卡死。
     """
     parts: list[pd.DataFrame] = []
     end_compact = train_end_date.replace("-", "")
-    for code, name in stock_pairs:
+    total = len(stock_pairs)
+    if progress and total:
+        print(
+            "[数据采集] 共 "
+            f"{total} 只股票；每条请求含超时与有限次重试，首只可能较慢请稍候…",
+            flush=True,
+        )
+    for idx, (code, name) in enumerate(stock_pairs, start=1):
+        if progress:
+            print(f"[数据采集] ({idx}/{total}) {code} {name[:16]} 拉取日线…", flush=True)
         hist = fetch_daily_hist(code, start_date=start_date, end_date=end_compact)
         if not has_enough_history(hist):
+            if progress:
+                print(f"          → 跳过（K 线不足或无数据），累计有效 {len(parts)} 只", flush=True)
             continue
         panel = build_stock_panel_features(hist, code, name)
         panel = panel[panel["date"] <= train_end_date]
         if len(panel) > 0:
             parts.append(panel)
+            if progress:
+                print(
+                    f"          → 纳入训练 样本行 {len(panel)}，累计有效 {len(parts)} 只",
+                    flush=True,
+                )
+        elif progress:
+            print(f"          → 跳过（截至日无样本），累计有效 {len(parts)} 只", flush=True)
+    if progress and total:
+        print(f"[数据采集] 完成：有效股票 {len(parts)}/{total}，正在合并面板…", flush=True)
     if not parts:
         return pd.DataFrame()
-    all_features = pd.concat(parts, ignore_index=True)
-    all_features = clean_cross_sectional_features(all_features)
-    return all_features
+    return pd.concat(parts, ignore_index=True)
 
 
 def train_lgbm_regressor(
@@ -123,18 +145,18 @@ def load_model(path: Path | None = None) -> LGBMRegressor:
     return joblib.load(p)
 
 
-def train_and_register(
-    stock_pairs: list[tuple[str, str]],
+def train_panel_and_register(
+    panel_df: pd.DataFrame,
     train_end_date: str,
     version: str | None = None,
     model_path: Path | None = None,
 ) -> tuple[LGBMRegressor, dict[str, Any]]:
+    """对已合并、并完成截面清洗的训练面板执行训练、落盘与注册。"""
     if version is None:
         version = "v" + datetime.now().strftime("%Y%m%d.%H%M")
-    raw = collect_training_samples(stock_pairs, train_end_date=train_end_date)
-    if raw.empty:
+    if panel_df.empty:
         raise RuntimeError("训练样本为空，请检查网络、股票池与日期区间。")
-    model, metrics = train_lgbm_regressor(raw)
+    model, metrics = train_lgbm_regressor(panel_df)
     save_model(model, model_path)
     register_model_version(
         version=version,
@@ -143,4 +165,29 @@ def train_and_register(
         metrics=_json_safe(metrics),
         set_active=True,
     )
-    return model, {"version": version, **metrics, "rows": len(raw)}
+    return model, {"version": version, **metrics, "rows": len(panel_df)}
+
+
+def train_and_register(
+    stock_pairs: list[tuple[str, str]],
+    train_end_date: str,
+    version: str | None = None,
+    model_path: Path | None = None,
+    *,
+    collect_progress: bool = False,
+) -> tuple[LGBMRegressor, dict[str, Any]]:
+    """collect → 截面清洗 → train_panel_and_register（供脚本一键调用）。"""
+    all_features = collect_training_samples(
+        stock_pairs,
+        train_end_date=train_end_date,
+        progress=collect_progress,
+    )
+    if all_features.empty:
+        raise RuntimeError("训练样本为空，请检查网络、股票池与日期区间。")
+    all_features = clean_cross_sectional_features(all_features)
+    return train_panel_and_register(
+        all_features,
+        train_end_date=train_end_date,
+        version=version,
+        model_path=model_path,
+    )
