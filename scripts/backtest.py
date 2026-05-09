@@ -663,6 +663,12 @@ def main() -> None:
             on="trade_date",
             how="left",
         )
+    pnls = engine.trade_pnls
+    n_close = len(pnls)
+    nav_out["n_close_trades"] = n_close
+    nav_out["close_trade_win_rate"] = (
+        float(np.mean([1.0 if x > 0 else 0.0 for x in pnls])) if n_close > 0 else float("nan")
+    )
     nav_out.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"净值序列已写入: {out_path.resolve()}")
 

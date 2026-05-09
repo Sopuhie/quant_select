@@ -354,279 +354,340 @@ with tab_hist:
         else:
             st.info("暂无收益率数据，请先运行 scripts/update_returns.py")
 
+
+def _run_backtest_subprocess() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "backtest.py"),
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-12-31",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=7200,
+    )
+
+
 with tab_backtest:
     st.subheader("📈 策略历史回测分析")
     st.caption(
-        "数据来自 `data/backtest_results.csv`（由 `scripts/backtest.py` 生成）。"
-        "图表为暗黑霓虹风格；基准列为空时仅展示策略曲线。"
+        "基于 LightGBM 历史滚动预测与周期全额换仓（默认 2024 样本外；优先本地 SQLite，不足则在线补充）。"
+        "结果：`data/backtest_results.csv`。"
     )
 
+    if "backtest_last_log" not in st.session_state:
+        st.session_state.backtest_last_log = ""
+
     if not BACKTEST_CSV.exists():
-        st.info("📊 尚未生成历史回测数据。可点击下方按钮运行 **2024 全年**滚动回测（耗时取决于股票池与网络）。")
         st.markdown(
-            "或在项目根目录执行：  \n`python scripts/backtest.py --start-date 2024-01-01 --end-date 2024-12-31`"
+            """
+<div style="
+  border:1px solid rgba(0,255,204,0.4);
+  border-radius:14px;
+  padding:18px 20px;
+  background:linear-gradient(135deg, rgba(0,60,55,0.35) 0%, rgba(15,20,40,0.55) 100%);
+  box-shadow:0 0 24px rgba(0,255,204,0.08);
+  margin-bottom:12px;
+">
+  <div style="color:#00FFCC;font-weight:700;font-size:1.05rem;">量化回测引擎 · 待命</div>
+  <div style="color:#b8c5d9;margin-top:8px;line-height:1.6;">
+    点击下方运行 <code style="color:#FF9900;">scripts/backtest.py</code>（2024-01-01～2024-12-31）。
+    日志可在展开面板查看。
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
         )
-        if st.button("🚀 一键运行历史回测 (2024年)", type="primary", key="run_backtest_2024"):
-            with st.spinner("回测运行中：正在拉取行情并滚动打分，请耐心等待…"):
-                try:
-                    proc = subprocess.run(
-                        [
-                            sys.executable,
-                            str(ROOT / "scripts" / "backtest.py"),
-                            "--start-date",
-                            "2024-01-01",
-                            "--end-date",
-                            "2024-12-31",
-                        ],
-                        cwd=str(ROOT),
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=7200,
-                    )
-                    if proc.returncode != 0:
-                        st.error(f"回测进程退出码 {proc.returncode}")
-                        if proc.stderr:
-                            st.code(proc.stderr[-8000:], language="text")
+        st.info("⏱ 全样本可能耗时较长；完成后自动生成 `data/backtest_results.csv`。")
+        col_run, _ = st.columns([2, 3])
+        with col_run:
+            if st.button(
+                "🚀 运行 2024 年度历史滚动回测 (LGB + 周期换仓)",
+                type="primary",
+                use_container_width=True,
+                key="bt_run_2024",
+            ):
+                with st.spinner("回测执行中：滚动计算因子并打分选股，请耐心等待…"):
+                    try:
+                        proc = _run_backtest_subprocess()
+                        log_parts: list[str] = []
                         if proc.stdout:
-                            with st.expander("stdout"):
-                                st.code(proc.stdout[-8000:], language="text")
-                    elif not BACKTEST_CSV.exists():
-                        st.warning("进程已结束但未找到 backtest_results.csv，请查看上方日志。")
-                    else:
-                        st.success("回测执行完成，已生成 data/backtest_results.csv")
-                        st.rerun()
-                except subprocess.TimeoutExpired:
-                    st.error("回测超时（>2h），请在终端手动运行或缩小股票池。")
-                except Exception as e:
-                    st.error(f"回测执行失败: {e}")
+                            log_parts.append("—— stdout ——\n" + proc.stdout)
+                        if proc.stderr:
+                            log_parts.append("—— stderr ——\n" + proc.stderr)
+                        st.session_state.backtest_last_log = "\n".join(log_parts)[-24000:]
+                        if proc.returncode != 0:
+                            st.error(f"回测进程退出码 {proc.returncode}")
+                        elif not BACKTEST_CSV.exists():
+                            st.warning("进程已结束但未生成 CSV，请查看日志。")
+                        else:
+                            st.success("✅ 回测完成，已写入 data/backtest_results.csv")
+                            st.rerun()
+                    except subprocess.TimeoutExpired:
+                        st.error("回测超时（>2h）。请在终端手动运行或缩小 QUANT_MAX_STOCKS。")
+                    except Exception as ex:
+                        st.error(f"执行异常: {ex}")
+        if st.session_state.backtest_last_log:
+            with st.expander("📜 最近一次回测控制台输出", expanded=False):
+                st.code(st.session_state.backtest_last_log, language="text")
     else:
         try:
             df_res = pd.read_csv(BACKTEST_CSV)
-        except Exception as e:
-            st.error(f"无法读取回测 CSV：{e}")
-            df_res = pd.DataFrame()
-
-        if df_res.empty or "nav" not in df_res.columns or "trade_date" not in df_res.columns:
-            st.warning("回测文件格式异常或为空，请删除后重新运行回测。")
-            if st.button("🗑️ 删除无效结果并重试", key="del_bad_backtest"):
+        except Exception as err:
+            st.error(f"解析回测数据出错: {err}")
+            if st.button("🧹 清理损坏的回测缓存", key="bt_clean_bad"):
                 BACKTEST_CSV.unlink(missing_ok=True)
                 st.rerun()
         else:
-            df_res = df_res.copy()
-            df_res["trade_date"] = df_res["trade_date"].astype(str)
-            nav0 = pd.to_numeric(df_res["nav"], errors="coerce").iloc[0]
-            if pd.isna(nav0) or nav0 == 0:
-                st.error("净值序列无效（nav 首行为空或为 0）。")
+            if df_res.empty or "nav" not in df_res.columns or "trade_date" not in df_res.columns:
+                st.warning("回测文件格式异常或为空。")
+                if st.button("🧹 删除无效 CSV", key="bt_del_invalid"):
+                    BACKTEST_CSV.unlink(missing_ok=True)
+                    st.rerun()
             else:
-                df_res["strategy_cum_pct"] = (
-                    pd.to_numeric(df_res["nav"], errors="coerce") / float(nav0) - 1.0
-                ) * 100.0
+                df_res = df_res.copy()
+                df_res["trade_date"] = df_res["trade_date"].astype(str)
+                nav_s = pd.to_numeric(df_res["nav"], errors="coerce")
+                nav0 = nav_s.iloc[0]
+                if pd.isna(nav0) or float(nav0) == 0:
+                    st.error("净值序列无效（首行 nav 为空或为 0）。")
+                else:
+                    df_res["strategy_cum"] = (nav_s / float(nav0) - 1.0) * 100.0
 
-                has_bench = (
-                    "benchmark_close" in df_res.columns
-                    and pd.to_numeric(df_res["benchmark_close"], errors="coerce").notna().any()
-                )
-                if has_bench:
-                    bc = pd.to_numeric(df_res["benchmark_close"], errors="coerce")
-                    first_b = bc.dropna().iloc[0]
-                    if first_b and first_b > 0:
-                        df_res["bench_cum_pct"] = (bc / float(first_b) - 1.0) * 100.0
-                    else:
-                        has_bench = False
-
-                metrics = _backtest_perf_metrics(df_res)
-
-                if go is not None:
-                    fig_bt = go.Figure()
-                    fig_bt.add_trace(
-                        go.Scatter(
-                            x=df_res["trade_date"],
-                            y=df_res["strategy_cum_pct"],
-                            mode="lines",
-                            name="A-Quant Lite（策略）",
-                            line=dict(color="#00FFCC", width=3),
-                            fill="tozeroy",
-                            fillcolor="rgba(0, 255, 204, 0.12)",
-                        )
+                    bc_raw = (
+                        pd.to_numeric(df_res["benchmark_close"], errors="coerce")
+                        if "benchmark_close" in df_res.columns
+                        else pd.Series(dtype=float)
                     )
-                    if has_bench and "bench_cum_pct" in df_res.columns:
+                    has_bench = bc_raw.notna().any()
+                    bench_cum_last = float("nan")
+                    if has_bench:
+                        valid_b = bc_raw.dropna()
+                        if not valid_b.empty and float(valid_b.iloc[0]) > 0:
+                            b0 = float(valid_b.iloc[0])
+                            df_res["bench_cum"] = (bc_raw / b0 - 1.0) * 100.0
+                            bench_cum_last = float(df_res["bench_cum"].iloc[-1])
+                        else:
+                            has_bench = False
+
+                    metrics = _backtest_perf_metrics(df_res)
+                    cum_ret = metrics.get("cumulative_return", float("nan"))
+                    ann_ret = metrics.get("annualized_return", float("nan"))
+                    mdd = metrics.get("max_drawdown", float("nan"))
+                    sharpe = metrics.get("sharpe_ratio", float("nan"))
+                    daily_win = metrics.get("win_rate_daily", float("nan"))
+                    excess_cum_pct = (
+                        float(metrics["excess_cumulative_return"]) * 100.0
+                        if np.isfinite(metrics.get("excess_cumulative_return", float("nan")))
+                        else float("nan")
+                    )
+
+                    n_close_raw = (
+                        pd.to_numeric(df_res["n_close_trades"], errors="coerce").dropna()
+                        if "n_close_trades" in df_res.columns
+                        else pd.Series(dtype=float)
+                    )
+                    n_close = int(n_close_raw.iloc[0]) if len(n_close_raw) > 0 else None
+
+                    tw_raw = (
+                        pd.to_numeric(df_res["close_trade_win_rate"], errors="coerce").dropna()
+                        if "close_trade_win_rate" in df_res.columns
+                        else pd.Series(dtype=float)
+                    )
+                    trade_win = float(tw_raw.iloc[0]) if len(tw_raw) > 0 else float("nan")
+                    if n_close is not None and n_close == 0:
+                        trade_win = float("nan")
+
+                    st.markdown("##### 核心评价指标")
+                    c_m1, c_m2, c_m3, c_m4, c_m5, c_m6 = st.columns(6)
+                    with c_m1:
+                        st.metric(
+                            "策略累计收益",
+                            f"{cum_ret * 100:.2f}%" if np.isfinite(cum_ret) else "—",
+                        )
+                    with c_m2:
+                        st.metric(
+                            "年化收益率",
+                            f"{ann_ret * 100:.2f}%" if np.isfinite(ann_ret) else "—",
+                            help=f"按每年 {BACKTEST_TRADING_DAYS_YR} 个交易日折算",
+                        )
+                    with c_m3:
+                        st.metric(
+                            "最大回撤 (MDD)",
+                            f"{mdd * 100:.2f}%" if np.isfinite(mdd) else "—",
+                        )
+                    with c_m4:
+                        st.metric(
+                            "夏普比率",
+                            f"{sharpe:.3f}" if np.isfinite(sharpe) else "—",
+                            help="无风险利率年化约 3%",
+                        )
+                    with c_m5:
+                        st.metric(
+                            "交易胜率 (平仓)",
+                            f"{trade_win:.1%}" if np.isfinite(trade_win) else "—",
+                            help="每次全额换仓平仓的盈亏胜率（见 CSV 列 close_trade_win_rate）",
+                        )
+                    with c_m6:
+                        st.metric(
+                            "平仓笔数",
+                            f"{n_close}" if n_close is not None else "—",
+                        )
+
+                    c_x1, c_x2, c_x3 = st.columns(3)
+                    with c_x1:
+                        if has_bench and np.isfinite(excess_cum_pct):
+                            st.metric("超额收益 (vs 沪深300)", f"{excess_cum_pct:.2f}%")
+                        elif has_bench and np.isfinite(bench_cum_last):
+                            alpha_pts = float(df_res["strategy_cum"].iloc[-1]) - bench_cum_last
+                            st.metric("超额收益 (曲线终点差)", f"{alpha_pts:.2f}%")
+                        else:
+                            st.metric("超额收益 (vs 沪深300)", "N/A")
+                    with c_x2:
+                        st.metric(
+                            "胜率（按日）",
+                            f"{daily_win:.1%}" if np.isfinite(daily_win) else "—",
+                        )
+                    with c_x3:
+                        st.metric("样本交易日", f"{metrics.get('n_days', '—')}")
+
+                    st.caption(
+                        f"最大回撤区间：{metrics.get('drawdown_start', '—')} → {metrics.get('drawdown_end', '—')} · "
+                        f"曲线区间：{df_res['trade_date'].iloc[0]} ~ {df_res['trade_date'].iloc[-1]}"
+                    )
+
+                    d0, d1 = df_res["trade_date"].iloc[0], df_res["trade_date"].iloc[-1]
+                    chart_title = f"滚动样本外 · 策略 vs 沪深300 累计收益率 (%) · {d0} ~ {d1}"
+
+                    if go is not None:
+                        fig_bt = go.Figure()
                         fig_bt.add_trace(
                             go.Scatter(
                                 x=df_res["trade_date"],
-                                y=df_res["bench_cum_pct"],
+                                y=df_res["strategy_cum"],
                                 mode="lines",
-                                name="沪深300（基准）",
-                                line=dict(color="#FF9900", width=2, dash="dash"),
+                                name="A-Quant Lite 策略",
+                                line=dict(color="#00FFCC", width=3),
                                 fill="tozeroy",
-                                fillcolor="rgba(255, 153, 0, 0.06)",
+                                fillcolor="rgba(0, 255, 204, 0.08)",
                             )
                         )
-                    fig_bt.update_layout(
-                        title=dict(
-                            text="策略 vs 沪深300 · 累计收益率 (%)",
-                            font=dict(size=18, color="#E0E0E0"),
-                        ),
-                        template="plotly_dark",
-                        paper_bgcolor="rgba(10,12,18,0.95)",
-                        plot_bgcolor="rgba(15,18,28,0.9)",
-                        font=dict(color="#CCCCCC"),
-                        xaxis=dict(
-                            showgrid=True,
-                            gridcolor="rgba(255,255,255,0.08)",
-                            zeroline=False,
-                        ),
-                        yaxis=dict(
-                            showgrid=True,
-                            gridcolor="rgba(255,255,255,0.08)",
-                            ticksuffix="%",
-                            zeroline=True,
-                            zerolinecolor="rgba(0,255,204,0.35)",
-                        ),
-                        legend=dict(
-                            orientation="h",
-                            yanchor="bottom",
-                            y=1.02,
-                            xanchor="right",
-                            x=1,
-                            bgcolor="rgba(0,0,0,0.4)",
-                        ),
-                        margin=dict(l=48, r=24, t=60, b=48),
-                        hovermode="x unified",
-                    )
-                    st.plotly_chart(fig_bt, use_container_width=True)
-                else:
-                    st.warning("未安装 plotly，请执行 pip install plotly")
-
-                st.markdown("##### 核心指标")
-                mcols_a = st.columns(3)
-                with mcols_a[0]:
-                    cr = metrics.get("cumulative_return", float("nan"))
-                    ex = metrics.get("excess_cumulative_return", float("nan"))
-                    st.metric(
-                        "累计收益率",
-                        f"{cr:.2%}" if np.isfinite(cr) else "—",
-                        delta=f"超额 {ex:.2%}" if np.isfinite(ex) else None,
-                        delta_color="normal",
-                    )
-                with mcols_a[1]:
-                    ar = metrics.get("annualized_return", float("nan"))
-                    st.metric(
-                        "年化收益率",
-                        f"{ar:.2%}" if np.isfinite(ar) else "—",
-                        help=f"按每年 {BACKTEST_TRADING_DAYS_YR} 个交易日折算",
-                    )
-                with mcols_a[2]:
-                    bc = metrics.get("benchmark_cumulative_return", float("nan"))
-                    st.metric(
-                        "基准累计收益",
-                        f"{bc:.2%}" if np.isfinite(bc) else "—（无基准列）",
-                    )
-
-                mcols_b = st.columns(3)
-                with mcols_b[0]:
-                    mdd = metrics.get("max_drawdown", float("nan"))
-                    st.metric(
-                        "最大回撤",
-                        f"{mdd:.2%}" if np.isfinite(mdd) else "—",
-                        help=(
-                            f"{metrics.get('drawdown_start', '')} → {metrics.get('drawdown_end', '')}"
-                            if metrics.get("drawdown_start")
-                            else None
-                        ),
-                    )
-                with mcols_b[1]:
-                    sh = metrics.get("sharpe_ratio", float("nan"))
-                    st.metric("夏普比率", f"{sh:.3f}" if np.isfinite(sh) else "—", help="Rf≈3% 年化")
-                with mcols_b[2]:
-                    wd = metrics.get("win_rate_daily", float("nan"))
-                    st.metric(
-                        "胜率（按日）",
-                        f"{wd:.1%}" if np.isfinite(wd) else "—",
-                    )
-
-                mcols_c = st.columns(2)
-                with mcols_c[0]:
-                    st.metric(
-                        "胜率（按平仓）",
-                        "见脚本日志",
-                        help="CSV 未写入单笔平仓；运行 scripts/backtest.py 时终端会打印「按平仓笔数」胜率。",
-                    )
-                with mcols_c[1]:
-                    st.metric("回测样本天数", f"{metrics.get('n_days', '—')}")
-
-                st.caption(
-                    f"最大回撤区间：{metrics.get('drawdown_start', '—')} → {metrics.get('drawdown_end', '—')}"
-                )
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("🔄 重新跑回测（删除 CSV）", key="rerun_backtest_del"):
-                        BACKTEST_CSV.unlink(missing_ok=True)
-                        st.rerun()
-                with c2:
-                    if st.button("🔁 再次执行 2024 回测（覆盖）", key="rerun_backtest_ovr"):
-                        with st.spinner("正在运行 2024 回测…"):
-                            try:
-                                proc = subprocess.run(
-                                    [
-                                        sys.executable,
-                                        str(ROOT / "scripts" / "backtest.py"),
-                                        "--start-date",
-                                        "2024-01-01",
-                                        "--end-date",
-                                        "2024-12-31",
-                                    ],
-                                    cwd=str(ROOT),
-                                    capture_output=True,
-                                    text=True,
-                                    encoding="utf-8",
-                                    errors="replace",
-                                    timeout=7200,
+                        if has_bench and "bench_cum" in df_res.columns:
+                            fig_bt.add_trace(
+                                go.Scatter(
+                                    x=df_res["trade_date"],
+                                    y=df_res["bench_cum"],
+                                    mode="lines",
+                                    name="沪深300 基准",
+                                    line=dict(color="#FF9900", width=2, dash="dash"),
+                                    fill="tozeroy",
+                                    fillcolor="rgba(255, 153, 0, 0.05)",
                                 )
-                                if proc.returncode != 0:
-                                    st.error(f"退出码 {proc.returncode}")
-                                    if proc.stderr:
-                                        st.code(proc.stderr[-6000:], language="text")
-                                else:
-                                    st.success("已完成覆盖写入")
-                                    st.rerun()
-                            except Exception as e:
-                                st.error(str(e))
+                            )
+                        fig_bt.update_layout(
+                            title=dict(text=chart_title, font=dict(size=17, color="#E8E8E8")),
+                            template="plotly_dark",
+                            paper_bgcolor="rgba(8,10,16,0.96)",
+                            plot_bgcolor="rgba(12,14,22,0.92)",
+                            font=dict(color="#C8C8C8"),
+                            xaxis=dict(
+                                showgrid=True,
+                                gridcolor="rgba(255,255,255,0.08)",
+                                zeroline=False,
+                            ),
+                            yaxis=dict(
+                                showgrid=True,
+                                gridcolor="rgba(255,255,255,0.08)",
+                                ticksuffix="%",
+                                zeroline=True,
+                                zerolinecolor="rgba(0,255,204,0.25)",
+                            ),
+                            legend=dict(
+                                orientation="h",
+                                yanchor="bottom",
+                                y=1.02,
+                                xanchor="right",
+                                x=1,
+                                bgcolor="rgba(0,0,0,0.45)",
+                            ),
+                            margin=dict(l=44, r=20, t=56, b=44),
+                            hovermode="x unified",
+                        )
+                        st.plotly_chart(fig_bt, use_container_width=True)
+                    else:
+                        st.warning("未安装 Plotly：`pip install plotly`")
 
-                with st.expander("📋 资产明细（净值 / 现金 / 持仓市值）", expanded=False):
-                    show_cols = [
-                        c
-                        for c in (
-                            "trade_date",
-                            "nav",
-                            "cash",
-                            "hold_mv",
-                            "n_positions",
-                            "daily_return",
-                            "benchmark_close",
+                    st.markdown("---")
+                    c_btn1, c_btn2, _ = st.columns([1.5, 1.5, 6.0])
+                    with c_btn1:
+                        if st.button("🔄 重新跑回测", use_container_width=True, key="bt_rerun_del"):
+                            BACKTEST_CSV.unlink(missing_ok=True)
+                            st.session_state.backtest_last_log = ""
+                            st.rerun()
+                    with c_btn2:
+                        export_buf = io.BytesIO()
+                        df_res.to_csv(export_buf, index=False, encoding="utf-8-sig")
+                        st.download_button(
+                            label="💾 导出回测 CSV",
+                            data=export_buf.getvalue(),
+                            file_name="backtest_results_export.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="bt_dl_csv",
                         )
-                        if c in df_res.columns
-                    ]
-                    disp = df_res[show_cols].copy()
-                    if "daily_return" in disp.columns:
-                        disp["daily_return"] = pd.to_numeric(
-                            disp["daily_return"], errors="coerce"
-                        ).map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
-                    if "nav" in disp.columns:
-                        disp["nav"] = pd.to_numeric(disp["nav"], errors="coerce").map(
-                            lambda x: f"{x:,.2f}" if pd.notna(x) else "—"
-                        )
-                    if "cash" in disp.columns:
-                        disp["cash"] = pd.to_numeric(disp["cash"], errors="coerce").map(
-                            lambda x: f"{x:,.2f}" if pd.notna(x) else "—"
-                        )
-                    if "hold_mv" in disp.columns:
-                        disp["hold_mv"] = pd.to_numeric(disp["hold_mv"], errors="coerce").map(
-                            lambda x: f"{x:,.2f}" if pd.notna(x) else "—"
-                        )
-                    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+                    with st.expander("📋 每日资产账单明细（NAV / 现金 / 持仓市值）", expanded=False):
+                        display_cols = [
+                            c
+                            for c in (
+                                "trade_date",
+                                "nav",
+                                "cash",
+                                "hold_mv",
+                                "n_positions",
+                                "daily_return",
+                                "benchmark_close",
+                                "n_close_trades",
+                                "close_trade_win_rate",
+                            )
+                            if c in df_res.columns
+                        ]
+                        detail_df = df_res[display_cols].copy()
+                        if "daily_return" in detail_df.columns:
+                            drn = pd.to_numeric(detail_df["daily_return"], errors="coerce")
+                            detail_df["daily_return"] = drn.apply(
+                                lambda x: f"{float(x):.2%}" if pd.notna(x) else "—"
+                            )
+                        st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+                    with st.expander("🔁 覆盖执行 2024 全样本回测", expanded=False):
+                        if st.button("在此覆盖运行 backtest.py（2024）", key="bt_ovr_inline"):
+                            with st.spinner("正在运行回测…"):
+                                try:
+                                    proc = _run_backtest_subprocess()
+                                    log_parts = []
+                                    if proc.stdout:
+                                        log_parts.append(proc.stdout)
+                                    if proc.stderr:
+                                        log_parts.append(proc.stderr)
+                                    st.session_state.backtest_last_log = "\n".join(log_parts)[
+                                        -24000:
+                                    ]
+                                    if proc.returncode != 0:
+                                        st.error(f"退出码 {proc.returncode}")
+                                    else:
+                                        st.success("已完成写入")
+                                        st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
+                        if st.session_state.backtest_last_log:
+                            st.code(st.session_state.backtest_last_log, language="text")
 
 with tab_perf:
     st.subheader("📊 模型表现概览")
