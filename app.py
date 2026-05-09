@@ -10,6 +10,7 @@ import io
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -355,23 +356,88 @@ with tab_hist:
             st.info("暂无收益率数据，请先运行 scripts/update_returns.py")
 
 
+_BACKTEST_TIMEOUT_SEC = 7200
+
+
+def _backtest_cli_cmd() -> list[str]:
+    """与页面按钮一致的回测命令；`-u` 减少 stdout 缓冲，便于界面实时看到日志。"""
+    return [
+        sys.executable,
+        "-u",
+        str(ROOT / "scripts" / "backtest.py"),
+        "--start-date",
+        "2024-01-01",
+        "--end-date",
+        "2024-12-31",
+    ]
+
+
 def _run_backtest_subprocess() -> subprocess.CompletedProcess[str]:
+    """非交互场景：一次性捕获输出（仍带 `-u`，缩短缓冲）。"""
     return subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "scripts" / "backtest.py"),
-            "--start-date",
-            "2024-01-01",
-            "--end-date",
-            "2024-12-31",
-        ],
+        _backtest_cli_cmd(),
         cwd=str(ROOT),
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=7200,
+        timeout=_BACKTEST_TIMEOUT_SEC,
     )
+
+
+def _run_backtest_streaming(status: Any) -> subprocess.CompletedProcess[str]:
+    """
+    边执行边把子进程 stdout/stderr 写入 st.status，避免长时间无输出误以为卡死。
+    """
+    cmd = _backtest_cli_cmd()
+    deadline = time.monotonic() + _BACKTEST_TIMEOUT_SEC
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    chunks: list[str] = []
+    assert proc.stdout is not None
+    try:
+        while True:
+            if time.monotonic() > deadline:
+                proc.kill()
+                try:
+                    proc.wait(timeout=15)
+                except Exception:
+                    pass
+                raise subprocess.TimeoutExpired(cmd, _BACKTEST_TIMEOUT_SEC)
+            line = proc.stdout.readline()
+            if line:
+                chunks.append(line)
+                try:
+                    status.write(line.rstrip()[:1500])
+                except Exception:
+                    pass
+            rc = proc.poll()
+            if rc is not None:
+                rest = proc.stdout.read()
+                if rest:
+                    chunks.append(rest)
+                    try:
+                        status.write(rest.rstrip()[-4000:])
+                    except Exception:
+                        pass
+                break
+        final_rc = int(rc) if rc is not None else 0
+        full = "".join(chunks)
+        return subprocess.CompletedProcess(cmd, final_rc, stdout=full, stderr="")
+    except subprocess.TimeoutExpired:
+        raise
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+        raise
 
 
 with tab_backtest:
@@ -413,26 +479,24 @@ with tab_backtest:
                 use_container_width=True,
                 key="bt_run_2024",
             ):
-                with st.spinner("回测执行中：滚动计算因子并打分选股，请耐心等待…"):
-                    try:
-                        proc = _run_backtest_subprocess()
-                        log_parts: list[str] = []
-                        if proc.stdout:
-                            log_parts.append("—— stdout ——\n" + proc.stdout)
-                        if proc.stderr:
-                            log_parts.append("—— stderr ——\n" + proc.stderr)
-                        st.session_state.backtest_last_log = "\n".join(log_parts)[-24000:]
-                        if proc.returncode != 0:
-                            st.error(f"回测进程退出码 {proc.returncode}")
-                        elif not BACKTEST_CSV.exists():
-                            st.warning("进程已结束但未生成 CSV，请查看日志。")
-                        else:
-                            st.success("✅ 回测完成，已写入 data/backtest_results.csv")
-                            st.rerun()
-                    except subprocess.TimeoutExpired:
-                        st.error("回测超时（>2h）。请在终端手动运行或缩小 QUANT_MAX_STOCKS。")
-                    except Exception as ex:
-                        st.error(f"执行异常: {ex}")
+                try:
+                    with st.status(
+                        "回测执行中：拉取行情与滚动回测（日志实时刷新；若长时间无新行请到任务管理器查看 Python 是否占用 CPU/网络）",
+                        expanded=True,
+                    ) as bt_status:
+                        proc = _run_backtest_streaming(bt_status)
+                    st.session_state.backtest_last_log = (proc.stdout or "")[-24000:]
+                    if proc.returncode != 0:
+                        st.error(f"回测进程退出码 {proc.returncode}（详情见上方状态框或展开日志）")
+                    elif not BACKTEST_CSV.exists():
+                        st.warning("进程已结束但未生成 CSV，请查看状态框内日志。")
+                    else:
+                        st.success("✅ 回测完成，已写入 data/backtest_results.csv")
+                        st.rerun()
+                except subprocess.TimeoutExpired:
+                    st.error("回测超时（>2h）。请在终端手动运行或缩小 QUANT_MAX_STOCKS。")
+                except Exception as ex:
+                    st.error(f"执行异常: {ex}")
         if st.session_state.backtest_last_log:
             with st.expander("📜 最近一次回测控制台输出", expanded=False):
                 st.code(st.session_state.backtest_last_log, language="text")
@@ -668,24 +732,21 @@ with tab_backtest:
 
                     with st.expander("🔁 覆盖执行 2024 全样本回测", expanded=False):
                         if st.button("在此覆盖运行 backtest.py（2024）", key="bt_ovr_inline"):
-                            with st.spinner("正在运行回测…"):
-                                try:
-                                    proc = _run_backtest_subprocess()
-                                    log_parts = []
-                                    if proc.stdout:
-                                        log_parts.append(proc.stdout)
-                                    if proc.stderr:
-                                        log_parts.append(proc.stderr)
-                                    st.session_state.backtest_last_log = "\n".join(log_parts)[
-                                        -24000:
-                                    ]
-                                    if proc.returncode != 0:
-                                        st.error(f"退出码 {proc.returncode}")
-                                    else:
-                                        st.success("已完成写入")
-                                        st.rerun()
-                                except Exception as e:
-                                    st.error(str(e))
+                            try:
+                                with st.status(
+                                    "覆盖运行回测中（实时日志）…", expanded=True
+                                ) as bt_status:
+                                    proc = _run_backtest_streaming(bt_status)
+                                st.session_state.backtest_last_log = (proc.stdout or "")[-24000:]
+                                if proc.returncode != 0:
+                                    st.error(f"退出码 {proc.returncode}")
+                                else:
+                                    st.success("已完成写入")
+                                    st.rerun()
+                            except subprocess.TimeoutExpired:
+                                st.error("回测超时（>2h）")
+                            except Exception as e:
+                                st.error(str(e))
                         if st.session_state.backtest_last_log:
                             st.code(st.session_state.backtest_last_log, language="text")
 

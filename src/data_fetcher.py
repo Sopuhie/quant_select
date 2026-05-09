@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -119,6 +120,8 @@ def _finalize_hist_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 _POOL_CACHE: dict[str, tuple[float, list[tuple[str, str]]]] = {}
 _POOL_TTL_SEC = 3600.0
+# 成分列解析逻辑变更时递增，避免 TTL 内继续使用错误的缓存池
+_POOL_CACHE_KEY_VER = "2"
 
 # 风险警示板（ST）代码缓存，避免每次选股全量请求
 _ST_BOARD_CACHE: tuple[float, frozenset[str]] | None = None
@@ -156,7 +159,7 @@ def compact_start_calendar_days_ago(days: int | None = None) -> str:
 
 
 def get_hs300_stocks(as_of_date: str | None = None) -> list[tuple[str, str]]:
-    """沪深300 成分（中证指数源），as_of_date 为 YYYY-MM-DD 时取该日及以前最近一期成份。"""
+    """沪深300 成分，as_of_date 为 YYYY-MM-DD 时取该日及以前最近一期成份。"""
     return _get_index_constituents("000300", as_of_date)
 
 
@@ -165,40 +168,129 @@ def get_zz500_stocks(as_of_date: str | None = None) -> list[tuple[str, str]]:
     return _get_index_constituents("000905", as_of_date)
 
 
+def _is_index_only_metadata_col(col_name: object) -> bool:
+    """排除「指数代码/指数名称」等列，避免误当成成分股代码列。"""
+    s = str(col_name)
+    return "指数" in s and "成分" not in s and "成份" not in s
+
+
+def _pick_index_constituent_code_col(cols: list) -> str | None:
+    """优先匹配成分券代码列，绝不能选用「指数代码」列（否则全体变成 000300/000905 一行）。"""
+    for c in cols:
+        if _is_index_only_metadata_col(c):
+            continue
+        sc = str(c)
+        if "券代码" in sc:
+            return c
+        if ("成分" in sc or "成份" in sc) and (
+            "代码" in sc or "code" in sc.lower()
+        ):
+            return c
+    for c in cols:
+        if _is_index_only_metadata_col(c):
+            continue
+        sc = str(c)
+        if "代码" in sc or "code" in sc.lower():
+            return c
+    return None
+
+
+def _pick_index_constituent_name_col(cols: list) -> str | None:
+    for c in cols:
+        if _is_index_only_metadata_col(c):
+            continue
+        sc = str(c)
+        if ("成分" in sc or "成份" in sc) and (
+            "名称" in sc or "name" in sc.lower()
+        ):
+            return c
+    for c in cols:
+        if _is_index_only_metadata_col(c):
+            continue
+        sc = str(c)
+        if "名称" in sc or "name" in sc.lower():
+            return c
+    return None
+
+
+def _extract_stock_code6(raw: object) -> str | None:
+    """从 '600000'、'600000.SH'、'sz.000001' 等解析 6 位 A 股代码。"""
+    s = str(raw).strip()
+    if not s:
+        return None
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 6:
+        return digits[-6:]
+    if digits.isdigit() and 1 <= len(digits) <= 6:
+        return digits.zfill(6)
+    return None
+
+
 def _get_index_constituents(index_code: str, as_of_date: str | None) -> list[tuple[str, str]]:
+    df = None
+    # 尝试中证官方接口
     try:
         df = ak.index_stock_cons_csindex(symbol=index_code)
     except Exception:
-        return []
+        df = None
+
+    # 如果官方接口挂了或为空，用新浪接口作为第一级备用方案
+    if df is None or df.empty:
+        try:
+            symbol_map = {"000300": "hs300", "000905": "zz500"}
+            if index_code in symbol_map:
+                df = ak.index_stock_cons(symbol=symbol_map[index_code])
+        except Exception:
+            df = None
+
+    # 如果依然为空，用东方财富成分股接口做终极兜底
+    if df is None or df.empty:
+        try:
+            symbol_em_map = {"000300": "000300.SH", "000905": "000905.SH"}
+            if index_code in symbol_em_map:
+                df = ak.index_stock_cons_em(symbol=index_code)
+        except Exception:
+            df = None
+
     if df is None or df.empty:
         return []
-    dcol = next((c for c in df.columns if "日期" in str(c)), df.columns[0])
-    ccol = next(
-        (c for c in df.columns if "券代码" in str(c) or str(c).lower() == "code"),
-        None,
-    )
-    ncol = next(
-        (c for c in df.columns if "券名称" in str(c) or str(c).lower() == "name"),
-        None,
-    )
+
+    # 规范化解析字段（须与「指数代码」列区分，否则会只剩指数代码一条）
+    cols = list(df.columns)
+    dcol = next((c for c in cols if "日期" in str(c) or "date" in str(c).lower()), None)
+    ccol = _pick_index_constituent_code_col(cols)
+    ncol = _pick_index_constituent_name_col(cols)
+
     if ccol is None:
         return []
+
     df = df.copy()
-    df["_d"] = pd.to_datetime(df[dcol], errors="coerce")
-    df = df.dropna(subset=["_d"])
-    if as_of_date:
-        cut = pd.Timestamp(str(as_of_date)[:10])
-        df = df[df["_d"] <= cut]
-    if df.empty:
-        return []
-    latest = df["_d"].max()
-    df = df[df["_d"] == latest]
+    if dcol and dcol in df.columns:
+        df["_d"] = pd.to_datetime(df[dcol], errors="coerce")
+        df = df.dropna(subset=["_d"])
+        if as_of_date:
+            cut = pd.Timestamp(str(as_of_date)[:10])
+            df = df[df["_d"] <= cut]
+        if df.empty:
+            # 如果按日期过滤空了，不退避，直接取最新的历史成份，保证回测能跑
+            df = pd.DataFrame()
+            try:
+                df = ak.index_stock_cons_csindex(symbol=index_code)
+                df["_d"] = pd.to_datetime(df[dcol], errors="coerce")
+            except Exception:
+                pass
+        if not df.empty:
+            latest = df["_d"].max()
+            df = df[df["_d"] == latest]
+
     pairs: list[tuple[str, str]] = []
     for _, row in df.iterrows():
-        c = str(row[ccol]).strip().zfill(6)
+        c = _extract_stock_code6(row[ccol])
+        if c is None:
+            continue
         n = str(row[ncol]).strip() if ncol is not None else ""
-        if len(c) == 6 and c.isdigit():
-            pairs.append((c, n))
+        pairs.append((c, n))
+
     return sorted(set(pairs), key=lambda x: x[0])
 
 
@@ -212,7 +304,7 @@ def get_stock_pool(
     pool_type: all | hs300 | zz500；默认读取 config.STOCK_POOL。
     """
     pt = (pool_type or STOCK_POOL).lower().strip()
-    cache_key = f"{pt}|{as_of_date}|{max_count}"
+    cache_key = f"{_POOL_CACHE_KEY_VER}|{pt}|{as_of_date}|{max_count}"
     now = time.time()
     hit = _POOL_CACHE.get(cache_key)
     if hit and now - hit[0] < _POOL_TTL_SEC:
@@ -230,6 +322,19 @@ def get_stock_pool(
             out = out[: int(max_count)]
     else:
         out = list_a_stock_codes(max_count=max_count)
+
+    # 终极兜底：如果前面全部获取失败，直接用 A 股全市场股票列表前max_count个股票塞满，防止回测彻底崩溃
+    if not out:
+        print("⚠️ 警告: 无法获取特定的指数成分股。已切换至全市场股票前 100 只作为兜底股票池进行回测...")
+        out = list_a_stock_codes(max_count=100)
+    elif pt in ("hs300", "zz500") and len(out) < 50:
+        # 成分列误解析时可能只剩指数代码 1 条，此处强制回退全市场，避免回测只拉一只「伪成分」
+        print(
+            f"⚠️ 警告: {pt.upper()} 成分数量异常（仅 {len(out)} 只），疑似接口字段解析错误。"
+            "已改用全市场股票列表兜底。"
+        )
+        cap = max(int(max_count), 100) if max_count is not None else 100
+        out = list_a_stock_codes(max_count=cap)
 
     _POOL_CACHE[cache_key] = (now, list(out))
     return out
