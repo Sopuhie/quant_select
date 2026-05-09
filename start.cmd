@@ -14,11 +14,12 @@ echo.
 echo ========================================
 echo   量化选股 - 测试启动菜单
 echo ========================================
-echo   1  Streamlit 复盘  ^(streamlit run app.py^)
-echo   2  每日选股        ^(run_daily，200 只，8 线程^)
-echo   3  训练模型        ^(示例截止 2024-12-31，200 只^)
-echo   4  每日选股 ^(强制覆盖当日，成功后按 config 推送钉钉^)
-echo   5  回填收益 ^(update_returns.py^)
+echo   1  Streamlit 复盘     ^(streamlit run app.py^)
+echo   2  每日选股           ^(run_daily，200 只，8 线程^)
+echo   3  训练模型           ^(示例截止 2024-12-31，200 只^)
+echo   4  每日选股 ^(强制覆盖当日记录，--force^)
+echo   5  回填收益           ^(scripts\update_returns.py^)
+echo   6  钉钉推送           ^(按最近交易日推送库内 Top 选股，需已配置 webhook^)
 echo   0  退出
 echo ========================================
 set /p choice=请输入数字后回车: 
@@ -28,6 +29,7 @@ if "%choice%"=="2" goto daily
 if "%choice%"=="3" goto train
 if "%choice%"=="4" goto daily_force
 if "%choice%"=="5" goto returns
+if "%choice%"=="6" goto dingtalk
 if "%choice%"=="0" goto eof
 echo 无效选择，请重试。
 goto menu
@@ -50,6 +52,10 @@ goto after_run
 
 :returns
 python scripts\update_returns.py
+goto after_run
+
+:dingtalk
+python -c "from src.dingtalk_notifier import maybe_push_daily_selections; from src.utils import get_last_trading_date; td=get_last_trading_date(); print('trade_date=', td); print('pushed=', maybe_push_daily_selections(td))"
 goto after_run
 
 :after_run

@@ -27,6 +27,40 @@ def add_calendar_days(d: str, n: int) -> str:
     return (base + timedelta(days=n)).isoformat()
 
 
+def get_last_trading_date(as_of: date | datetime | str | None = None) -> str:
+    """
+    返回 as_of 当日或之前的最近一个 A 股交易日（YYYY-MM-DD）。
+    优先使用新浪交易日历；失败时退回「跳过周六日」的近似工作日。
+    """
+    if as_of is None:
+        base = datetime.now().date()
+    elif isinstance(as_of, datetime):
+        base = as_of.date()
+    elif isinstance(as_of, date):
+        base = as_of
+    else:
+        base = datetime.strptime(str(as_of)[:10], "%Y-%m-%d").date()
+
+    try:
+        from akshare.tool.trade_date_hist import tool_trade_date_hist_sina
+
+        df = tool_trade_date_hist_sina()
+        trade_dates = sorted(
+            pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d").tolist()
+        )
+        cut = base.strftime("%Y-%m-%d")
+        past = [d for d in trade_dates if d <= cut]
+        if past:
+            return past[-1]
+    except Exception:
+        pass
+
+    d = base
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.isoformat()
+
+
 def next_trade_day_after(d: str) -> str | None:
     """
     给定YYYYMMDD或YYYY-MM-DD的「当前选股所属交易日」d，返回其后的下一个A股交易日（YYYY-MM-DD）。
