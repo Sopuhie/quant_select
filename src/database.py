@@ -51,6 +51,21 @@ CREATE TABLE IF NOT EXISTS model_versions (
 CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_selections(trade_date);
 CREATE INDEX IF NOT EXISTS idx_predict_date ON daily_predictions(trade_date);
 CREATE INDEX IF NOT EXISTS idx_predict_rank ON daily_predictions(rank_in_market);
+
+CREATE TABLE IF NOT EXISTS stock_daily_kline (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    stock_name TEXT NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    volume REAL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, stock_code)
+);
+CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date);
 """
 
 
@@ -111,6 +126,54 @@ def insert_daily_selections(
         )
     with get_connection(db_path) as conn:
         conn.executemany(sql, batch)
+
+
+def upsert_stock_daily_klines(
+    rows: Iterable[dict[str, Any]],
+    db_path: Path | None = None,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> None:
+    """写入或更新本地日线缓存；冲突键为 (date, stock_code)。
+
+    若传入 ``connection``，则不单独提交/关闭连接（由调用方 ``commit``）。
+    """
+    sql = """
+    INSERT INTO stock_daily_kline (date, stock_code, stock_name, open, high, low, close, volume)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(date, stock_code) DO UPDATE SET
+        stock_name = excluded.stock_name,
+        open = excluded.open,
+        high = excluded.high,
+        low = excluded.low,
+        close = excluded.close,
+        volume = excluded.volume
+    """
+    batch: list[tuple[Any, ...]] = []
+    for r in rows:
+        batch.append(
+            (
+                r["date"],
+                str(r["stock_code"]).strip().zfill(6),
+                str(r.get("stock_name") or "").strip(),
+                float(r["open"]) if r.get("open") is not None else None,
+                float(r["high"]) if r.get("high") is not None else None,
+                float(r["low"]) if r.get("low") is not None else None,
+                float(r["close"]) if r.get("close") is not None else None,
+                float(r["volume"]) if r.get("volume") is not None else None,
+            )
+        )
+    if not batch:
+        return
+    own = connection is None
+    conn = connection or sqlite3.connect(str(db_path or DB_PATH))
+    try:
+        conn.executemany(sql, batch)
+        if own:
+            conn.commit()
+    finally:
+        if own:
+            conn.close()
 
 
 def insert_daily_predictions(

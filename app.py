@@ -1,7 +1,7 @@
 """
 Streamlit 复盘与全功能控制台（暗黑霓虹科技风最终整合版）。
 支持一键在界面运行：
-  1. 增量/全量数据拉取（连通性探测）
+  1. 全量/增量本地行情同步（stock_daily_kline，对齐「全 A」上限可配）
   2. 模型重新训练
   3. 每日选股预测
   4. 历史收益回填
@@ -288,7 +288,14 @@ def _sanitize_latest_selection(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str
 
 # ================= 6. 选项卡定义 =================
 tab_today, tab_hist, tab_backtest, tab_perf, tab_data, tab_settings = st.tabs(
-    ["🎯 今日推荐", "📜 历史复盘", "📈 历史回测", "⚡ 模型表现", "⚙️ 系统控制台", "🔧 环境设置"]
+    [
+        "🎯 今日推荐",
+        "📜 历史与股票K线查询",
+        "📈 历史回测",
+        "⚡ 模型表现",
+        "⚙️ 系统控制台",
+        "🔧 环境设置",
+    ]
 )
 
 # ----------------- TAB 1: 今日推荐 -----------------
@@ -372,7 +379,7 @@ with tab_today:
                     st.session_state.selected_stock = None
                     st.rerun()
 
-            with st.spinner("加载K线数据中..."):
+            with st.spinner("从本地读取K线中..."):
                 df_kline = get_stock_kline_data(
                     st.session_state.selected_stock["code"],
                     days=365,
@@ -415,8 +422,43 @@ with tab_today:
                 else:
                     st.error("绘制K线图失败")
 
-# ----------------- TAB 2: 历史复盘 -----------------
+# ----------------- TAB 2: 历史复盘与个股极速检索 -----------------
 with tab_hist:
+    st.subheader("🔍 全市场个股本地 K 线秒开浏览器")
+
+    col_input, col_info = st.columns([1.5, 3.5])
+    with col_input:
+        search_code = st.text_input(
+            "📝 输入任意 6 位股票代码查询K线",
+            value="000300",
+            max_chars=6,
+            key="kline_search_code",
+        )
+    with col_info:
+        st.caption(
+            "优先通过本地 SQLite（stock_daily_kline）秒开约 365 日行情；"
+            "本地缺失时将自动在线补全并写回缓存。"
+        )
+
+    q = str(search_code or "").strip()
+    if q:
+        with st.spinner("极速加载本地行情 K 线中..."):
+            df_kline = get_stock_kline_data(q, days=365)
+        if df_kline is not None and len(df_kline) > 0:
+            fig = draw_candlestick(df_kline, str(q).zfill(6), "自选查询")
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.error("绘制K线图失败")
+        else:
+            st.warning(
+                "⚠️ 暂无该股票完整本地数据。请前往「系统控制台」运行「本地行情同步」，"
+                "或等待在线补全拉取完成。"
+            )
+
+    st.markdown("---")
+    st.subheader("📜 历史选股记录复盘")
+
     history_df = query_df(
         """
         SELECT trade_date, rank, stock_code, stock_name, score, close_price,
@@ -425,48 +467,16 @@ with tab_hist:
         ORDER BY trade_date DESC, rank ASC
         """
     )
-    if history_df.empty:
-        st.info("暂无选股记录。")
-    else:
-        st.subheader("📜 历史选股记录复盘")
-
-        history_df = history_df.copy()
-        history_df["display"] = (
-            history_df["trade_date"].astype(str)
-            + " - "
-            + history_df["stock_code"].astype(str)
-            + " "
-            + history_df["stock_name"].astype(str)
-        )
-        options = history_df["display"].tolist()
-        selected = st.selectbox(
-            "选择股票查看K线图",
-            options=options,
-            key="history_select",
-        )
-
-        if selected:
-            sel_row = history_df.loc[history_df["display"] == selected].iloc[0]
-            selected_code = sel_row["stock_code"]
-            selected_name = sel_row["stock_name"]
-
-            with st.spinner(f"加载 {selected_code} {selected_name} K线数据..."):
-                df_kline = get_stock_kline_data(selected_code, days=365)
-            if df_kline is not None and len(df_kline) > 0:
-                fig = draw_candlestick(df_kline, selected_code, selected_name)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.error("绘制K线图失败")
-
-        st.markdown("---")
-        display_df = history_df.drop(columns=["display"], errors="ignore").copy()
+    if not history_df.empty:
+        display_df = history_df.copy()
         for col in ["next_day_return", "hold_5d_return"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda x: f"{float(x):.2%}" if pd.notna(x) else "—"
                 )
         st.dataframe(display_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("暂无历史推荐股票。")
 
 # ----------------- TAB 3: 📈 历史回测 -----------------
 with tab_backtest:
@@ -641,24 +651,24 @@ with tab_data:
         st.markdown(
             """
             <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
-                <h4 style="color: #00FFCC; margin-top:0;">📊 任务 A：更新本地数据池</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">校验股票池与行情拉取连通性（并发拉 K 线样本）；不写入选股表。完整训练/预测会按需在线拉取并计算因子。</p>
+                <h4 style="color: #00FFCC; margin-top:0;">📊 任务 A：全量/增量行情同步</h4>
+                <p style="font-size: 0.85rem; color: #8f9cae;">写入本地表 stock_daily_kline：无历史则拉约 365 自然日；已有则从最近日期次日增量 UPSERT（默认最多约 6000 只，见脚本参数）。</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
         data_btn = st.button(
-            "🚀 开始数据更新", key="run_data_update", use_container_width=True
+            "🚀 运行本地行情同步", key="run_data_update", use_container_width=True
         )
         if data_btn:
-            with st.spinner("正在拉取行情样本并校验连通性..."):
+            with st.spinner("正在下载日线并写入本地 SQLite..."):
                 ret_code, _log = run_command_interactive(
-                    [sys.executable, str(ROOT / "run_daily.py"), "--only-data"]
+                    [sys.executable, str(ROOT / "scripts" / "update_local_data.py")]
                 )
                 if ret_code == 0:
-                    st.success("✅ 数据连通性校验完成！")
+                    st.success("✅ 本地行情同步完成！")
                 else:
-                    st.error("❌ 任务执行异常，请查看上方实时日志")
+                    st.error("❌ 同步异常，请查看上方实时日志")
 
     with row1_col2:
         st.markdown(
@@ -735,7 +745,7 @@ with tab_data:
                 )
                 if ret_code == 0:
                     st.success(
-                        "✅ 回测完成！已成功生成 data/backtest_results.csv"
+                        f"✅ 回测完成！已生成 {DATA_DIR / 'backtest_results.csv'}"
                     )
                 else:
                     st.error("❌ 回测异常，请查阅上方调试日志")
