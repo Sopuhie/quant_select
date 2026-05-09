@@ -1,5 +1,5 @@
 """
-Streamlit 复盘界面（暗黑霓虹科技风整合版）。
+Streamlit 复盘界面（暗黑霓虹科技风最终整合版）。
 
 启动（在 quant_select 目录下）:
   streamlit run app.py
@@ -7,6 +7,8 @@ Streamlit 复盘界面（暗黑霓虹科技风整合版）。
 from __future__ import annotations
 
 import io
+import os
+import platform
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +26,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+import plotly.graph_objects as go
+
 from src.config import DATA_DIR, DB_PATH, FEATURE_COLUMNS, MODEL_PATH, TOP_N_SELECTION
 from src.config_manager import config_manager
 from src.database import init_db, query_df
@@ -40,21 +44,81 @@ st.set_page_config(
 )
 init_db()
 
-# ================= 2. 注入自定义 Cyberpunk CSS 样式 =================
+# ================= 2. 定义全局酷炫 Plotly 绘图模板 =================
+PLOTLY_CYBER_TEMPLATE = "plotly_dark"
+COLOR_CYBER_TEAL = "#00FFCC"
+COLOR_CYBER_ORANGE = "#FF9900"
+COLOR_TEXT = "#8f9cae"
+COLOR_GRID = "rgba(255, 255, 255, 0.05)"
+
+
+def get_cyber_layout(title: str = "图表名称", *, y_pct_suffix: bool = True) -> go.Layout:
+    y_axis = dict(
+        showgrid=True,
+        gridcolor=COLOR_GRID,
+        zeroline=False,
+        linecolor=COLOR_GRID,
+    )
+    if y_pct_suffix:
+        y_axis["suffix"] = "%"
+    return go.Layout(
+        title=title,
+        template=PLOTLY_CYBER_TEMPLATE,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=COLOR_TEXT),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor=COLOR_GRID,
+            zeroline=False,
+            linecolor=COLOR_GRID,
+        ),
+        yaxis=y_axis,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            font=dict(color=COLOR_TEXT),
+        ),
+        margin=dict(l=50, r=20, t=60, b=40),
+    )
+
+
+def draw_cyber_area_trace(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    name: str = "策略",
+) -> go.Figure:
+    fig.add_trace(
+        go.Scatter(
+            x=df[x_col],
+            y=df[y_col],
+            mode="lines",
+            name=name,
+            line=dict(color=COLOR_CYBER_TEAL, width=3, shape="spline"),
+            fill="tozeroy",
+            fillcolor="rgba(0, 255, 204, 0.04)",
+        )
+    )
+    return fig
+
+
+# ================= 3. 注入自定义 CSS 样式 =================
 st.markdown(
     """
     <style>
-    /* 隐藏 Streamlit 顶部红线与页脚 */
     header {visibility: hidden;}
     footer {visibility: hidden;}
     #MainMenu {visibility: hidden;}
 
-    /* 全局暗黑背景微调 */
     .stApp {
         background-color: #0d0e15;
     }
 
-    /* 针对 st.metric 指标卡片进行玻璃拟态美化 */
     [data-testid="stMetricValue"] {
         font-family: 'Courier New', Courier, monospace;
         color: #00FFCC !important;
@@ -79,7 +143,6 @@ st.markdown(
         box-shadow: 0 0 15px rgba(0, 255, 204, 0.2);
     }
 
-    /* 自定义 Tab 选项卡样式 */
     .stTabs [data-baseweb="tab-list"] {
         gap: 10px;
         background-color: rgba(30, 34, 51, 0.3);
@@ -106,12 +169,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ================= 3. 头部标题栏 =================
+# ================= 4. 头部标题栏 =================
 st.markdown(
     """
     <div style="display: flex; align-items: center; margin-bottom: 25px;">
         <div style="background-color: #00FFCC; width: 6px; height: 35px; border-radius: 3px; margin-right: 15px; box-shadow: 0 0 10px #00FFCC;"></div>
-        <h1 style="color: #ffffff; margin: 0; font-family: 'Segoe UI', sans-serif; font-weight: 800; letter-spacing: 1px;">A-QUANT LITE <span style="color: #00FFCC; font-size: 1.2rem; font-weight: 400;">智能选股系统</span></h1>
+        <h1 style="color: #ffffff; margin: 0; font-family: 'Segoe UI', sans-serif; font-weight: 800; letter-spacing: 1px;">A-QUANT LITE <span style="color: #00FFCC; font-size: 1.2rem; font-weight: 400;">智能选股控制台</span></h1>
     </div>
     """,
     unsafe_allow_html=True,
@@ -154,7 +217,7 @@ def _sanitize_latest_selection(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str
     return out, msgs
 
 
-# ================= 4. 核心功能选项卡定义 =================
+# ================= 5. 核心功能选项卡定义 =================
 tab_today, tab_hist, tab_backtest, tab_perf, tab_data, tab_pred, tab_settings = st.tabs(
     ["今日推荐", "历史复盘", "📈 历史回测", "模型表现", "数据管理", "全市场预测", "⚙️ 系统设置"]
 )
@@ -173,11 +236,7 @@ with tab_today:
             st.warning(w)
 
         if len(today_df) != TOP_N_SELECTION:
-            st.info(
-                f"{latest_date} 暂无完整的 Top{TOP_N_SELECTION} 选股展示数据"
-                f"（当前有效记录 {len(today_df)} 条）。"
-                f"若数据库存在重复写入，可运行：`python scripts/clean_duplicates.py` 后刷新页面。"
-            )
+            st.info(f"{latest_date} 暂无完整的 Top{TOP_N_SELECTION} 选股展示数据。")
 
         if "selected_stock" not in st.session_state:
             st.session_state.selected_stock = None
@@ -187,7 +246,6 @@ with tab_today:
             for i, col in enumerate(cols):
                 row = today_df.iloc[i]
                 with col:
-                    # 重新美化为暗黑青边霓虹卡片
                     st.markdown(
                         f"""
                         <div style="
@@ -225,16 +283,6 @@ with tab_today:
                         unsafe_allow_html=True,
                     )
 
-                    if pd.notna(row.get("next_day_return")):
-                        h5 = row.get("hold_5d_return")
-                        if pd.notna(h5):
-                            st.caption(
-                                f"📈 已回填：次日 {float(row['next_day_return']):.2%} · "
-                                f"5日 {float(h5):.2%}"
-                            )
-                        else:
-                            st.caption(f"📈 已回填：次日 {float(row['next_day_return']):.2%}")
-
                     btn_key = f"kline_btn_{row['stock_code']}"
                     if st.button(
                         f"📊 查看K线 - {row['stock_name']}",
@@ -262,7 +310,7 @@ with tab_today:
             with st.spinner("加载K线数据中..."):
                 df_kline = get_stock_kline_data(
                     st.session_state.selected_stock["code"],
-                    days=60,
+                    days=90,
                 )
 
             if df_kline is not None and len(df_kline) > 0:
@@ -272,7 +320,13 @@ with tab_today:
                     st.session_state.selected_stock["name"],
                 )
                 if fig:
+                    cyber = get_cyber_layout(
+                        f"{st.session_state.selected_stock['code']} K线",
+                        y_pct_suffix=False,
+                    )
+                    fig.update_layout(cyber, height=600)
                     st.plotly_chart(fig, use_container_width=True)
+
                     latest = df_kline.iloc[-1]
                     col_a, col_b, col_c, col_d = st.columns(4)
                     with col_a:
@@ -308,7 +362,7 @@ with tab_hist:
     history_df = query_df(
         """
         SELECT trade_date, rank, stock_code, stock_name, score, close_price,
-               next_day_return, hold_5d_return, created_at
+               next_day_return, hold_5d_return
         FROM daily_selections
         ORDER BY trade_date DESC, rank ASC
         """
@@ -316,9 +370,8 @@ with tab_hist:
     if history_df.empty:
         st.info("暂无选股记录。")
     else:
-        st.subheader("📜 历史选股记录")
+        st.subheader("📜 历史选股记录复盘")
 
-        st.subheader("🔍 查看历史股票K线")
         history_df = history_df.copy()
         history_df["display"] = (
             history_df["trade_date"].astype(str)
@@ -344,6 +397,10 @@ with tab_hist:
             if df_kline is not None and len(df_kline) > 0:
                 fig = draw_candlestick(df_kline, selected_code, selected_name)
                 if fig:
+                    fig.update_layout(
+                        get_cyber_layout(f"{selected_code} K线复盘", y_pct_suffix=False),
+                        height=600,
+                    )
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.error("绘制K线图失败")
@@ -351,43 +408,21 @@ with tab_hist:
                 st.error("无法获取K线数据，请检查网络或数据源")
 
         st.markdown("---")
-        st.subheader("📋 历史记录表")
-
         display_df = history_df.drop(columns=["display"], errors="ignore").copy()
         for col in ["next_day_return", "hold_5d_return"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda x: f"{float(x):.2%}" if pd.notna(x) else "—"
                 )
-
         st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-        st.subheader("📊 历史统计")
-        valid_returns = history_df[history_df["next_day_return"].notna()]
-        if len(valid_returns) > 0:
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                win_rate = (valid_returns["next_day_return"] > 0).mean()
-                st.metric("次日胜率", f"{win_rate:.1%}")
-            with col_b:
-                avg_return = valid_returns["next_day_return"].mean()
-                st.metric("平均次日收益", f"{avg_return:.2%}")
-            with col_c:
-                st.metric("样本数量", len(valid_returns))
-        else:
-            st.info("暂无收益率数据，请先运行 scripts/update_returns.py")
 
 # ----------------- TAB 3: 📈 历史回测 -----------------
 with tab_backtest:
     st.subheader("📈 策略历史回测分析")
-    st.caption(
-        "基于 LightGBM 历史滚动预测与周期换仓策略（2024 样本外滚动，默认持有 5 个交易日）。"
-    )
+    st.caption("基于 LightGBM 历史滚动预测与周期换仓策略（2024 样本外滚动）。")
 
     if not BACKTEST_CSV_PATH.exists():
-        st.info(
-            "📊 尚未生成历史回测数据。你可以点击下方按钮运行 2024 全年滚动回测（程序会优先使用本地 SQLite 历史行情，若数据不足则会在线补充）。"
-        )
+        st.info("📊 尚未生成历史回测数据。点击下方按钮运行 2024 全年滚动回测。")
         col_run, _ = st.columns([2, 3])
         with col_run:
             if st.button(
@@ -395,9 +430,7 @@ with tab_backtest:
                 type="primary",
                 use_container_width=True,
             ):
-                with st.spinner(
-                    "回测执行中，正在滚动计算因子并打分选股，请耐心等待..."
-                ):
+                with st.spinner("回测执行中，请耐心等待..."):
                     try:
                         res = subprocess.run(
                             [
@@ -429,7 +462,10 @@ with tab_backtest:
     else:
         try:
             df_res = pd.read_csv(BACKTEST_CSV_PATH)
-            df_res["strategy_cum"] = (df_res["nav"] / df_res["nav"].iloc[0] - 1.0) * 100
+
+            df_res["strategy_cum"] = (
+                df_res["nav"] / df_res["nav"].iloc[0] - 1.0
+            ) * 100
 
             has_bench = (
                 "benchmark_close" in df_res.columns
@@ -442,51 +478,21 @@ with tab_backtest:
                         df_res["benchmark_close"] / valid_bench.iloc[0] - 1.0
                     ) * 100
 
-            total_days = len(df_res)
             cum_ret = df_res["nav"].iloc[-1] / df_res["nav"].iloc[0] - 1.0
-
-            ann_factor = 242 / max(total_days - 1, 1)
-            ann_ret = (df_res["nav"].iloc[-1] / df_res["nav"].iloc[0]) ** ann_factor - 1.0
-
             peak = df_res["nav"].cummax()
-            dd = df_res["nav"] / peak - 1.0
-            mdd = dd.min()
+            mdd = (df_res["nav"] / peak - 1.0).min()
 
-            daily_returns = df_res["nav"].pct_change().fillna(0.0)
-            rf_d = (1.0 + 0.03) ** (1.0 / 242) - 1.0
-            excess = daily_returns - rf_d
-            std_d = daily_returns.std(ddof=1)
-            sharpe = (
-                (excess.mean() / std_d * (242**0.5)) if std_d > 1e-12 else 0.0
-            )
-
-            col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+            col_m1, col_m2 = st.columns(2)
             col_m1.metric("策略累计收益", f"{cum_ret * 100:.2f}%")
-            col_m2.metric("年化收益率", f"{ann_ret * 100:.2f}%")
-            col_m3.metric("最大回撤 (MDD)", f"{mdd * 100:.2f}%")
-            col_m4.metric("夏普比率 (Sharpe)", f"{sharpe:.3f}")
-
-            if has_bench and "bench_cum" in df_res.columns:
-                bench_cum_ret = df_res["bench_cum"].iloc[-1]
-                alpha_ret = df_res["strategy_cum"].iloc[-1] - bench_cum_ret
-                col_m5.metric("超额收益 (vs基准)", f"{alpha_ret:.2f}%")
-            else:
-                col_m5.metric("超额收益", "N/A")
-
-            import plotly.graph_objects as go
+            col_m2.metric("最大回撤 (MDD)", f"{mdd * 100:.2f}%")
 
             fig = go.Figure()
-
-            fig.add_trace(
-                go.Scatter(
-                    x=df_res["trade_date"],
-                    y=df_res["strategy_cum"],
-                    mode="lines",
-                    name="A-Quant Lite 策略",
-                    line=dict(color="#00FFCC", width=3),
-                    fill="tozeroy",
-                    fillcolor="rgba(0, 255, 204, 0.04)",
-                )
+            draw_cyber_area_trace(
+                fig,
+                df_res,
+                x_col="trade_date",
+                y_col="strategy_cum",
+                name="A-Quant 策略",
             )
 
             if has_bench and "bench_cum" in df_res.columns:
@@ -496,20 +502,13 @@ with tab_backtest:
                         y=df_res["bench_cum"],
                         mode="lines",
                         name="沪深 300 基准",
-                        line=dict(color="#FF9900", width=2, dash="dash"),
+                        line=dict(color=COLOR_CYBER_ORANGE, width=2, dash="dash"),
                     )
                 )
 
             fig.update_layout(
-                title="2024 滚动样本外策略 vs 沪深300 累计收益率 (%)",
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.08)"),
-                yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.08)", suffix="%"),
-                legend=dict(
-                    orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
-                ),
+                get_cyber_layout("策略 vs 沪深300 累计收益率 (%)", y_pct_suffix=True),
+                height=550,
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -530,23 +529,6 @@ with tab_backtest:
                     use_container_width=True,
                 )
 
-            with st.expander("📋 查看每日调仓资产账单明细"):
-                display_cols = [
-                    "trade_date",
-                    "nav",
-                    "cash",
-                    "hold_mv",
-                    "n_positions",
-                    "daily_return",
-                ]
-                existing_cols = [c for c in display_cols if c in df_res.columns]
-                detail_df = df_res[existing_cols].copy()
-                if "daily_return" in detail_df.columns:
-                    detail_df["daily_return"] = detail_df["daily_return"].apply(
-                        lambda x: f"{float(x):.2%}" if pd.notna(x) else "—"
-                    )
-                st.dataframe(detail_df, use_container_width=True, hide_index=True)
-
         except Exception as err:
             st.error(f"解析回测数据出错: {err}")
             if st.button("🧹 清理损坏的回测缓存"):
@@ -555,29 +537,11 @@ with tab_backtest:
 
 # ----------------- TAB 4: 模型表现 -----------------
 with tab_perf:
-    st.subheader("📊 模型表现与特征贡献度分析")
-    st.caption(
-        "分析当前激活模型的特征重要性（Feature Importance）以及回填收益率后的多维度胜率统计。"
-    )
+    st.subheader("📊 模型特征贡献度分析")
 
     conn = sqlite3.connect(str(DB_PATH))
-    perf_df = pd.read_sql_query(
-        """
-        SELECT trade_date, rank, stock_code, stock_name,
-               next_day_return, hold_5d_return
-        FROM daily_selections
-        WHERE next_day_return IS NOT NULL
-        ORDER BY trade_date DESC
-        """,
-        conn,
-    )
     model_df = pd.read_sql_query(
-        """
-        SELECT version, train_end_date, is_active, features, metrics, created_at
-        FROM model_versions
-        ORDER BY created_at DESC
-        LIMIT 5
-        """,
+        "SELECT version, is_active FROM model_versions ORDER BY id DESC LIMIT 5",
         conn,
     )
     conn.close()
@@ -585,7 +549,7 @@ with tab_perf:
     st.subheader("🎯 因子贡献度排行 (Feature Importance)")
 
     if not MODEL_PATH.exists():
-        st.warning("⚠️ 找不到本地模型文件，请先在终端运行 train_model.py 训练模型。")
+        st.warning("⚠️ 找不到本地模型文件。")
     else:
         try:
             model = joblib.load(MODEL_PATH)
@@ -603,8 +567,6 @@ with tab_perf:
                 )
                 feat_imp_df = feat_imp_df.sort_values("Importance", ascending=True)
 
-                import plotly.graph_objects as go
-
                 fig_imp = go.Figure()
                 fig_imp.add_trace(
                     go.Bar(
@@ -617,158 +579,29 @@ with tab_perf:
                                 [0, "rgba(0, 255, 204, 0.2)"],
                                 [1, "rgba(0, 255, 204, 1.0)"],
                             ],
-                            line=dict(color="#00FFCC", width=1.5),
+                            line=dict(color=COLOR_CYBER_TEAL, width=1.5),
                         ),
                         name="因子分裂次数",
                     )
                 )
 
                 fig_imp.update_layout(
-                    title="模型决策树分裂频次排行 (分值越高代表因子越核心)",
-                    template="plotly_dark",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.08)"),
-                    yaxis=dict(showgrid=False),
-                    height=450,
-                    margin=dict(l=120, r=20, t=40, b=40),
+                    get_cyber_layout(
+                        "模型决策树分裂频次排行 (分值越高代表因子越核心)",
+                        y_pct_suffix=False,
+                    ),
+                    xaxis=dict(showgrid=True, gridcolor=COLOR_GRID),
+                    height=500,
                 )
                 st.plotly_chart(fig_imp, use_container_width=True)
             else:
-                st.info("无法从当前保存的模型中解析特征重要性指标。")
+                st.info("无法解析特征重要性指标。")
         except Exception as e:
-            st.error(f"解析特征重要性时出错: {e}")
+            st.error(f"解析出错: {e}")
 
     st.markdown("---")
-
-    if len(model_df) > 0:
-        st.subheader("🧩 最近模型版本历史")
-        display_model_df = model_df.copy()
-        if "features" in display_model_df.columns:
-            display_model_df = display_model_df.drop(columns=["features"], errors="ignore")
-        st.dataframe(display_model_df, use_container_width=True, hide_index=True)
-        st.markdown("---")
-
-    if len(perf_df) > 0:
-        st.subheader("📈 历史回填数据核心指标")
-
-        col1, col2, col3, col4, col5 = st.columns(5)
-
-        win_rate_1d = (perf_df["next_day_return"] > 0).mean()
-        col1.metric(
-            "次日胜率",
-            f"{win_rate_1d:.1%}",
-            help="推荐股票次日上涨的概率",
-        )
-
-        avg_return_1d = perf_df["next_day_return"].mean()
-        col2.metric(
-            "平均次日收益",
-            f"{avg_return_1d:.2%}",
-            help="推荐股票次日的平均收益率",
-        )
-
-        top1_df = perf_df[perf_df["rank"] == 1]
-        if len(top1_df) > 0:
-            top1_win_rate = (top1_df["next_day_return"] > 0).mean()
-            col3.metric(
-                "Top1 胜率",
-                f"{top1_win_rate:.1%}",
-                help="排名第一的股票次日上涨概率",
-            )
-        else:
-            col3.metric("Top1 胜率", "暂无数据")
-
-        col4.metric("样本数量", len(perf_df), help="参与统计的选股记录数")
-
-        best_return = perf_df["next_day_return"].max()
-        worst_return = perf_df["next_day_return"].min()
-        col5.metric(
-            "收益区间",
-            f"{best_return:.1%} / {worst_return:.1%}",
-            help="最大收益 / 最小收益",
-        )
-
-        st.markdown("---")
-        st.subheader("📊 按排名分组表现")
-
-        rank_stats = perf_df.groupby("rank").agg(
-            平均收益=("next_day_return", "mean"),
-            样本数=("next_day_return", "count"),
-            胜率=("next_day_return", lambda x: (x > 0).mean()),
-        )
-        rank_stats["胜率"] = rank_stats["胜率"].apply(lambda x: f"{x:.1%}")
-        rank_stats["平均收益"] = rank_stats["平均收益"].apply(lambda x: f"{x:.2%}")
-
-        st.dataframe(rank_stats, use_container_width=True)
-
-        st.markdown("---")
-        st.subheader("📉 次日收益分布")
-
-        try:
-            import plotly.express as px
-
-            fig_hist = px.histogram(
-                perf_df,
-                x="next_day_return",
-                nbins=30,
-                title="次日收益率分布",
-                labels={"next_day_return": "次日收益率", "count": "频次"},
-                color_discrete_sequence=["#00FFCC"],
-            )
-            fig_hist.add_vline(x=0, line_dash="dash", line_color="red")
-            fig_hist.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                height=400,
-            )
-            st.plotly_chart(fig_hist, use_container_width=True)
-        except Exception:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.hist(perf_df["next_day_return"], bins=20, edgecolor="black", color="#00FFCC")
-            ax.axvline(x=0, color="r", linestyle="--", linewidth=2)
-            ax.set_xlabel("次日收益率")
-            ax.set_ylabel("频次")
-            ax.set_title("次日收益率分布")
-            st.pyplot(fig)
-            plt.close(fig)
-
-        st.markdown("---")
-        st.subheader("📈 历史表现趋势")
-
-        daily_avg = (
-            perf_df.groupby("trade_date")["next_day_return"]
-            .agg(mean="mean", count="count")
-            .reset_index()
-        )
-        daily_avg.columns = ["日期", "平均收益", "股票数量"]
-        daily_avg = daily_avg.sort_values("日期")
-
-        if len(daily_avg) > 1:
-            try:
-                import plotly.express as px
-
-                fig_line = px.line(
-                    daily_avg,
-                    x="日期",
-                    y="平均收益",
-                    title="每日平均收益趋势",
-                    markers=True,
-                )
-                fig_line.add_hline(y=0, line_dash="dash", line_color="red")
-                fig_line.update_layout(
-                    template="plotly_dark",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                )
-                st.plotly_chart(fig_line, use_container_width=True)
-            except Exception:
-                st.line_chart(daily_avg.set_index("日期")["平均收益"])
-        else:
-            st.info("需要至少2个交易日的数据才能显示趋势图")
-    else:
-        st.info("📭 暂无真实选股后回填的收益率数据。")
+    st.subheader("🧩 模型版本历史")
+    st.dataframe(model_df, hide_index=True, use_container_width=True)
 
 # ----------------- TAB 5: 数据管理 -----------------
 with tab_data:
@@ -859,7 +692,6 @@ with tab_pred:
 with tab_settings:
     st.subheader("⚙️ 系统状态与配置管理")
 
-    # 既然钉钉推送暂不使用，我们把钉钉配置归纳进折叠面板
     with st.expander("🔌 钉钉群机器人集成设置（暂不启用）"):
         ding_config = config_manager.get_dingtalk_config()
         time_options = ["09:30", "15:00", "16:00", "17:00", "18:00", "20:00"]
@@ -908,19 +740,15 @@ with tab_settings:
                 if not webhook_url.strip():
                     st.warning("请先填写 Webhook")
                 else:
-                    DingTalkNotifier(webhook_url.strip(), secret.strip() or None).send_text(
-                        "A-Quant Lite：钉钉测试推送"
-                    )
+                    DingTalkNotifier(
+                        webhook_url.strip(), secret.strip() or None
+                    ).send_text("A-Quant Lite：钉钉测试推送")
                     st.success("已发送测试消息（若机器人正常应秒内收到）")
             except Exception as ex:
                 st.error(f"测试失败: {ex}")
 
-    # 新增系统运行状态面板
     st.markdown("---")
     st.subheader("🖥️ 宿主运行环境状态检测")
-
-    import os
-    import platform
 
     col_sys1, col_sys2, col_sys3 = st.columns(3)
 

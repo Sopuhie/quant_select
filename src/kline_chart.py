@@ -1,6 +1,6 @@
 """
 K线图模块
-用于获取股票历史数据并绘制K线图
+用于获取股票历史数据并绘制无缝连续的K线图
 """
 from __future__ import annotations
 
@@ -31,13 +31,6 @@ def _append_ma(df: pd.DataFrame) -> pd.DataFrame:
 def get_stock_kline_data(stock_code, days=60):
     """
     获取股票K线数据
-
-    Args:
-        stock_code: 股票代码，如 '600219' 或 '000983'
-        days: 获取多少天的数据
-
-    Returns:
-        DataFrame with columns: date, open, high, low, close, volume, ma5, ma10, ma20
     """
     stock_code = str(stock_code).zfill(6)
 
@@ -116,15 +109,12 @@ def get_stock_kline_data(stock_code, days=60):
 
 def draw_candlestick(df, stock_code, stock_name):
     """
-    绘制K线图
+    绘制无留白连续K线图
 
     Args:
-        df: 包含 date, open, high, low, close, volume 的 DataFrame（可含 ma5/ma10/ma20）
+        df: 包含 date, open, high, low, close, volume 的 DataFrame
         stock_code: 股票代码
         stock_name: 股票名称
-
-    Returns:
-        plotly Figure 对象
     """
     if df is None or len(df) == 0:
         return None
@@ -133,46 +123,62 @@ def draw_candlestick(df, stock_code, stock_name):
     if "ma5" not in df.columns:
         df = _append_ma(df)
 
+    # 格式化日期显示为 YYYY-MM-DD 字符串，作为 category 类型的坐标，实现无缝连贯
+    date_strs = df["date"].dt.strftime("%Y-%m-%d").tolist()
+
+    # 创建双子图，上方K线占 75%，下方成交量占 25%
     fig = make_subplots(
         rows=2,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.03,
-        row_heights=[0.7, 0.3],
+        row_heights=[0.75, 0.25],
     )
+
+    # 1. 绘制 K 线部分 (红涨绿跌，契合您的要求)
+    # 阳线颜色（Red） 阴线颜色（Green）
+    color_up = "#FF3333"
+    color_down = "#00CC66"
 
     fig.add_trace(
         go.Candlestick(
-            x=df["date"],
+            x=date_strs,
             open=df["open"],
             high=df["high"],
             low=df["low"],
             close=df["close"],
             name="K线",
+            increasing_line_color=color_up,
+            increasing_fillcolor=color_up,
+            decreasing_line_color=color_down,
+            decreasing_fillcolor=color_down,
         ),
         row=1,
         col=1,
     )
 
-    colors = ["red" if c >= o else "green" for c, o in zip(df["close"], df["open"])]
+    # 2. 绘制成交量柱状图 (颜色与 K 线完全一致)
+    volume_colors = [color_up if c >= o else color_down for c, o in zip(df["close"], df["open"])]
 
     fig.add_trace(
         go.Bar(
-            x=df["date"],
+            x=date_strs,
             y=df["volume"],
             name="成交量",
-            marker_color=colors,
+            marker_color=volume_colors,
+            marker_line_width=0,
         ),
         row=2,
         col=1,
     )
 
+    # 3. 绘制均线 (使用荧光配色凸显暗黑风格)
     fig.add_trace(
         go.Scatter(
-            x=df["date"],
+            x=date_strs,
             y=df["ma5"],
             name="MA5",
-            line=dict(color="orange", width=1.5),
+            line=dict(color="#00FFCC", width=1.5),  # 荧光青
         ),
         row=1,
         col=1,
@@ -180,10 +186,10 @@ def draw_candlestick(df, stock_code, stock_name):
 
     fig.add_trace(
         go.Scatter(
-            x=df["date"],
+            x=date_strs,
             y=df["ma10"],
             name="MA10",
-            line=dict(color="blue", width=1.5),
+            line=dict(color="#FF00FF", width=1.5),  # 荧光紫
         ),
         row=1,
         col=1,
@@ -191,26 +197,65 @@ def draw_candlestick(df, stock_code, stock_name):
 
     fig.add_trace(
         go.Scatter(
-            x=df["date"],
+            x=date_strs,
             y=df["ma20"],
             name="MA20",
-            line=dict(color="purple", width=1.5),
+            line=dict(color="#FFFF00", width=1.5),  # 荧光黄
         ),
         row=1,
         col=1,
     )
 
+    # ================= 🚀 极简暗黑 Layout 升级（去除繁琐网格） =================
+    COLOR_GRID = "rgba(255, 255, 255, 0.04)"  # 极淡的边框线
+
     fig.update_layout(
-        title=f"{stock_code} {stock_name} - K线图",
-        xaxis_title="日期",
-        yaxis_title="价格",
-        height=600,
+        title=f"{stock_code} {stock_name} (无间断连续K线)",
         template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
         xaxis_rangeslider_visible=False,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=50, r=20, t=60, b=40),
     )
 
-    fig.update_yaxes(title_text="价格", row=1, col=1)
-    fig.update_yaxes(title_text="成交量", row=2, col=1)
+    # 核心点：强制 X 轴为 category 类型。这会使 Plotly 忽略周末的时间差，让蜡烛图完美连贯！
+    fig.update_xaxes(
+        type="category",
+        showgrid=False,  # 关掉网格线，让画面简洁干净
+        linecolor=COLOR_GRID,
+        tickfont=dict(color="#8f9cae"),
+        row=1,
+        col=1,
+    )
+    fig.update_xaxes(
+        type="category",
+        showgrid=False,
+        linecolor=COLOR_GRID,
+        tickfont=dict(color="#8f9cae"),
+        row=2,
+        col=1,
+    )
+
+    fig.update_yaxes(
+        showgrid=True,
+        gridcolor=COLOR_GRID,  # y轴仅保留淡淡的水平参考线
+        zeroline=False,
+        linecolor=COLOR_GRID,
+        tickfont=dict(color="#8f9cae"),
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridcolor=COLOR_GRID,
+        zeroline=False,
+        linecolor=COLOR_GRID,
+        tickfont=dict(color="#8f9cae"),
+        row=2,
+        col=1,
+    )
 
     return fig
 
