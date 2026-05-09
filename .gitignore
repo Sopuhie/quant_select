@@ -17,3 +17,4 @@ ENV/
 
 # 数据库文件
 stocks.db
+/data/stocks_bak20260508.db
