@@ -66,6 +66,18 @@ CREATE TABLE IF NOT EXISTS stock_daily_kline (
     UNIQUE(date, stock_code)
 );
 CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date);
+
+CREATE TABLE IF NOT EXISTS system_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    run_time TEXT NOT NULL,
+    parameters TEXT,
+    log_output TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_logs_task_name ON system_logs(task_name);
+CREATE INDEX IF NOT EXISTS idx_logs_created ON system_logs(created_at);
 """
 
 
@@ -200,6 +212,32 @@ def insert_daily_predictions(
         )
     with get_connection(db_path) as conn:
         conn.executemany(sql, batch)
+
+
+def insert_system_log(
+    task_name: str,
+    status: str,
+    parameters: str | None,
+    log_output: str | None,
+    *,
+    db_path: Path | None = None,
+) -> None:
+    """写入一条系统任务日志（SUCCESS / FAILED 等）。用于控制台任务与前端联动追溯。"""
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO system_logs (task_name, status, run_time, parameters, log_output)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(task_name).strip(),
+                str(status).strip(),
+                run_time,
+                parameters if parameters is not None else "",
+                log_output if log_output is not None else "",
+            ),
+        )
 
 
 def register_model_version(
