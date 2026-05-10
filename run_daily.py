@@ -237,6 +237,7 @@ def predict_daily(
     total = len(pairs)
     done = 0
 
+    rows_by_code: dict[str, dict[str, float | str]] = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
             ex.submit(_fetch_one_predict_row, c, n, trade_date): (c, n)
@@ -251,13 +252,16 @@ def predict_daily(
             except Exception:
                 continue
             if r:
-                rows.append(r)
+                rows_by_code[_normalize_stock_code(str(r["stock_code"]))] = r
+
+    # 按股票池顺序组装，避免仅用 as_completed 顺序导致 stable sort 下并列分时 TopN 抖动
+    rows = [rows_by_code[c] for c, _n in pairs if c in rows_by_code]
 
     if not rows:
         print("错误: 未能获取到任何有效的股票因子特征数据。")
         sys.exit(1)
 
-    # 转化为 DataFrame
+    # 转化为 DataFrame（已按 pairs 顺序，便于与训练/排查对齐）
     feat_df = pd.DataFrame(rows)
 
     # 4. 【核心升级】执行多因子截面去极值与 Z-Score 标准化清洗
@@ -290,8 +294,11 @@ def predict_daily(
     filtered_df = filtered_df.copy()
     filtered_df["score"] = scores.astype(float)
 
-    # 全市场排序并记录预测数据
-    filtered_df = filtered_df.sort_values("score", ascending=False).reset_index(drop=True)
+    # 全市场排序并记录预测数据（分数相同时按代码稳定次序，避免重复运行 Top 边界跳动）
+    filtered_df = filtered_df.sort_values(
+        ["score", "stock_code"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
     filtered_df["rank_in_market"] = range(1, len(filtered_df) + 1)
 
     # 清理当天旧数据，防止重复写入

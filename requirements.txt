@@ -1,13 +1,12 @@
 pandas>=1.5.0
 numpy>=1.23.0
 lightgbm>=4.0.0
-streamlit>=1.28.0
+streamlit>=1.33.0
 akshare>=1.12.0
 schedule>=1.2.0
 scikit-learn>=1.2.0
 joblib>=1.2.0
 matplotlib>=3.7.0
 plotly>=5.18.0
-streamlit-autorefresh>=1.0.1
 baostock>=0.8.8
 requests>=2.27.0

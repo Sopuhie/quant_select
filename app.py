@@ -112,6 +112,31 @@ def draw_cyber_area_trace(
     return fig
 
 
+@st.fragment(run_every=15)
+def render_intraday_live_charts(top3: list[tuple[str, str]]) -> None:
+    """仅重跑本片段以刷新分时图，避免整页 st_autorefresh。"""
+    live_cols = st.columns(3)
+    for i, col in enumerate(live_cols):
+        if i >= len(top3):
+            break
+        code, name = top3[i]
+        with col:
+            with st.spinner(f"正在捕获 {name} 分时..."):
+                df_live = get_realtime_min_data(code)
+                if df_live is not None and not df_live.empty:
+                    fig_live = draw_realtime_line_chart(df_live, code, name)
+                    if fig_live:
+                        st.plotly_chart(
+                            fig_live,
+                            use_container_width=True,
+                            config={"displayModeBar": False},
+                        )
+                    else:
+                        st.info("等候开盘交易数据...")
+                else:
+                    st.info("☕ 非交易时段或无今日分时数据")
+
+
 # ================= 3. 注入自定义 CSS 样式 =================
 st.markdown(
     """
@@ -379,44 +404,14 @@ with tab_today:
             )
             st.subheader("⏱️ 推荐股今日实时分时走势对比")
             st.caption(
-                "股市开盘期间（9:30–11:30，13:00–15:00），下方分时在安装 "
-                "`streamlit-autorefresh` 后约每 15 秒自动刷新，便于观察日内走势。"
+                "股市开盘期间（9:30–11:30，13:00–15:00），下方三支分时仅在本区域每约 15 秒刷新一次，"
+                "不会触发整页重载。"
             )
-
-            try:
-                from streamlit_autorefresh import st_autorefresh
-
-                st_autorefresh(interval=15000, limit=100, key="live_tracker_counter")
-            except ImportError:
-                st.caption(
-                    "💡 提示：在终端执行 `pip install streamlit-autorefresh` "
-                    "可开启分时图约每 15 秒自动刷新。"
-                )
-
-            live_cols = st.columns(3)
-            for i, col in enumerate(live_cols):
-                if i >= len(today_df):
-                    break
-                row = today_df.iloc[i]
-                with col:
-                    with st.spinner(f"正在捕获 {row['stock_name']} 分时..."):
-                        df_live = get_realtime_min_data(row["stock_code"])
-                        if df_live is not None and not df_live.empty:
-                            fig_live = draw_realtime_line_chart(
-                                df_live,
-                                row["stock_code"],
-                                row["stock_name"],
-                            )
-                            if fig_live:
-                                st.plotly_chart(
-                                    fig_live,
-                                    use_container_width=True,
-                                    config={"displayModeBar": False},
-                                )
-                            else:
-                                st.info("等候开盘交易数据...")
-                        else:
-                            st.info("☕ 非交易时段或无今日分时数据")
+            top3_pairs = [
+                (str(row["stock_code"]), str(row["stock_name"]))
+                for _, row in today_df.head(3).iterrows()
+            ]
+            render_intraday_live_charts(top3_pairs)
 
         if not t3.empty and st.session_state.selected_stock:
             st.markdown("---")
@@ -482,7 +477,7 @@ with tab_hist:
     with col_input:
         search_code = st.text_input(
             "📝 输入任意 6 位股票代码查询K线",
-            value="000300",
+            value="600519",
             max_chars=6,
             key="kline_search_code",
         )
@@ -692,6 +687,76 @@ with tab_perf:
     st.markdown("---")
     st.subheader("🧩 模型版本历史")
     st.dataframe(model_df, hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("📊 全市场模型得分排名")
+    st.caption(
+        "数据来自每日预测写入的「全市场打分」表；可选交易日浏览任意股票的模型分与名次，便于对比非 Top 推荐标的。"
+    )
+
+    pred_dates_df = query_df(
+        """
+        SELECT DISTINCT trade_date FROM daily_predictions
+        ORDER BY trade_date DESC
+        LIMIT 366
+        """
+    )
+    if pred_dates_df.empty:
+        st.info("暂无全市场打分记录。请先在「系统控制台」运行「每日预测」。")
+    else:
+        date_list = pred_dates_df["trade_date"].astype(str).tolist()
+        rank_sel_date = st.selectbox(
+            "排名所属交易日",
+            options=date_list,
+            index=0,
+            key="perf_ranking_trade_date",
+        )
+        rank_full_df = query_df(
+            """
+            SELECT rank_in_market, stock_code, stock_name, score
+            FROM daily_predictions
+            WHERE trade_date = ?
+            ORDER BY rank_in_market ASC
+            """,
+            (rank_sel_date,),
+        )
+        if rank_full_df.empty:
+            st.warning("该交易日库中无预测明细。")
+        else:
+            n_all = len(rank_full_df)
+            scope_labels = ["前 200 名", "前 500 名", "前 1000 名", "全部"]
+            scope_map = {scope_labels[0]: 200, scope_labels[1]: 500, scope_labels[2]: 1000}
+            default_label = scope_labels[1] if n_all >= 500 else (
+                scope_labels[2] if n_all > 200 else scope_labels[3]
+            )
+            scope_pick = st.selectbox(
+                "展示范围",
+                options=scope_labels,
+                index=scope_labels.index(default_label)
+                if default_label in scope_labels
+                else len(scope_labels) - 1,
+                key="perf_ranking_scope",
+            )
+            cap = n_all if scope_pick == "全部" else min(scope_map[scope_pick], n_all)
+            show_df = rank_full_df.head(cap).copy()
+            show_df = show_df.rename(
+                columns={
+                    "rank_in_market": "全市场名次",
+                    "stock_code": "代码",
+                    "stock_name": "名称",
+                    "score": "模型得分",
+                }
+            )
+            show_df["模型得分"] = show_df["模型得分"].map(lambda x: f"{float(x):.4f}")
+            st.dataframe(
+                show_df,
+                use_container_width=True,
+                hide_index=True,
+                height=min(520, 28 * (cap + 1)),
+            )
+            st.caption(
+                f"当日共 **{n_all}** 只股票参与排名；当前表格展示 **{cap}** 行（按名次升序）。"
+            )
 
 # ----------------- TAB 5: ⚙️ 系统控制台 -----------------
 with tab_data:
