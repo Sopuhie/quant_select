@@ -15,9 +15,9 @@ echo ========================================
 echo   量化选股 - 测试启动菜单
 echo ========================================
 echo   1  Streamlit 复盘     ^(streamlit run app.py^)
-echo   2  每日选股           ^(run_daily，200 只，8 线程^)
+echo   2  每日选股           ^(run_daily，200 只，8 线程，默认覆盖当日记录^)
 echo   3  训练模型           ^(示例截止 2024-12-31，200 只^)
-echo   4  每日选股 ^(强制覆盖当日记录，--force^)
+echo   4  每日选股 ^(已存在则跳过，--skip-if-exists^)
 echo   5  回填收益           ^(scripts\update_returns.py^)
 echo   6  钉钉推送           ^(按最近交易日推送库内 Top 选股，需已配置 webhook^)
 echo   0  退出
@@ -43,7 +43,7 @@ python run_daily.py --max-stocks 200 --workers 8
 goto after_run
 
 :daily_force
-python run_daily.py --max-stocks 200 --workers 8 --force
+python run_daily.py --max-stocks 200 --workers 8 --skip-if-exists
 goto after_run
 
 :train

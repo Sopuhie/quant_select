@@ -708,19 +708,38 @@ with tab_data:
             """
             <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
                 <h4 style="color: #00FFCC; margin-top:0;">📡 任务 C：执行每日智能选股</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">K 线与因子计算均基于本地 stock_daily_kline；股票池默认取库内有足够历史的代码。需要成分池时可命令行加 --online-pool。</p>
+                <p style="font-size: 0.85rem; color: #8f9cae;">K 线与因子计算均基于本地 stock_daily_kline；截面清洗与 LightGBM 打分后产出 Top 推荐。股票池默认取库内有足够历史的代码；需要成分池时可命令行加 --online-pool。</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
+        st.markdown(
+            "<div style='margin-top: 10px;'></div>", unsafe_allow_html=True
+        )
+        col_cb1, col_cb2 = st.columns(2)
+        with col_cb1:
+            include_300 = st.checkbox(
+                "🟢 包含创业板 (300 / 301)",
+                value=True,
+                help="未勾选时，选股池将排除代码以 300、301 开头的股票",
+            )
+        with col_cb2:
+            include_688 = st.checkbox(
+                "🔵 包含科创板 (688)",
+                value=True,
+                help="未勾选时，选股池将排除代码以 688 开头的股票",
+            )
         predict_btn = st.button(
             "🚀 运行每日预测", key="run_predict", use_container_width=True
         )
         if predict_btn:
             with st.spinner("提取全市场实时因子，进行 LightGBM 测算中..."):
-                ret_code, _log = run_command_interactive(
-                    [sys.executable, str(ROOT / "run_daily.py")]
-                )
+                cmd = [sys.executable, str(ROOT / "run_daily.py")]
+                if include_300:
+                    cmd.append("--include-300")
+                if include_688:
+                    cmd.append("--include-688")
+                ret_code, _log = run_command_interactive(cmd)
                 if ret_code == 0:
                     st.success(
                         "✅ 今日推荐选股计算完成！请前往「今日推荐」卡片查看。"

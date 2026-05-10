@@ -5,10 +5,12 @@
 用法:
   python run_daily.py
   python run_daily.py --trade-date 2026-05-08
-  python run_daily.py --force --workers 8
+  python run_daily.py --workers 8   # 默认覆盖当日已有选股记录
+  python run_daily.py --skip-if-exists   # 若当日已有记录则跳过
   python run_daily.py --max-stocks 500   # 可选：限制最多参与预测的股票数
   python run_daily.py --online-pool --pool hs300   # 成分在线拉取，K 线仍只读库
   python run_daily.py --only-data   # 探测本地可预测股票数量
+  python run_daily.py --include-300 --include-688   # 默认不传则从池中剔除 300/301/688 开头股票
 """
 from __future__ import annotations
 
@@ -48,6 +50,20 @@ from src.factor_calculator import clean_cross_sectional_features, compute_factor
 from src.model_trainer import load_model
 from src.predictor import filter_predictions
 from src.utils import get_last_trading_date
+
+
+def _normalize_stock_code(code: str) -> str:
+    return str(code).strip().zfill(6)
+
+
+def _board_allowed(code: str, *, include_300: bool, include_688: bool) -> bool:
+    """未勾选对应 include 时剔除创业板常见前缀 300/301 与科创板 688。"""
+    c = _normalize_stock_code(code)
+    if not include_300 and (c.startswith("300") or c.startswith("301")):
+        return False
+    if not include_688 and c.startswith("688"):
+        return False
+    return True
 
 
 def _fetch_one_predict_row(
@@ -135,13 +151,13 @@ def predict_daily(
     max_workers: int | None = None,
     verbose: bool = True,
     use_online_pool: bool = False,
+    include_300: bool = False,
+    include_688: bool = False,
 ) -> None:
     print(f"开始执行 {trade_date} 每日预测选股流程...")
-    # 检查数据库是否已存在该日记录
+    # 默认覆盖写入；仅当 force=False（命令行 --skip-if-exists）时跳过已存在记录
     if selection_exists_for_date(trade_date) and not force:
-        print(
-            f"提示: {trade_date} 选股记录已存在，跳过。若要强制覆盖，请使用 --force 参数。"
-        )
+        print(f"提示: {trade_date} 选股记录已存在，跳过（已使用 --skip-if-exists）。")
         return
 
     # 1. 载入模型
@@ -191,6 +207,21 @@ def predict_daily(
         )
         sys.exit(1)
 
+    before_board = len(pairs)
+    pairs = [
+        (c, n)
+        for c, n in pairs
+        if _board_allowed(c, include_300=include_300, include_688=include_688)
+    ]
+    if verbose and before_board != len(pairs):
+        print(
+            f"板块过滤：剔除后剩余 {len(pairs)}/{before_board} 只 "
+            f"（含创业板300/301={include_300}, 含科创板688={include_688}）。"
+        )
+    if not pairs:
+        print("错误: 板块过滤后没有剩余候选股票，请调整 --include-300 / --include-688。")
+        sys.exit(1)
+
     workers = int(max_workers if max_workers is not None else PREDICT_FETCH_WORKERS)
     workers = max(1, min(workers, 32))
     src = "在线成分∩本地" if use_online_pool else "本地库"
@@ -236,6 +267,17 @@ def predict_daily(
     filtered_df = filter_predictions(feat_df)
     if filtered_df.empty:
         print("警告: 过滤后没有剩余的候选股票。")
+        sys.exit(1)
+
+    sc = filtered_df["stock_code"].map(_normalize_stock_code)
+    mask = pd.Series(True, index=filtered_df.index)
+    if not include_300:
+        mask &= ~(sc.str.startswith("300") | sc.str.startswith("301"))
+    if not include_688:
+        mask &= ~sc.str.startswith("688")
+    filtered_df = filtered_df.loc[mask].copy()
+    if filtered_df.empty:
+        print("警告: 板块过滤后没有剩余的候选股票。")
         sys.exit(1)
 
     # 6. 使用 LightGBM 模型进行打分预测
@@ -302,7 +344,16 @@ def main() -> None:
         help="最多参与预测的股票数量；默认不限制，使用本地库内全部满足 K 线长度的股票",
     )
     parser.add_argument("--pool", type=str, default=STOCK_POOL)
-    parser.add_argument("--force", action="store_true", help="强制覆盖已有的选股数据")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )  # 兼容旧脚本；默认已始终覆盖，无需再传
+    parser.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        help="若当日选股记录已存在则跳过（默认每次均覆盖写入）",
+    )
     parser.add_argument(
         "--workers",
         type=int,
@@ -323,6 +374,18 @@ def main() -> None:
         "--online-pool",
         action="store_true",
         help="股票池使用 AkShare 成分（需网络），K 线仍仅从本地 stock_daily_kline 读取",
+    )
+    parser.add_argument(
+        "--include-300",
+        dest="include_300",
+        action="store_true",
+        help="包含创业板代码（300、301 开头）；不传则从选股池中剔除",
+    )
+    parser.add_argument(
+        "--include-688",
+        dest="include_688",
+        action="store_true",
+        help="包含代码以 688 开头的股票（科创板）；不传则从选股池中剔除",
     )
     args = parser.parse_args()
 
@@ -354,10 +417,12 @@ def main() -> None:
         trade_date=target_date,
         max_stocks=args.max_stocks,
         pool_type=args.pool,
-        force=args.force,
+        force=not args.skip_if_exists,
         max_workers=args.workers,
         verbose=not args.quiet,
         use_online_pool=args.online_pool,
+        include_300=args.include_300,
+        include_688=args.include_688,
     )
 
 
