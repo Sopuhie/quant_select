@@ -34,9 +34,14 @@ import plotly.graph_objects as go
 from src.config import DATA_DIR, DB_PATH, FEATURE_COLUMNS, MODEL_PATH, TOP_N_SELECTION
 from src.config_manager import config_manager
 from src.database import init_db, query_df
-from src.kline_chart import draw_candlestick, get_stock_kline_data
+from src.kline_chart import (
+    draw_candlestick,
+    get_stock_kline_data,
+    lookup_stock_display_name,
+)
 
-DEFAULT_TRAIN_END_DATE = os.environ.get("QUANT_TRAIN_END_DATE", "2024-12-31")
+# 若设置 QUANT_TRAIN_END_DATE=YYYY-MM-DD，面板训练将仅使用该日及以前的本地 K 线；不设则使用库内全部日期。
+_QUANT_TRAIN_END_DATE_ENV = os.environ.get("QUANT_TRAIN_END_DATE", "").strip()
 
 # ================= 1. 全局页面配置 =================
 st.set_page_config(
@@ -445,7 +450,9 @@ with tab_hist:
         with st.spinner("极速加载本地行情 K 线中..."):
             df_kline = get_stock_kline_data(q, days=365)
         if df_kline is not None and len(df_kline) > 0:
-            fig = draw_candlestick(df_kline, str(q).zfill(6), "自选查询")
+            code_z = str(q).zfill(6)
+            qname = lookup_stock_display_name(code_z) or "自选查询"
+            fig = draw_candlestick(df_kline, code_z, qname)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
             else:
@@ -675,7 +682,7 @@ with tab_data:
             """
             <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
                 <h4 style="color: #00FFCC; margin-top:0;">🎯 任务 B：重新训练选股模型</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">读取本地流程采集的历史因子面板，使用 LightGBM 重训模型。截止日期默认 2024-12-31，可用环境变量 QUANT_TRAIN_END_DATE 覆盖。</p>
+                <p style="font-size: 0.85rem; color: #8f9cae;">读取本地 SQLite（stock_daily_kline）计算因子并重训 LightGBM。默认使用库内全部日期；若需截止日可设置环境变量 QUANT_TRAIN_END_DATE。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -685,14 +692,12 @@ with tab_data:
         )
         if train_btn:
             with st.spinner("正在重新计算因子并重训模型..."):
-                ret_code, _log = run_command_interactive(
-                    [
-                        sys.executable,
-                        str(ROOT / "train_model.py"),
-                        "--train-end-date",
-                        DEFAULT_TRAIN_END_DATE,
-                    ]
-                )
+                train_cmd = [sys.executable, str(ROOT / "train_model.py")]
+                if _QUANT_TRAIN_END_DATE_ENV:
+                    train_cmd.extend(
+                        ["--train-end-date", _QUANT_TRAIN_END_DATE_ENV[:10]]
+                    )
+                ret_code, _log = run_command_interactive(train_cmd)
                 if ret_code == 0:
                     st.success("✅ 模型重训完成，最新模型权重已保存！")
                 else:
@@ -703,7 +708,7 @@ with tab_data:
             """
             <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
                 <h4 style="color: #00FFCC; margin-top:0;">📡 任务 C：执行每日智能选股</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">一键计算最新因子的中位数去极值（MAD）与标准化，并跑出今日 Top 推荐。</p>
+                <p style="font-size: 0.85rem; color: #8f9cae;">K 线与因子计算均基于本地 stock_daily_kline；股票池默认取库内有足够历史的代码。需要成分池时可命令行加 --online-pool。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -728,7 +733,7 @@ with tab_data:
             """
             <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
                 <h4 style="color: #00FFCC; margin-top:0;">📈 任务 D：运行策略历史滚动回测</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">执行 2024 全年样本外滚动回测，并自动输出累计收益与基准超额资产曲线。</p>
+                <p style="font-size: 0.85rem; color: #8f9cae;">基于本地 stock_daily_kline；不传日期时默认回测区间为库内最早日至最晚日。基准 000300 优先读库。不足可加 --online-fallback。</p>
             </div>
             """,
             unsafe_allow_html=True,

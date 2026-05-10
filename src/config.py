@@ -77,19 +77,19 @@ LGB_PARAMS = {
     "seed": 42,
 }
 
-# 特征列名（与 factor_calculator 输出一致）
+# 特征列名（与 factor_calculator / 本地 K 线训练管线一致）
 FEATURE_COLUMNS = [
-    "ret_1d",
-    "ret_5d",
-    "ret_20d",
-    "volatility_5d",
-    "volatility_20d",
-    "vol_ratio_5_20",
-    "ma5_bias",
-    "ma20_bias",
-    "rsi_14",
-    "macd_hist",
-    "pv_corr_10",
-    "amplitude_5d",
-    "shadow_ratio",
+    "factor_bias_5",
+    "factor_bias_10",
+    "factor_bias_20",
+    "factor_bias_60",
+    "factor_ratio_5_20",
+    "factor_ratio_10_60",
+    "factor_return_1d",
+    "factor_return_5d",
+    "factor_momentum_10d",
+    "factor_volume_ratio",
+    "factor_volume_position",
+    "factor_volatility_5d",
+    "factor_volatility_20d",
 ]

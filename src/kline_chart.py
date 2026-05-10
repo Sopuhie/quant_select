@@ -15,6 +15,32 @@ from .data_fetcher import fetch_daily_hist
 from .database import upsert_stock_daily_klines
 
 
+def lookup_stock_display_name(stock_code: object) -> str:
+    """从本地 ``stock_daily_kline`` 取该股最新一条记录里的名称（同步脚本写入）。"""
+    code = str(stock_code).strip().zfill(6)
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT stock_name FROM stock_daily_kline
+            WHERE stock_code = ?
+            ORDER BY date DESC
+            LIMIT 1
+            """,
+            (code,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            n = str(row[0]).strip()
+            if n and n != "未知":
+                return n
+    except Exception:
+        pass
+    return ""
+
+
 def _append_ma(df: pd.DataFrame) -> pd.DataFrame:
     out = df.sort_values("date").reset_index(drop=True)
     out["ma5"] = out["close"].rolling(window=5).mean()
@@ -114,17 +140,48 @@ def draw_candlestick(df, stock_code, stock_name):
     color_up = "#FF3333"
     color_down = "#00CC66"
 
-    hover_text_candlestick = []
-    for pos, (_, row) in enumerate(df.iterrows()):
-        date_str = date_strs[pos]
-        text = (
-            f"<b>日期</b>: {date_str}<br>"
-            f"<b>开盘</b>: {row['open']:.2f}<br>"
-            f"<b>最高</b>: {row['high']:.2f}<br>"
-            f"<b>最低</b>: {row['low']:.2f}<br>"
-            f"<b>收盘</b>: {row['close']:.2f}"
-        )
-        hover_text_candlestick.append(text)
+    # Candlestick 不支持可靠的 text+hoverinfo；用 customdata + hovertemplate。
+    # 均线后画会挡住 K 线悬浮命中：先画均线并跳过 hover，最后画 K 线置于顶层。
+    ohlc_cd = df[["open", "high", "low", "close"]].to_numpy(dtype=float)
+
+    fig.add_trace(
+        go.Scatter(
+            x=date_strs,
+            y=df["ma5"],
+            name="MA5",
+            hoverinfo="skip",
+            mode="lines",
+            line=dict(color="#00FFCC", width=1.5),
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=date_strs,
+            y=df["ma10"],
+            name="MA10",
+            hoverinfo="skip",
+            mode="lines",
+            line=dict(color="#FF00FF", width=1.5),
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=date_strs,
+            y=df["ma20"],
+            name="MA20",
+            hoverinfo="skip",
+            mode="lines",
+            line=dict(color="#FFFF00", width=1.5),
+        ),
+        row=1,
+        col=1,
+    )
 
     fig.add_trace(
         go.Candlestick(
@@ -134,8 +191,14 @@ def draw_candlestick(df, stock_code, stock_name):
             low=df["low"],
             close=df["close"],
             name="K线",
-            text=hover_text_candlestick,
-            hoverinfo="text",
+            customdata=ohlc_cd,
+            hovertemplate=(
+                "<b>日期</b>: %{x}<br>"
+                "<b>开盘</b>: %{customdata[0]:.2f}<br>"
+                "<b>最高</b>: %{customdata[1]:.2f}<br>"
+                "<b>最低</b>: %{customdata[2]:.2f}<br>"
+                "<b>收盘</b>: %{customdata[3]:.2f}<extra></extra>"
+            ),
             increasing_line_color=color_up,
             increasing_fillcolor=color_up,
             decreasing_line_color=color_down,
@@ -170,53 +233,6 @@ def draw_candlestick(df, stock_code, stock_name):
         col=1,
     )
 
-    def get_ma_hover_text(ma_series, name="MA"):
-        hover_texts = []
-        for pos, val in enumerate(ma_series):
-            date_str = date_strs[pos]
-            val_str = f"{val:.2f}" if pd.notna(val) else "—"
-            hover_texts.append(f"<b>日期</b>: {date_str}<br><b>{name}</b>: {val_str}")
-        return hover_texts
-
-    fig.add_trace(
-        go.Scatter(
-            x=date_strs,
-            y=df["ma5"],
-            name="MA5",
-            text=get_ma_hover_text(df["ma5"], "MA5"),
-            hoverinfo="text",
-            line=dict(color="#00FFCC", width=1.5),
-        ),
-        row=1,
-        col=1,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=date_strs,
-            y=df["ma10"],
-            name="MA10",
-            text=get_ma_hover_text(df["ma10"], "MA10"),
-            hoverinfo="text",
-            line=dict(color="#FF00FF", width=1.5),
-        ),
-        row=1,
-        col=1,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=date_strs,
-            y=df["ma20"],
-            name="MA20",
-            text=get_ma_hover_text(df["ma20"], "MA20"),
-            hoverinfo="text",
-            line=dict(color="#FFFF00", width=1.5),
-        ),
-        row=1,
-        col=1,
-    )
-
     color_grid = "rgba(255, 255, 255, 0.04)"
 
     fig.update_layout(
@@ -228,6 +244,7 @@ def draw_candlestick(df, stock_code, stock_name):
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=50, r=20, t=60, b=40),
+        hovermode="x unified",
         hoverlabel=dict(
             bgcolor="#141622",
             bordercolor="#00FFCC",
@@ -240,6 +257,7 @@ def draw_candlestick(df, stock_code, stock_name):
         showgrid=False,
         linecolor=color_grid,
         tickfont=dict(color="#8f9cae"),
+        showspikes=False,
         row=1,
         col=1,
     )
@@ -248,6 +266,7 @@ def draw_candlestick(df, stock_code, stock_name):
         showgrid=False,
         linecolor=color_grid,
         tickfont=dict(color="#8f9cae"),
+        showspikes=False,
         row=2,
         col=1,
     )
@@ -257,6 +276,7 @@ def draw_candlestick(df, stock_code, stock_name):
         zeroline=False,
         linecolor=color_grid,
         tickfont=dict(color="#8f9cae"),
+        showspikes=False,
         row=1,
         col=1,
     )
@@ -266,6 +286,7 @@ def draw_candlestick(df, stock_code, stock_name):
         zeroline=False,
         linecolor=color_grid,
         tickfont=dict(color="#8f9cae"),
+        showspikes=False,
         row=2,
         col=1,
     )

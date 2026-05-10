@@ -7,63 +7,46 @@ import pandas as pd
 from .config import FEATURE_COLUMNS, LABEL_HORIZON_DAYS
 
 
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = (-delta).where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / (avg_loss + 1e-12)
-    return 100 - (100 / (1 + rs))
-
-
-def _macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    dif = ema_fast - ema_slow
-    dea = dif.ewm(span=signal, adjust=False).mean()
-    return dif - dea
-
-
 def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
+    """与 ``train_model`` 本地 SQLite 管线一致的技术因子（13 维）。"""
     if df.empty:
         return pd.DataFrame(columns=FEATURE_COLUMNS)
 
+    df = df.sort_values("date").reset_index(drop=True)
     close = df["close"].astype(float)
     high = df["high"].astype(float)
     low = df["low"].astype(float)
-    open_p = df["open"].astype(float)
     vol = df["volume"].astype(float)
 
-    out = pd.DataFrame(index=df.index)
+    eps = 1e-12
+    ma5 = close.rolling(5).mean()
+    ma10 = close.rolling(10).mean()
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
 
-    out["ret_1d"] = close.pct_change(1)
-    out["ret_5d"] = close.pct_change(5)
-    out["ret_20d"] = close.pct_change(20)
-    out["volatility_5d"] = out["ret_1d"].rolling(5).std()
-    out["volatility_20d"] = out["ret_1d"].rolling(20).std()
+    out = pd.DataFrame(index=df.index)
+    out["factor_bias_5"] = (close - ma5) / (ma5 + eps)
+    out["factor_bias_10"] = (close - ma10) / (ma10 + eps)
+    out["factor_bias_20"] = (close - ma20) / (ma20 + eps)
+    out["factor_bias_60"] = (close - ma60) / (ma60 + eps)
+
+    out["factor_ratio_5_20"] = ma5 / (ma20 + eps) - 1.0
+    out["factor_ratio_10_60"] = ma10 / (ma60 + eps) - 1.0
+
+    out["factor_return_1d"] = close.pct_change(1)
+    out["factor_return_5d"] = close.pct_change(5)
+    out["factor_momentum_10d"] = close / (close.shift(10) + eps) - 1.0
 
     vol_ma5 = vol.rolling(5).mean()
     vol_ma20 = vol.rolling(20).mean()
-    out["vol_ratio_5_20"] = vol_ma5 / (vol_ma20 + 1e-12)
+    out["factor_volume_ratio"] = vol / (vol_ma5 + eps)
+    out["factor_volume_position"] = vol_ma5 / (vol_ma20 + eps) - 1.0
 
-    ma5 = close.rolling(5).mean()
-    ma20 = close.rolling(20).mean()
-    out["ma5_bias"] = close / (ma5 + 1e-12) - 1
-    out["ma20_bias"] = close / (ma20 + 1e-12) - 1
+    high_low_ratio = (high - low) / (close + eps)
+    out["factor_volatility_5d"] = high_low_ratio.rolling(5).mean()
+    out["factor_volatility_20d"] = high_low_ratio.rolling(20).mean()
 
-    out["rsi_14"] = _rsi(close, 14)
-    out["macd_hist"] = _macd_hist(close)
-
-    out["pv_corr_10"] = close.rolling(10).corr(vol).fillna(0.0)
-
-    daily_amp = (high - low) / (close.shift(1) + 1e-12)
-    out["amplitude_5d"] = daily_amp.rolling(5).mean()
-
-    entity_max = np.maximum(open_p, close)
-    out["shadow_ratio"] = (high - entity_max) / (high - low + 1e-12)
-    out["shadow_ratio"] = out["shadow_ratio"].fillna(0.0)
-
+    out = out.replace([np.inf, -np.inf], np.nan)
     return out[FEATURE_COLUMNS]
 
 

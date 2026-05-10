@@ -6,11 +6,15 @@
   得到的 TopN 以开盘价等权满仓买入（信号仅使用截至昨日收盘的历史数据，避免未来函数）。
 
 用法（在项目根目录 quant_select/ 下）:
+  python scripts/backtest.py
+    # 不传日期时，开始/结束日默认取 stock_daily_kline 库内 MIN(date)、MAX(date)
   python scripts/backtest.py --start-date 2024-01-01 --end-date 2024-12-31
   python scripts/backtest.py --holding-days 5 --buy-price open --sell-price open
 
 说明:
-  - stocks.db 默认无 OHLCV 表时会并发调用 AkShare/Baostock 拉取行情；亦可自建日线表供 _try_read_ohlc_from_sqlite 命中。
+  - 行情默认仅从 SQLite 表 ``stock_daily_kline`` 读取（与本地行情同步脚本一致）；可加 ``--online-fallback`` 在网络可用时补拉。
+  - 股票池优先 AkShare 成分；失败则自动改为「库内出现的代码」。
+  - 沪深300 基准：优先读库内代码 000300；若无则再尝试 AkShare。
   - 净值序列默认写入 data/backtest_results.csv。
 """
 from __future__ import annotations
@@ -68,6 +72,20 @@ def load_active_model() -> Any:
     return load_model(MODEL_PATH)
 
 
+def get_stock_daily_kline_date_bounds(db_path: Path) -> tuple[str | None, str | None]:
+    """``stock_daily_kline`` 全局最早、最晚交易日（YYYY-MM-DD）；无数据则为 (None, None)。"""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT MIN(date), MAX(date) FROM stock_daily_kline"
+            ).fetchone()
+    except Exception:
+        return None, None
+    if not row or row[0] is None or row[1] is None:
+        return None, None
+    return _normalize_date(str(row[0])), _normalize_date(str(row[1]))
+
+
 def _sqlite_table_names(db_path: Path) -> list[str]:
     try:
         with sqlite3.connect(db_path) as conn:
@@ -79,6 +97,43 @@ def _sqlite_table_names(db_path: Path) -> list[str]:
         return []
 
 
+def read_stock_daily_kline_range(
+    start_date: str,
+    end_date: str,
+    db_path: Path,
+) -> pd.DataFrame:
+    """从 ``stock_daily_kline`` 读取区间日线（本地回测主路径）。"""
+    s = _normalize_date(start_date)
+    e = _normalize_date(end_date)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            raw = pd.read_sql_query(
+                """
+                SELECT date, stock_code, stock_name, open, high, low, close, volume
+                FROM stock_daily_kline
+                WHERE date >= ? AND date <= ?
+                ORDER BY stock_code, date
+                """,
+                conn,
+                params=(s, e),
+            )
+    except Exception as exc:
+        print(f"读取 stock_daily_kline 失败: {exc}")
+        return pd.DataFrame()
+
+    if raw.empty:
+        return raw
+
+    raw["date"] = pd.to_datetime(raw["date"]).dt.strftime("%Y-%m-%d")
+    raw["stock_code"] = raw["stock_code"].astype(str).str.strip().str.zfill(6)
+    for col in ("open", "high", "low", "close", "volume"):
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    raw["stock_name"] = raw["stock_name"].astype(str).fillna("")
+    raw = raw.dropna(subset=["close"]).sort_values(["stock_code", "date"])
+    print(f"已从本地 stock_daily_kline 读取 OHLCV：{len(raw)} 行（{s} ~ {e}）")
+    return raw.reset_index(drop=True)
+
+
 def _try_read_ohlc_from_sqlite(
     start_date: str,
     end_date: str,
@@ -88,9 +143,18 @@ def _try_read_ohlc_from_sqlite(
     若库中存在常见命名的 OHLCV 表则读取；列名兼容 date/trade_date、code/stock_code。
     """
     tables = _sqlite_table_names(db_path)
-    candidates = [
-        t for t in tables if any(k in t.lower() for k in ("daily", "bar", "ohlc", "kline", "quote"))
-    ]
+    # 优先固定表名（与 update_local_data 一致）
+    candidates = []
+    if "stock_daily_kline" in tables:
+        candidates.append("stock_daily_kline")
+    candidates.extend(
+        [
+            t
+            for t in tables
+            if t != "stock_daily_kline"
+            and any(k in t.lower() for k in ("daily", "bar", "ohlc", "kline", "quote"))
+        ]
+    )
     for t in candidates:
         try:
             with sqlite3.connect(db_path) as conn:
@@ -155,15 +219,33 @@ def _fetch_one_stock(
     return hist
 
 
+def _pairs_from_db_bars(bars: pd.DataFrame, max_count: int) -> list[tuple[str, str]]:
+    """按代码排序，取每只股票最新一条记录的名称。"""
+    if bars.empty:
+        return []
+    rows: list[tuple[str, str]] = []
+    for code, g in bars.groupby("stock_code", sort=False):
+        g = g.sort_values("date")
+        last = g.iloc[-1]
+        c = str(code).strip().zfill(6)
+        n = str(last.get("stock_name", "") or "").strip()
+        rows.append((c, n))
+    rows.sort(key=lambda x: x[0])
+    return rows[: max(0, int(max_count))]
+
+
 def fetch_backtest_data(
     start_date: str,
     end_date: str,
     stock_pairs: list[tuple[str, str]],
     db_path: Path | None = None,
     max_workers: int = 4,
+    *,
+    online_fallback: bool = False,
 ) -> pd.DataFrame:
     """
-    优先从 stocks.db 读取已落库的日线；若无合适表则并发调用 fetch_daily_hist。
+    默认：仅从 ``stock_daily_kline`` 读取 [cal_start, end_date] 区间行情。
+    ``online_fallback=True`` 且本地覆盖不足时，再并发 ``fetch_daily_hist``。
     """
     path = db_path or DB_PATH
     buf_days = 420
@@ -171,19 +253,39 @@ def fetch_backtest_data(
     iso_start = _normalize_date(cal_start).replace("-", "")
     iso_end = _normalize_date(end_date).replace("-", "")
 
-    hit = _try_read_ohlc_from_sqlite(cal_start, end_date, path)
-    if hit is not None and not hit.empty:
-        codes = set(hit["stock_code"].unique())
-        need = {c for c, _ in stock_pairs}
-        if len(codes & need) >= max(10, len(need) // 10):
+    hit = read_stock_daily_kline_range(cal_start, end_date, path)
+    need = {str(c).zfill(6) for c, _ in stock_pairs}
+
+    if not hit.empty:
+        codes = set(hit["stock_code"].astype(str).str.zfill(6))
+        overlap = codes & need
+        n_need = len(need)
+        thresh = max(1, min(n_need, max(10, n_need // 10))) if n_need else 1
+        if len(overlap) >= thresh:
             return hit[hit["stock_code"].isin(need)].reset_index(drop=True)
         print(
-            "库内 OHLCV 与当前股票池交集过少，将改为在线拉取补充。"
-            "若需纯本地回测，请先批量写入日线或扩大库内股票覆盖。"
+            f"本地 K 线与当前股票池交集 {len(overlap)} 只（阈值约 {thresh}），"
+            + ("将尝试在线补拉…" if online_fallback else "请扩大本地同步股票覆盖或改用 --pool / --max-stocks。"),
+            flush=True,
+        )
+    else:
+        print("本地 stock_daily_kline 在扩展区间内无数据。", flush=True)
+
+    if not online_fallback:
+        raise RuntimeError(
+            "本地数据库行情不足以覆盖当前股票池与回测区间。"
+            "请先运行：python scripts/update_local_data.py "
+            "或添加参数 --online-fallback 允许在线补拉。"
         )
 
+    hit_legacy = _try_read_ohlc_from_sqlite(cal_start, end_date, path)
+    if hit_legacy is not None and not hit_legacy.empty:
+        codes = set(hit_legacy["stock_code"].unique())
+        if len(codes & need) >= max(10, len(need) // 10):
+            return hit_legacy[hit_legacy["stock_code"].isin(need)].reset_index(drop=True)
+
     print(
-        f"未使用或未命中本地 OHLCV 宽表，正在在线拉取 {len(stock_pairs)} 只股票日线 "
+        f"正在在线拉取 {len(stock_pairs)} 只股票日线 "
         f"（{iso_start} ~ {iso_end}），请耐心等待…"
     )
     parts: list[pd.DataFrame] = []
@@ -289,12 +391,52 @@ def _price_on(
     return v
 
 
+def fetch_benchmark_close_from_db(
+    start_date: str,
+    end_date: str,
+    db_path: Path,
+    bench: str = "000300",
+) -> pd.DataFrame:
+    """若本地库内有指数/ETF 日线（如 000300），直接用作基准。"""
+    code = str(bench).strip().zfill(6)
+    s = _normalize_date(start_date)
+    e = _normalize_date(end_date)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            raw = pd.read_sql_query(
+                """
+                SELECT date, close FROM stock_daily_kline
+                WHERE stock_code = ? AND date >= ? AND date <= ?
+                ORDER BY date
+                """,
+                conn,
+                params=(code, s, e),
+            )
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+    out = raw.copy()
+    out.columns = ["date", "close"]
+    out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out = out.dropna(subset=["date", "close"])
+    print(f"已从本地库读取基准 {code} 收盘价：{len(out)} 条")
+    return out.reset_index(drop=True)
+
+
 def fetch_benchmark_close(
     start_date: str,
     end_date: str,
     bench: str = "000300",
+    db_path: Path | None = None,
 ) -> pd.DataFrame:
-    """沪深300等指数收盘价序列，用于超额收益；失败则返回空表。"""
+    """沪深300等指数收盘价序列；优先本地库，失败再 AkShare。"""
+    path = db_path or DB_PATH
+    local_b = fetch_benchmark_close_from_db(start_date, end_date, path, bench=bench)
+    if not local_b.empty:
+        return local_b
+
     import akshare as ak
 
     s = start_date.replace("-", "")
@@ -577,8 +719,18 @@ def _print_report(m: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="量化选股历史滚动回测")
-    parser.add_argument("--start-date", type=str, default="2024-01-01")
-    parser.add_argument("--end-date", type=str, default="2024-12-31")
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="回测开始日 YYYY-MM-DD；省略则用库 stock_daily_kline 的 MIN(date)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="回测结束日 YYYY-MM-DD；省略则用库 stock_daily_kline 的 MAX(date)",
+    )
     parser.add_argument(
         "--holding-days",
         type=int,
@@ -596,6 +748,11 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4, help="在线拉行情并发数")
     parser.add_argument("--benchmark", type=str, default="000300", help="基准指数代码（默认沪深300）")
     parser.add_argument(
+        "--online-fallback",
+        action="store_true",
+        help="本地 K 线不足时允许在线拉取行情（默认关闭，纯本地回测）",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=str(DATA_DIR / "backtest_results.csv"),
@@ -603,8 +760,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    start_date = _normalize_date(args.start_date)
-    end_date = _normalize_date(args.end_date)
+    db_lo, db_hi = get_stock_daily_kline_date_bounds(DB_PATH)
+    if db_lo is None or db_hi is None:
+        raise SystemExit(
+            "无法读取 stock_daily_kline 的日期范围（表不存在或无数据）。"
+            "请先运行：python scripts/update_local_data.py"
+        )
+
+    start_date = _normalize_date(args.start_date or db_lo)
+    end_date = _normalize_date(args.end_date or db_hi)
+    if args.start_date is None or args.end_date is None:
+        print(
+            f"回测区间（未指定的边界已取自本地库）: {start_date} ~ {end_date}",
+            flush=True,
+        )
+
+    if start_date > end_date:
+        raise SystemExit(f"开始日 {start_date} 不能晚于结束日 {end_date}。")
 
     mv = get_active_model_version()
     if mv is None:
@@ -614,10 +786,28 @@ def main() -> None:
 
     model = load_active_model()
 
-    # 股票池：取回测区间内「尽可能覆盖」——按结束日成分 + 上限
-    pairs = get_stock_pool(as_of_date=end_date, pool_type=args.pool, max_count=args.max_stocks)
+    # 股票池：优先结束日成分（可能需联网）；失败则用本地库内代码
+    pairs: list[tuple[str, str]] = []
+    try:
+        pairs = get_stock_pool(
+            as_of_date=end_date, pool_type=args.pool, max_count=args.max_stocks
+        )
+    except Exception as exc:
+        print(f"提示: 在线获取股票池失败（{exc}），将仅使用数据库中已有代码。", flush=True)
+
+    cal_start_bt = (
+        pd.Timestamp(start_date) - pd.Timedelta(days=420)
+    ).strftime("%Y-%m-%d")
+    bars_preview = read_stock_daily_kline_range(cal_start_bt, end_date, DB_PATH)
+
     if not pairs:
-        raise SystemExit("股票池为空，请检查 pool 与网络（AkShare）。")
+        pairs = _pairs_from_db_bars(bars_preview, args.max_stocks)
+        if not pairs:
+            raise SystemExit(
+                "股票池为空且本地 stock_daily_kline 无数据。"
+                "请先运行 scripts/update_local_data.py 或检查网络后重试。"
+            )
+        print(f"使用数据库内股票共 {len(pairs)} 只参与回测。", flush=True)
 
     bars = fetch_backtest_data(
         start_date,
@@ -625,6 +815,7 @@ def main() -> None:
         pairs,
         db_path=DB_PATH,
         max_workers=args.workers,
+        online_fallback=args.online_fallback,
     )
 
     all_days = sorted(bars["date"].unique())
@@ -652,7 +843,9 @@ def main() -> None:
     engine.run()
 
     nav_df = pd.DataFrame(engine.nav_records)
-    bench_df = fetch_benchmark_close(start_date, end_date, bench=args.benchmark)
+    bench_df = fetch_benchmark_close(
+        start_date, end_date, bench=args.benchmark, db_path=DB_PATH
+    )
     metrics = _compute_metrics(nav_df, bench_df, engine.trade_pnls, rf_annual=args.rf_annual)
     _print_report(metrics)
 

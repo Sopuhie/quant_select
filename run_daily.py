@@ -1,11 +1,14 @@
 """
-每日选股：拉行情、截面清洗、LightGBM 打分，写入 daily_predictions / daily_selections。
+每日选股：从本地 stock_daily_kline 读 K 线、截面清洗、LightGBM 打分，写入 daily_predictions / daily_selections。
+默认股票池为「本地库中截至预测日有足够历史的代码」；可加 --online-pool 用 AkShare 成分后再与本地求交。
 
 用法:
   python run_daily.py
   python run_daily.py --trade-date 2026-05-08
-  python run_daily.py --force --max-stocks 300 --pool hs300 --workers 8
-  python run_daily.py --only-data   # 仅校验股票池与行情拉取，不写入选股表
+  python run_daily.py --force --workers 8
+  python run_daily.py --max-stocks 500   # 可选：限制最多参与预测的股票数
+  python run_daily.py --online-pool --pool hs300   # 成分在线拉取，K 线仍只读库
+  python run_daily.py --only-data   # 探测本地可预测股票数量
 """
 from __future__ import annotations
 
@@ -24,19 +27,22 @@ import pandas as pd
 
 from src.config import (
     FEATURE_COLUMNS,
-    MAX_STOCKS_UNIVERSE,
+    MIN_HISTORY_BARS,
     MODEL_PATH,
     PREDICT_FETCH_WORKERS,
     STOCK_POOL,
     TOP_N_SELECTION,
 )
-from src.data_fetcher import fetch_daily_hist, get_stock_pool
+from src.data_fetcher import get_stock_pool
 from src.database import (
     delete_daily_outputs_for_trade_date,
+    fetch_stock_daily_bars_until,
     init_db,
     insert_daily_predictions,
     insert_daily_selections,
+    list_predict_universe_from_kline,
     selection_exists_for_date,
+    stock_codes_with_local_bars,
 )
 from src.factor_calculator import clean_cross_sectional_features, compute_factors_for_history
 from src.model_trainer import load_model
@@ -48,11 +54,10 @@ def _fetch_one_predict_row(
     code: str,
     name: str,
     trade_date: str,
-    end_compact: str,
 ) -> dict[str, float | str] | None:
-    """单只股票：拉 K 线并生成当日因子行（供线程池并发调用）。"""
-    df_hist = fetch_daily_hist(code, start_date="20230101", end_date=end_compact)
-    if df_hist.empty or len(df_hist) < 60:
+    """单只股票：从本地 stock_daily_kline 读 K 线并生成当日因子行（供线程池并发调用）。"""
+    df_hist = fetch_stock_daily_bars_until(code, trade_date)
+    if df_hist.empty or len(df_hist) < MIN_HISTORY_BARS:
         return None
 
     df_today = df_hist[df_hist["date"] <= trade_date].reset_index(drop=True)
@@ -86,67 +91,50 @@ def _fetch_one_predict_row(
 
 
 def run_only_data_probe(
-    max_stocks: int,
+    max_stocks: int | None,
     pool_type: str,
     *,
     max_workers: int | None = None,
     verbose: bool = True,
+    use_online_pool: bool = False,
 ) -> None:
-    """仅校验股票池与行情拉取连通性，不写入选股表。"""
-    print("📊 任务：数据连通性探测（不写入选股表 / daily_predictions）...")
-    pairs = get_stock_pool(pool_type=pool_type, max_count=max_stocks)
-    if not pairs:
-        print("❌ 股票池为空，请检查 AkShare / Baostock / 网络。")
-        raise SystemExit(1)
-    print(f"股票池样本数: {len(pairs)}（上限 max_stocks={max_stocks}）")
-
-    workers = max_workers if max_workers is not None else PREDICT_FETCH_WORKERS
-    workers = max(1, min(workers, len(pairs)))
-    end_compact = datetime.now().strftime("%Y%m%d")
-
-    ok = 0
-    failed = 0
-
-    def _one(code_name: tuple[str, str]) -> tuple[str, int, str | None]:
-        code, _name = code_name
-        try:
-            df = fetch_daily_hist(code, start_date="20230101", end_date=end_compact)
-            return code, len(df), None
-        except Exception as exc:  # noqa: BLE001
-            return code, 0, str(exc)
-
-    if verbose:
-        print(f"并发拉取 K 线（workers={workers}）...")
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_one, p): p for p in pairs}
-        for i, fut in enumerate(as_completed(futs), start=1):
-            code, n, err = fut.result()
-            if err:
-                failed += 1
-                if verbose:
-                    print(f"  [{i}/{len(pairs)}] {code} 失败: {err}")
-            else:
-                ok += 1
-                if verbose:
-                    print(f"  [{i}/{len(pairs)}] {code} OK，bars={n}")
-
-    print(f"✅ 探测结束：成功 {ok}，失败 {failed}。")
-    print(
-        "提示：原始 K 线在本项目中主要在线用于因子计算；"
-        "选股结果写入请使用「运行每日预测」。"
+    """探测本地 K 线是否足够做预测（不写入选股表）。"""
+    _ = (pool_type, max_workers)  # 保留 CLI 签名兼容；探测仅统计本地库
+    print("📊 任务：本地行情探测（不写入选股表 / daily_predictions）...")
+    td = get_last_trading_date()
+    pairs = list_predict_universe_from_kline(
+        td,
+        min_bars=MIN_HISTORY_BARS,
+        max_count=max_stocks,
     )
-    if failed == len(pairs):
+    if not pairs:
+        print(
+            f"❌ 截止 {td}，本地 stock_daily_kline 中没有满足 ≥{MIN_HISTORY_BARS} "
+            "根 K 线的股票。请先运行 scripts/update_local_data.py。"
+        )
         raise SystemExit(1)
+    lim_note = "全库" if max_stocks is None else f"至多 {max_stocks} 只"
+    print(f"✅ 截止 {td}，{lim_note} 约有 {len(pairs)} 只股票满足本地 K 线长度。")
+    if verbose and len(pairs) <= 10:
+        for c, n in pairs:
+            nb = len(fetch_stock_daily_bars_until(c, td))
+            print(f"   {c} {n[:16]} … 共 {nb} 根（截至 {td}）")
+    if use_online_pool:
+        print(
+            "提示: 已配置 --online-pool 时真实选股会尝试在线成分池并与本地求交；"
+            "本次探测仍仅统计本地可算因子股票数。"
+        )
 
 
 def predict_daily(
     trade_date: str,
-    max_stocks: int,
+    max_stocks: int | None,
     pool_type: str,
     force: bool = False,
     *,
     max_workers: int | None = None,
     verbose: bool = True,
+    use_online_pool: bool = False,
 ) -> None:
     print(f"开始执行 {trade_date} 每日预测选股流程...")
     # 检查数据库是否已存在该日记录
@@ -162,28 +150,62 @@ def predict_daily(
         sys.exit(1)
     model = load_model(MODEL_PATH)
 
-    # 2. 获取股票池
-    pairs = get_stock_pool(as_of_date=trade_date, pool_type=pool_type, max_count=max_stocks)
+    # 2. 股票池：默认完全来自本地库；--online-pool 时用在线成分与本地可算股票求交
+    if use_online_pool:
+        try:
+            pool_cap = None if max_stocks is None else max(max_stocks * 3, max_stocks)
+            pairs_online = get_stock_pool(
+                as_of_date=trade_date,
+                pool_type=pool_type,
+                max_count=pool_cap,
+            )
+        except Exception as exc:
+            print(f"警告: 在线股票池获取失败（{exc}），改用纯本地股票列表。")
+            pairs_online = []
+        eligible = stock_codes_with_local_bars(trade_date, MIN_HISTORY_BARS)
+        pairs = [
+            (str(c).zfill(6), str(n).strip())
+            for c, n in pairs_online
+            if str(c).strip().zfill(6) in eligible
+        ]
+        if max_stocks is not None:
+            pairs = pairs[: int(max_stocks)]
+        if not pairs:
+            pairs = list_predict_universe_from_kline(
+                trade_date,
+                min_bars=MIN_HISTORY_BARS,
+                max_count=max_stocks,
+            )
+            print("提示: 在线池与本地 K 线无交集，已退回本地股票列表。")
+    else:
+        pairs = list_predict_universe_from_kline(
+            trade_date,
+            min_bars=MIN_HISTORY_BARS,
+            max_count=max_stocks,
+        )
+
     if not pairs:
-        print("错误: 股票池为空，请检查网络或参数设置。")
+        print(
+            "错误: 本地 stock_daily_kline 中没有足够历史的股票。"
+            "请先运行 scripts/update_local_data.py，或使用 --online-pool（仍需本地有对应 K 线）。"
+        )
         sys.exit(1)
 
     workers = int(max_workers if max_workers is not None else PREDICT_FETCH_WORKERS)
     workers = max(1, min(workers, 32))
+    src = "在线成分∩本地" if use_online_pool else "本地库"
     print(
-        f"正在获取 {len(pairs)} 只股票的历史 K 线并计算因子（并发 {workers}）..."
+        f"从本地库读取 {len(pairs)} 只股票的 K 线并计算因子（股票池来源: {src}，并发 {workers}）..."
     )
 
-    # 3. 并发拉取 K 线并计算因子切片（模型打分仍在主线程）
+    # 3. 并发读取本地 K 线并计算因子（模型打分仍在主线程）
     rows: list[dict[str, float | str]] = []
     total = len(pairs)
     done = 0
 
-    end_compact = trade_date.replace("-", "")
-
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
-            ex.submit(_fetch_one_predict_row, c, n, trade_date, end_compact): (c, n)
+            ex.submit(_fetch_one_predict_row, c, n, trade_date): (c, n)
             for c, n in pairs
         }
         for fut in as_completed(futs):
@@ -273,7 +295,12 @@ def main() -> None:
         default=None,
         help="预测日期 (YYYY-MM-DD)，留空则默认最近交易日",
     )
-    parser.add_argument("--max-stocks", type=int, default=MAX_STOCKS_UNIVERSE)
+    parser.add_argument(
+        "--max-stocks",
+        type=int,
+        default=None,
+        help="最多参与预测的股票数量；默认不限制，使用本地库内全部满足 K 线长度的股票",
+    )
     parser.add_argument("--pool", type=str, default=STOCK_POOL)
     parser.add_argument("--force", action="store_true", help="强制覆盖已有的选股数据")
     parser.add_argument(
@@ -290,7 +317,12 @@ def main() -> None:
     parser.add_argument(
         "--only-data",
         action="store_true",
-        help="仅校验股票池与行情拉取连通性，不执行选股写入",
+        help="仅探测本地 K 线是否足够预测，不执行选股写入",
+    )
+    parser.add_argument(
+        "--online-pool",
+        action="store_true",
+        help="股票池使用 AkShare 成分（需网络），K 线仍仅从本地 stock_daily_kline 读取",
     )
     args = parser.parse_args()
 
@@ -302,6 +334,7 @@ def main() -> None:
             pool_type=args.pool,
             max_workers=args.workers,
             verbose=not args.quiet,
+            use_online_pool=args.online_pool,
         )
         return
 
@@ -324,6 +357,7 @@ def main() -> None:
         force=args.force,
         max_workers=args.workers,
         verbose=not args.quiet,
+        use_online_pool=args.online_pool,
     )
 
 

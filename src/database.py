@@ -369,3 +369,111 @@ def update_selection_returns(
     with get_connection(db_path) as conn:
         cur = conn.execute(sql, vals)
         return int(cur.rowcount if cur.rowcount is not None else 0)
+
+
+def fetch_stock_daily_bars_until(
+    stock_code: str,
+    end_date: str,
+    *,
+    db_path: Path | None = None,
+) -> pd.DataFrame:
+    """
+    从 ``stock_daily_kline`` 读取单只股票截至 ``end_date``（含）的日线，列与在线行情对齐。
+    """
+    code = str(stock_code).strip().zfill(6)
+    end = str(end_date).strip()[:10]
+    path = str(db_path or DB_PATH)
+    with sqlite3.connect(path) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT date, open, high, low, close, volume
+            FROM stock_daily_kline
+            WHERE stock_code = ? AND date <= ?
+            ORDER BY date ASC
+            """,
+            conn,
+            params=(code, end),
+        )
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["close"]).reset_index(drop=True)
+
+
+def list_predict_universe_from_kline(
+    trade_date: str,
+    *,
+    min_bars: int,
+    max_count: int | None,
+    db_path: Path | None = None,
+) -> list[tuple[str, str]]:
+    """
+    截至 ``trade_date``（含）本地 K 线条数 >= ``min_bars`` 的股票，
+    名称取该 cutoff 下最新一根的名称；按代码排序后可选截断 ``max_count``
+    （``None`` 或 ``<=0`` 表示不限制，返回库内全部满足条数的股票）。
+    """
+    end = str(trade_date).strip()[:10]
+    mb = max(1, int(min_bars))
+    path = str(db_path or DB_PATH)
+    sql_body = """
+    WITH eligible AS (
+        SELECT stock_code
+        FROM stock_daily_kline
+        WHERE date <= ?
+        GROUP BY stock_code
+        HAVING COUNT(*) >= ?
+    ),
+    latest AS (
+        SELECT stock_code, MAX(date) AS mx
+        FROM stock_daily_kline
+        WHERE date <= ?
+        GROUP BY stock_code
+    )
+    SELECT k.stock_code, k.stock_name
+    FROM stock_daily_kline k
+    INNER JOIN eligible e ON k.stock_code = e.stock_code
+    INNER JOIN latest L ON k.stock_code = L.stock_code AND k.date = L.mx
+    ORDER BY k.stock_code
+    """
+    use_limit = max_count is not None and int(max_count) > 0
+    sql = sql_body + (" LIMIT ?" if use_limit else "")
+    params: tuple[Any, ...] = (end, mb, end)
+    if use_limit:
+        params = (*params, int(max_count))
+
+    with sqlite3.connect(path) as conn:
+        raw = pd.read_sql_query(sql, conn, params=params)
+    if raw.empty:
+        return []
+    out: list[tuple[str, str]] = []
+    for _, row in raw.iterrows():
+        c = str(row["stock_code"]).strip().zfill(6)
+        n = str(row.get("stock_name") or "").strip()
+        out.append((c, n))
+    return out
+
+
+def stock_codes_with_local_bars(
+    trade_date: str,
+    min_bars: int,
+    *,
+    db_path: Path | None = None,
+) -> set[str]:
+    """截至 trade_date 至少有 min_bars 根 K 线的 6 位代码集合。"""
+    end = str(trade_date).strip()[:10]
+    mb = max(1, int(min_bars))
+    path = str(db_path or DB_PATH)
+    with sqlite3.connect(path) as conn:
+        cur = conn.execute(
+            """
+            SELECT stock_code FROM stock_daily_kline
+            WHERE date <= ?
+            GROUP BY stock_code
+            HAVING COUNT(*) >= ?
+            """,
+            (end, mb),
+        )
+        rows = cur.fetchall()
+    return {str(r[0]).strip().zfill(6) for r in rows}
