@@ -36,6 +36,8 @@ from src.config_manager import config_manager
 from src.database import init_db, query_df
 from src.kline_chart import (
     draw_candlestick,
+    draw_realtime_line_chart,
+    get_realtime_min_data,
     get_stock_kline_data,
     lookup_stock_display_name,
 )
@@ -370,6 +372,51 @@ with tab_today:
                             "code": row["stock_code"],
                             "name": row["stock_name"],
                         }
+
+        if not today_df.empty:
+            st.markdown(
+                "<div style='margin-top: 30px;'></div>", unsafe_allow_html=True
+            )
+            st.subheader("⏱️ 推荐股今日实时分时走势对比")
+            st.caption(
+                "股市开盘期间（9:30–11:30，13:00–15:00），下方分时在安装 "
+                "`streamlit-autorefresh` 后约每 15 秒自动刷新，便于观察日内走势。"
+            )
+
+            try:
+                from streamlit_autorefresh import st_autorefresh
+
+                st_autorefresh(interval=15000, limit=100, key="live_tracker_counter")
+            except ImportError:
+                st.caption(
+                    "💡 提示：在终端执行 `pip install streamlit-autorefresh` "
+                    "可开启分时图约每 15 秒自动刷新。"
+                )
+
+            live_cols = st.columns(3)
+            for i, col in enumerate(live_cols):
+                if i >= len(today_df):
+                    break
+                row = today_df.iloc[i]
+                with col:
+                    with st.spinner(f"正在捕获 {row['stock_name']} 分时..."):
+                        df_live = get_realtime_min_data(row["stock_code"])
+                        if df_live is not None and not df_live.empty:
+                            fig_live = draw_realtime_line_chart(
+                                df_live,
+                                row["stock_code"],
+                                row["stock_name"],
+                            )
+                            if fig_live:
+                                st.plotly_chart(
+                                    fig_live,
+                                    use_container_width=True,
+                                    config={"displayModeBar": False},
+                                )
+                            else:
+                                st.info("等候开盘交易数据...")
+                        else:
+                            st.info("☕ 非交易时段或无今日分时数据")
 
         if not t3.empty and st.session_state.selected_stock:
             st.markdown("---")

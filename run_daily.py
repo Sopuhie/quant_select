@@ -11,6 +11,8 @@
   python run_daily.py --online-pool --pool hs300   # 成分在线拉取，K 线仍只读库
   python run_daily.py --only-data   # 探测本地可预测股票数量
   python run_daily.py --include-300 --include-688   # 默认不传则从池中剔除 300/301/688 开头股票
+
+选股写入成功后，若 config 中启用钉钉，将自动调用推送（与 Streamlit「系统设置」一致）。
 """
 from __future__ import annotations
 
@@ -46,6 +48,7 @@ from src.database import (
     selection_exists_for_date,
     stock_codes_with_local_bars,
 )
+from src.dingtalk_notifier import maybe_push_daily_selections
 from src.factor_calculator import clean_cross_sectional_features, compute_factors_for_history
 from src.model_trainer import load_model
 from src.predictor import filter_predictions
@@ -327,6 +330,11 @@ def predict_daily(
             f"  Rank {r['rank']}: {r['stock_code']} {r['stock_name']} "
             f"(分数: {r['score']:.4f}, 收盘价: {r['close_price']})"
         )
+
+    try:
+        maybe_push_daily_selections(trade_date)
+    except Exception as exc:
+        print(f"钉钉推送环节异常（选股数据已写入）: {exc}")
 
 
 def main() -> None:

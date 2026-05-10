@@ -292,3 +292,115 @@ def draw_candlestick(df, stock_code, stock_name):
     )
 
     return fig
+
+
+def get_realtime_min_data(stock_code: object) -> pd.DataFrame | None:
+    """
+    获取单只股票当天的实时分时数据（东方财富 1 分钟级走势）。
+    """
+    import akshare as ak  # 按需加载，避免仅画日 K 时拉起重依赖
+
+    stock_code = str(stock_code).strip().zfill(6)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    start_s = f"{today_str} 09:25:00"
+    end_s = f"{today_str} 15:05:00"
+    try:
+        df = ak.stock_zh_a_hist_min_em(
+            symbol=stock_code,
+            start_date=start_s,
+            end_date=end_s,
+            period="1",
+            adjust="qfq",
+        )
+        if df is None or df.empty:
+            return None
+
+        rename_map = {
+            "时间": "time",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        need = {"time", "open", "close", "high", "low", "volume"}
+        if not need.issubset(df.columns):
+            return None
+
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df.dropna(subset=["time"])
+        df = df[df["time"].dt.strftime("%Y-%m-%d") == today_str].reset_index(drop=True)
+        for c in ("open", "close", "high", "low", "volume"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["close"])
+        return df if not df.empty else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"获取实时分时失败 {stock_code}: {exc}")
+    return None
+
+
+def draw_realtime_line_chart(
+    df: pd.DataFrame | None,
+    stock_code: object,
+    stock_name: object,
+) -> go.Figure | None:
+    """
+    绘制极简暗黑霓虹风分时折线图（无网格、面积填充）。
+    """
+    if df is None or df.empty:
+        return None
+
+    open_price = float(df["open"].iloc[0])
+    latest_price = float(df["close"].iloc[-1])
+    if open_price > 0:
+        pct_chg = (latest_price / open_price - 1.0) * 100.0
+    else:
+        pct_chg = 0.0
+
+    theme_color = "#FF3333" if pct_chg >= 0 else "#00CC66"
+    fill_color = (
+        "rgba(255, 51, 51, 0.05)" if pct_chg >= 0 else "rgba(0, 204, 102, 0.05)"
+    )
+
+    times = df["time"].dt.strftime("%H:%M").tolist()
+    code_s = str(stock_code).strip().zfill(6)
+    name_s = str(stock_name).strip()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=times,
+            y=df["close"],
+            mode="lines",
+            name="分时价",
+            line=dict(color=theme_color, width=2.5, shape="spline"),
+            fill="tozeroy",
+            fillcolor=fill_color,
+        )
+    )
+
+    fig.update_layout(
+        title=f"⏳ {code_s} {name_s} ({pct_chg:+.2f}%)",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        margin=dict(l=10, r=10, t=40, b=10),
+        height=180,
+    )
+
+    fig.update_xaxes(
+        showgrid=False,
+        zeroline=False,
+        visible=True,
+        tickfont=dict(color="#6272a4", size=9),
+    )
+    fig.update_yaxes(
+        showgrid=False,
+        zeroline=False,
+        visible=True,
+        tickfont=dict(color="#6272a4", size=9),
+    )
+
+    return fig
