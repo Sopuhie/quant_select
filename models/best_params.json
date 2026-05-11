@@ -2,11 +2,11 @@
   "objective": "lambdarank",
   "metric": "ndcg",
   "verbosity": -1,
-  "learning_rate": 0.05367493007972244,
-  "num_leaves": 15,
-  "min_child_samples": 54,
-  "subsample": 0.8008838754245452,
-  "colsample_bytree": 0.6310234933102002,
+  "learning_rate": 0.01324458134009936,
+  "num_leaves": 39,
+  "min_child_samples": 22,
+  "subsample": 0.8727961206236347,
+  "colsample_bytree": 0.677633994480005,
   "bagging_freq": 1,
   "seed": 42
 }

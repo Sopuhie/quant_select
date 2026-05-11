@@ -1073,8 +1073,8 @@ with tab_perf:
                         "factor_volume_position": "🔄 5日与20日均量趋势位置",
                         "factor_volatility_5d": "🌪️ 5日历史波动率 (高低价差比)",
                         "factor_volatility_20d": "🌪️ 20日历史波动率",
-                        "factor_macd_diff": "📊 MACD 快慢线差 / 收盘 (中长期趋势强度)",
-                        "factor_close_position": "💹 收盘在日内高低区位 (买盘承接强度代理)",
+                        "factor_macd_diff": "〽️ MACD 趋势强弱 (中线发散度)",
+                        "factor_close_position": "🎯 日内收盘位置 (主力真买入强度/资金代理)",
                     }
 
                     raw_features = FEATURE_COLUMNS[:n]
@@ -1096,10 +1096,10 @@ with tab_perf:
                     st.markdown(
                         """
                         <div style="background-color: rgba(30, 34, 51, 0.4); border-left: 4px solid #00FFCC; padding: 12px; border-radius: 4px; margin-bottom: 20px;">
-                            <strong style="color: #00FFCC;">💡 指标卡片小课堂：</strong>
+                            <strong style="color: #00FFCC;">💡 指标重要性看板说明：</strong>
                             <span style="color: #8f9cae; font-size: 0.9rem;">
-                                决策树分裂频次代表模型在筛选 Top 推荐股时，<b>使用该因子进行分类和过滤的次数</b>。
-                                柱体越长、排名越靠上，说明该指标在双排序模型中<b>越核心</b>，是主要的超额收益来源。
+                                决策树分裂频次代表双排序模型在筛选优秀推荐股时，<b>使用该因子进行截面排序和筛选的权重次数</b>。
+                                柱体越长，说明该指标在当前的 LTR（Learning to Rank）排序决策体系中<b>贡献的超额收益越核心</b>。
                             </span>
                         </div>
                         """,
@@ -1121,20 +1121,18 @@ with tab_perf:
                                 line=dict(color=COLOR_CYBER_TEAL, width=1.5),
                             ),
                             name="因子分裂次数",
-                            hovertemplate=(
-                                "<b>%{y}</b><br>贡献分裂次数: %{x}<extra></extra>"
-                            ),
+                            hovertemplate="<b>%{y}</b><br>贡献分裂次数: %{x}<extra></extra>",
                         )
                     )
 
                     fig_imp.update_layout(
                         get_cyber_layout(
-                            "模型决策树核心因子贡献排行 (中文大白话版)"
+                            "模型决策树核心因子贡献排行 (中文指标大白话版)"
                         ),
                         xaxis=dict(
                             showgrid=True,
                             gridcolor=COLOR_GRID,
-                            title="分裂频次 (越高代表该因子越核心)",
+                            title="分裂频次",
                         ),
                         yaxis=dict(showgrid=False),
                         height=550,

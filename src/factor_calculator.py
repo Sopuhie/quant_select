@@ -206,14 +206,21 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     out["factor_wr_14"] = _williams_r(high, low, close, OSCILLATOR_PERIOD)
     out["factor_atr_14"] = _atr_ratio(high, low, close, OSCILLATOR_PERIOD)
 
+    # MACD Difference（EMA12 − EMA26，按收盘价缩放消除量纲）
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     out["factor_macd_diff"] = (ema12 - ema26) / (close + eps)
 
+    # 日内收盘位置：(收盘−最低)/(最高−最低)，近似资金承接强度；零振幅时用 eps 避免除零
     denom = high.astype(float) - low.astype(float)
-    safe_den = denom.where(denom >= eps, eps)
-    out["factor_close_position"] = (
-        (close.astype(float) - low.astype(float)) / safe_den
+    l = low.astype(float)
+    c = close.astype(float)
+    d_np = denom.to_numpy(dtype=float)
+    safe_d = np.where(d_np < eps, eps, d_np)
+    out["factor_close_position"] = pd.Series(
+        (c.to_numpy(dtype=float) - l.to_numpy(dtype=float)) / safe_d,
+        index=df.index,
+        dtype=float,
     ).clip(0.0, 1.0)
 
     if "market_cap" in df.columns:

@@ -114,6 +114,6 @@ FEATURE_COLUMNS = [
     "factor_wr_14",
     "factor_atr_14",
     "factor_size_mcap",
-    "factor_macd_diff",
-    "factor_close_position",
+    "factor_macd_diff",  # MACD 快慢线差 / 收盘，中长期趋势强度
+    "factor_close_position",  # 日内收盘在高低区间位置，资金承接代理
 ]
