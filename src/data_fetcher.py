@@ -443,6 +443,55 @@ def fetch_daily_hist(
     return _finalize_hist_columns(df)
 
 
+def resolve_incremental_daily_fetch_window(
+    last_date_raw: object | None,
+    latest_trade_date: str,
+    end_compact: str,
+    *,
+    new_stock_history_days: int = 365,
+) -> tuple[str | None, str]:
+    """
+    计算本地增量同步时 ``fetch_daily_hist`` 的 ``start_date``（紧凑 ``YYYYMMDD``）。
+
+    Returns:
+        (start_compact, kind)。kind 为 ``fetch`` 时应发起网络请求；
+        ``uptodate`` / ``bad_range`` 时 ``start_compact`` 为 ``None``（不应请求）。
+    """
+    from .utils import next_trade_day_after
+
+    lt = str(latest_trade_date).strip()[:10]
+    ec = str(end_compact).strip().replace("-", "")[:8]
+
+    if last_date_raw is not None:
+        ld = str(last_date_raw).strip()[:10]
+        if ld >= lt:
+            return None, "uptodate"
+
+    if last_date_raw is None:
+        start_compact = (
+            datetime.now().date() - timedelta(days=int(new_stock_history_days))
+        ).strftime("%Y%m%d")
+    else:
+        ld_raw = str(last_date_raw).strip()[:10]
+        nxt_trade = next_trade_day_after(ld_raw)
+        if nxt_trade:
+            start_compact = nxt_trade.replace("-", "")[:8]
+        else:
+            try:
+                day_next = datetime.strptime(ld_raw, "%Y-%m-%d").date() + timedelta(
+                    days=1
+                )
+            except ValueError:
+                day_next = datetime.now().date() - timedelta(
+                    days=int(new_stock_history_days)
+                )
+            start_compact = day_next.strftime("%Y%m%d")
+
+    if start_compact > ec:
+        return None, "bad_range"
+    return start_compact, "fetch"
+
+
 def load_stock_latest_date_map(db_path: Path | str | None = None) -> dict[str, str]:
     """
     返回各股票在本地库中的最新交易日 ``YYYY-MM-DD``（``stock_code -> max(date)``）。

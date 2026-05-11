@@ -634,7 +634,11 @@ with tab_match:
         ),
         horizontal=True,
         key="pattern_match_algo",
-        help="Pearson：对齐时间轴的相关性+RMSE；DTW：允许形态在时间轴上伸缩对齐，适合节奏不同的相似走势。",
+        help=(
+            "Pearson：同一时间轴上的相关性与 RMSE 组合得分。"
+            "DTW：纯 NumPy 双行 DP + Sakoe-Chiba 带状加速（固定带宽下约 O(N·W)），"
+            "允许形态在时间轴上局部伸缩对齐；得分 100/(1+距离)。"
+        ),
     )
 
     code_raw = str(target_stock or "").strip()
@@ -773,7 +777,12 @@ with tab_match:
                     )
 
                     if run_match:
-                        with st.spinner("正在扫描本地全市场行情，请稍候…"):
+                        _spin = (
+                            "正在按 DTW（双行 DP）扫描全市场，可能较慢…"
+                            if match_algo == "dtw"
+                            else "正在扫描本地全市场行情，请稍候…"
+                        )
+                        with st.spinner(_spin):
                             st.session_state["pm_results"] = find_similar_patterns(
                                 target_code=code_z,
                                 start_date=start_str,
@@ -823,7 +832,10 @@ with tab_match:
                         _algo_note = (
                             "当前排序：**皮尔逊 + 形状距离** 启发式得分。"
                             if match_algo == "pearson"
-                            else "当前排序：**DTW** 距离换算得分 `100/(1+距离)`。"
+                            else (
+                                "当前排序：**DTW**（NumPy 双行动态规划，默认 Sakoe-Chiba 带状；"
+                                "必要时回退完整 DTW）相似度 `100/(1+距离)`。"
+                            )
                         )
                         st.caption(
                             "三张折线图分别对比：**样板股**与 **各 Top 匹配股** 在各自窗口内做 Min-Max 归一化后的收盘价曲线；"

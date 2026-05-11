@@ -1,4 +1,8 @@
-"""基于 OHLCV 计算因子（仅使用截至当日的历史，避免未来函数）。"""
+"""基于 OHLCV 计算因子（仅使用截至当日的历史，避免未来函数）。
+
+截面清洗支持「行业内 MAD + Z-score」中性化与指定因子的分位秩变换；行业字段由
+``stock_daily_kline.industry``（或上游 DataFrame）提供。
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -87,10 +91,22 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     return out[FEATURE_COLUMNS]
 
 
-def clean_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
+def clean_cross_sectional_features(
+    df: pd.DataFrame,
+    *,
+    use_industry_neutralization: bool = True,
+    use_percentile_rank_volatility: bool = True,
+) -> pd.DataFrame:
     """
-    截面清洗：按交易日分组；高波动因子先做分位秩中心化；
-    优先按（交易日 × 行业）做 MAD 截断 + Z-score，行业内少于 5 只时对该行业标的退回当日全截面标准化。
+    截面清洗（PART 1：行业中性化 + 高波动因子分位秩）：
+
+    - 按 ``date`` / ``trade_date`` 分组；
+    - 若 ``use_percentile_rank_volatility``：对 ``PERCENTILE_RANK_FEATURES`` 做
+      ``rank(pct=True) - 0.5``，落在约 ``[-0.5, 0.5]``；
+    - 若 ``use_industry_neutralization`` 且存在 ``industry`` 列：在每个交易日内
+      按行业做 MAD 截断 + Z-score；组内少于 ``MIN_INDUSTRY_GROUP_SIZE`` 只则该行改用
+      **当日全截面** MAD+Z；
+    - 若不启用行业中性或缺失 ``industry``：退化为当日全截面 MAD+Z（与原全局逻辑一致）。
     """
     if df.empty:
         return df
@@ -99,19 +115,29 @@ def clean_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
     if group_key not in df.columns:
         return df
 
-    industry_col = "industry" if "industry" in df.columns else None
-    ind_series_name = "_cs_industry_key"
-
     cleaned_parts: list[pd.DataFrame] = []
 
     for _date, day_df in df.groupby(group_key, sort=False):
         day_df = day_df.copy()
 
-        for col in PERCENTILE_RANK_FEATURES:
-            if col not in day_df.columns:
-                continue
-            s = day_df[col].astype(float)
-            day_df[col] = s.rank(pct=True, method="average") - 0.5
+        if use_percentile_rank_volatility:
+            for col in PERCENTILE_RANK_FEATURES:
+                if col not in day_df.columns:
+                    continue
+                s = day_df[col].astype(float)
+                day_df[col] = s.rank(pct=True, method="average") - 0.5
+
+        if not use_industry_neutralization:
+            out_day = day_df.copy()
+            for col in FEATURE_COLUMNS:
+                if col not in day_df.columns:
+                    continue
+                out_day[col] = _mad_clip_zscore(day_df[col]).values
+            cleaned_parts.append(out_day)
+            continue
+
+        industry_col = "industry" if "industry" in day_df.columns else None
+        ind_series_name = "_cs_industry_key"
 
         if industry_col is not None:
             ik = (
@@ -170,9 +196,12 @@ def build_stock_panel_features(
 ) -> pd.DataFrame:
     factors = compute_factors_for_history(df)
     lab = label_forward_return(df["close"].astype(float))
+    meta_cols = ["date"]
+    if "industry" in df.columns:
+        meta_cols.append("industry")
     merged = pd.concat(
         [
-            df[["date"]].reset_index(drop=True),
+            df[meta_cols].reset_index(drop=True),
             factors.reset_index(drop=True),
         ],
         axis=1,

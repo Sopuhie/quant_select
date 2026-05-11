@@ -200,6 +200,9 @@ def upsert_stock_daily_klines(
 ) -> None:
     """写入或更新本地日线缓存；冲突键为 (date, stock_code)。
 
+    支持可选字段 ``industry``（申万/中信等行业文本）；空字符串不会覆盖库内已有行业
+    （``COALESCE(NULLIF(TRIM(excluded.industry),''), …)``）。
+
     若传入 ``connection``，则不单独提交/关闭连接（由调用方 ``commit``）。
     """
     sql = """

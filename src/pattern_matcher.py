@@ -1,6 +1,6 @@
 """
 图形相似度匹配引擎。
-使用本地 SQLite 行情：可选皮尔逊相关 + 形状距离（向量化），或 DTW（动态时间规整）度量形态相似度。
+使用本地 SQLite 行情：可选皮尔逊相关 + 形状距离（向量化），或纯 NumPy DTW（双行 DP，可选 Sakoe-Chiba 带状）。
 """
 from __future__ import annotations
 
@@ -34,22 +34,95 @@ def _row_minmax_norm(X: np.ndarray) -> np.ndarray:
     return out
 
 
-def _dtw_distance_sq_euclidean(a: np.ndarray, b: np.ndarray) -> float:
-    """经典 DTW，平方欧式路径代价，返回路径长度的欧式距离（非平方）。"""
+# Sakoe-Chiba 带宽（|i−j|≤R）；R 为常数时单条序列约 O(W·R)，全候选合计 O(N·W·R)≈O(N·W)。
+DEFAULT_DTW_SAKOE_CHIBA_RADIUS = 12
+
+
+def _dtw_accumulated_sq_cost_full_2row(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    完整 DTW：累计平方欧式路径代价（未开方）。
+    双行滚动数组，时间 O(n·m)，空间 O(m)；无 (n+1)×(m+1) 全矩阵分配。
+    """
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
     n, m = len(a), len(b)
     if n == 0 or m == 0:
         return float("inf")
-    inf = np.inf
-    dtw = np.full((n + 1, m + 1), inf, dtype=np.float64)
-    dtw[0, 0] = 0.0
+    prev = np.full(m + 1, np.inf, dtype=np.float64)
+    curr = np.full(m + 1, np.inf, dtype=np.float64)
+    prev[0] = 0.0
     for i in range(1, n + 1):
+        curr[0] = np.inf
         ai = a[i - 1]
+        delta_sq = (ai - b) ** 2
         for j in range(1, m + 1):
-            cost = (ai - b[j - 1]) ** 2
-            dtw[i, j] = cost + min(dtw[i - 1, j], dtw[i, j - 1], dtw[i - 1, j - 1])
-    return float(np.sqrt(dtw[n, m]))
+            curr[j] = delta_sq[j - 1] + min(prev[j], curr[j - 1], prev[j - 1])
+        prev, curr = curr, prev
+    val = prev[m]
+    return float(val) if np.isfinite(val) else float("inf")
+
+
+def _dtw_accumulated_sq_cost_banded_2row(
+    a: np.ndarray,
+    b: np.ndarray,
+    radius: int,
+) -> float:
+    """
+    Sakoe-Chiba 带状 DTW（|i−j|≤radius），双行滚动。
+    固定 radius 且 n≈m=W 时，时间约 O(W·radius)。
+    """
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return float("inf")
+    r = max(0, int(radius))
+    prev = np.full(m + 1, np.inf, dtype=np.float64)
+    curr = np.full(m + 1, np.inf, dtype=np.float64)
+    prev[0] = 0.0
+    for i in range(1, n + 1):
+        curr[:] = np.inf
+        lo = max(1, i - r)
+        hi = min(m, i + r)
+        ai = a[i - 1]
+        for j in range(lo, hi + 1):
+            c = (ai - b[j - 1]) ** 2
+            curr[j] = c + min(prev[j], curr[j - 1], prev[j - 1])
+        prev, curr = curr, prev
+    val = prev[m]
+    return float(val) if np.isfinite(val) else float("inf")
+
+
+def _dtw_euclidean_distance(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    sakoe_chiba_radius: int | None,
+) -> float:
+    """欧式 DTW 距离；优先带状加速，累计代价非有限时回退完整 DTW。"""
+    rad = (
+        int(sakoe_chiba_radius)
+        if sakoe_chiba_radius is not None
+        else DEFAULT_DTW_SAKOE_CHIBA_RADIUS
+    )
+    cost_sq = _dtw_accumulated_sq_cost_banded_2row(a, b, rad)
+    if not np.isfinite(cost_sq):
+        cost_sq = _dtw_accumulated_sq_cost_full_2row(a, b)
+    return float(np.sqrt(cost_sq)) if np.isfinite(cost_sq) else float("inf")
+
+
+def _dtw_distances_ref_to_rows(
+    ref: np.ndarray,
+    X: np.ndarray,
+    *,
+    sakoe_chiba_radius: int | None,
+) -> np.ndarray:
+    """样板 ``ref`` (W,) 与候选矩阵 ``X`` (N,W) 的 DTW 距离向量 (N,)。"""
+    ref = np.asarray(ref, dtype=np.float64).ravel()
+    out = np.empty(X.shape[0], dtype=np.float64)
+    for i in range(X.shape[0]):
+        out[i] = _dtw_euclidean_distance(ref, X[i], sakoe_chiba_radius=sakoe_chiba_radius)
+    return out
 
 
 def _pearson_rows(ref: np.ndarray, X: np.ndarray) -> np.ndarray:
@@ -76,6 +149,7 @@ def find_similar_patterns(
     compare_days: int = 120,
     limit_results: int = 5,
     algorithm: str = "pearson",
+    dtw_sakoe_chiba_radius: int | None = None,
 ) -> list[dict]:
     """
     在本地行情库中，寻找与目标股票给定区间收盘价形态最相似的个股（最近窗口长度与模板一致）。
@@ -86,6 +160,8 @@ def find_similar_patterns(
         compare_days: 日历跨度近似控制候选数据加载起点（越大越耗内存，默认覆盖约一季以上交易日）
         limit_results: 返回前几条
         algorithm: ``pearson`` | ``dtw``；DTW 适合时间轴伸缩的形态比较。
+        dtw_sakoe_chiba_radius: DTW 的 Sakoe-Chiba 带宽 R（``|i-j|≤R``）；``None`` 时用模块默认值。
+            固定 R 时复杂度约 ``O(N·W·R)``；过紧时会自动回退完整双行 DTW。
     """
     algo = str(algorithm).strip().lower()
     if algo not in ("pearson", "dtw"):
@@ -172,11 +248,16 @@ def find_similar_patterns(
     ref = np.asarray(target_series, dtype=np.float64)
 
     if algo == "dtw":
-        dtw_d = np.array(
-            [_dtw_distance_sq_euclidean(ref, X_norm[i]) for i in range(X_norm.shape[0])],
-            dtype=np.float64,
+        dtw_d = _dtw_distances_ref_to_rows(
+            ref,
+            X_norm,
+            sakoe_chiba_radius=dtw_sakoe_chiba_radius,
         )
-        similarity = 100.0 / (1.0 + dtw_d)
+        similarity = np.where(
+            np.isfinite(dtw_d) & (dtw_d >= 0),
+            100.0 / (1.0 + dtw_d),
+            0.0,
+        )
     else:
         corr = _pearson_rows(ref, X_norm)
         diff = X_norm - ref

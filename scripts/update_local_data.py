@@ -6,7 +6,10 @@
 
 逻辑：本地无该代码记录则拉取约 365 自然日；已有则从「最近收盘日」次日增量拉取并 UPSERT。
 启动前一次性查询 ``SELECT stock_code, MAX(date) GROUP BY stock_code`` 建查找表；已对齐最近交易日的标的跳过网络请求。
-并发拉取使用 ``ThreadPoolExecutor``（默认 8 线程，可用 ``--workers`` 或环境变量 ``QUANT_UPDATE_WORKERS`` 调整），写入仍在主线程串行提交以降低锁竞争。
+
+并发策略（SQLite 友好）：
+  - **阶段 1**：``ThreadPoolExecutor`` 内仅执行网络拉取，不写数据库；
+  - **阶段 2**：线程池结束后，由 **主线程** 将内存中的 K 线分批 ``UPSERT`` 并 ``commit``，避免多线程竞争连接导致锁等待或死锁。
 """
 from __future__ import annotations
 
@@ -15,7 +18,6 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,20 +33,20 @@ from src.database import (
     open_sqlite_connection,
     upsert_stock_daily_klines,
 )
-from src.data_fetcher import fetch_daily_hist, get_stock_pool
-from src.utils import get_last_trading_date, next_trade_day_after
+from src.data_fetcher import (
+    fetch_daily_hist,
+    get_stock_pool,
+    resolve_incremental_daily_fetch_window,
+)
+from src.utils import get_last_trading_date
 
 DEFAULT_WORKERS = max(1, int(os.environ.get("QUANT_UPDATE_WORKERS", "8")))
+# 主线程单次 executemany 行数上限（过大易占用内存；过小则事务开销大）
+UPSERT_FLUSH_ROWS = max(1000, int(os.environ.get("QUANT_UPSERT_FLUSH_ROWS", "8000")))
+COMMIT_EVERY_FLUSHES = max(1, int(os.environ.get("QUANT_COMMIT_EVERY_FLUSHES", "3")))
 
 
-def _parse_db_date(s: str) -> datetime:
-    s = str(s).strip()
-    if "-" in s:
-        return datetime.strptime(s[:10], "%Y-%m-%d")
-    return datetime.strptime(s[:8], "%Y%m%d")
-
-
-def _worker_fetch_incremental(
+def _worker_fetch_only(
     code: str,
     name: str,
     last_date_raw: object | None,
@@ -52,31 +54,17 @@ def _worker_fetch_incremental(
     end_compact: str,
 ) -> tuple[list[dict] | None, str]:
     """
-    网络拉取（线程内执行）。返回 (records, status)。
-    status: fetched | uptodate | bad_range | empty | error
+    仅在 worker 线程中执行网络请求与内存组装，**禁止**访问 SQLite。
+    返回 (records, status)；status ∈ fetched | uptodate | bad_range | empty | error
     """
     code = str(code).strip().zfill(6)
-    if last_date_raw is not None:
-        ld = str(last_date_raw).strip()[:10]
-        if ld >= latest_trade:
-            return None, "uptodate"
-
-    if last_date_raw is None:
-        start_compact = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
-    else:
-        ld_raw = str(last_date_raw).strip()[:10]
-        nxt_trade = next_trade_day_after(ld_raw)
-        if nxt_trade:
-            start_compact = nxt_trade.replace("-", "")[:8]
-        else:
-            try:
-                nxt = _parse_db_date(ld_raw) + timedelta(days=1)
-            except ValueError:
-                nxt = datetime.now() - timedelta(days=365)
-            start_compact = nxt.strftime("%Y%m%d")
-
-    if start_compact > end_compact:
-        return None, "bad_range"
+    start_compact, kind = resolve_incremental_daily_fetch_window(
+        last_date_raw,
+        latest_trade,
+        end_compact,
+    )
+    if kind != "fetch":
+        return None, kind
 
     try:
         df = fetch_daily_hist(
@@ -135,17 +123,11 @@ def update_database_kline(
     print(
         f"全市场共获取到 {total} 只股票；本地已有缓存 {len(date_mapping)} 只。"
         f" MAX(date) 映射查询耗时 {(t_map - t0) * 1000:.1f} ms。"
-        f" 增量截止(最近交易日): {latest_trade}；并发线程: {workers}。",
+        f" 增量截止(最近交易日): {latest_trade}；并发拉取线程: {workers}。",
         flush=True,
     )
 
     skipped_uptodate = 0
-    skipped_bad_range = 0
-    empty_fetch = 0
-    errors = 0
-    stocks_saved = 0
-    fetch_jobs = 0
-
     pending: list[tuple[str, str, object | None]] = []
     for c, n in stock_pool:
         code = str(c).strip().zfill(6)
@@ -161,64 +143,100 @@ def update_database_kline(
         flush=True,
     )
 
-    commit_every = 50
+    # ---------- 阶段 1：仅并发拉取（零 SQLite） ----------
+    t_fetch0 = time.perf_counter()
+    outcomes: list[tuple[list[dict] | None, str]] = []
+    workers_n = max(1, min(workers, 32))
+
+    with ThreadPoolExecutor(max_workers=workers_n) as ex:
+        futs = [
+            ex.submit(
+                _worker_fetch_only,
+                code,
+                name,
+                last_raw,
+                latest_trade,
+                end_compact,
+            )
+            for code, name, last_raw in pending
+        ]
+        done = 0
+        for fut in as_completed(futs):
+            done += 1
+            if n_pending and (done % 500 == 0 or done == n_pending):
+                print(
+                    f"  [拉取] {done}/{n_pending} 个任务已完成…",
+                    flush=True,
+                )
+            try:
+                outcomes.append(fut.result())
+            except Exception:
+                outcomes.append((None, "error"))
+
+    t_fetch1 = time.perf_counter()
+    print(
+        f"阶段 1 结束：并发拉取耗时 {t_fetch1 - t_fetch0:.1f}s；开始主线程批量写入…",
+        flush=True,
+    )
+
+    skipped_bad_range = 0
+    empty_fetch = 0
+    errors = 0
+    fetch_jobs = 0
+    pending_writes: list[list[dict]] = []
+
+    for records, status in outcomes:
+        if status == "uptodate":
+            skipped_uptodate += 1
+            continue
+        if status == "bad_range":
+            skipped_bad_range += 1
+            continue
+        if status == "empty":
+            empty_fetch += 1
+            continue
+        if status == "error":
+            errors += 1
+            continue
+        if status == "fetched" and records:
+            fetch_jobs += 1
+            pending_writes.append(records)
+
+    # ---------- 阶段 2：主线程分批 UPSERT ----------
+    stocks_batches = 0
+    buf: list[dict] = []
+    flush_ops = 0
     conn = open_sqlite_connection(DB_PATH)
     try:
-        with ThreadPoolExecutor(max_workers=max(1, min(workers, 32))) as ex:
-            futs = [
-                ex.submit(
-                    _worker_fetch_incremental,
-                    code,
-                    name,
-                    last_raw,
-                    latest_trade,
-                    end_compact,
-                )
-                for code, name, last_raw in pending
-            ]
-            done = 0
-            for fut in as_completed(futs):
-                done += 1
-                if n_pending and (done % 500 == 0 or done == n_pending):
+        for recs in pending_writes:
+            buf.extend(recs)
+            stocks_batches += 1
+            while len(buf) >= UPSERT_FLUSH_ROWS:
+                chunk = buf[:UPSERT_FLUSH_ROWS]
+                del buf[:UPSERT_FLUSH_ROWS]
+                upsert_stock_daily_klines(chunk, connection=conn)
+                flush_ops += 1
+                if flush_ops % COMMIT_EVERY_FLUSHES == 0:
+                    conn.commit()
                     print(
-                        f"进度: {done}/{n_pending} "
-                        f"(已写入批次: {stocks_saved}, 有效拉取: {fetch_jobs})",
+                        f"  [写入] 已执行 upsert 批次 {flush_ops} "
+                        f"（约每批 {UPSERT_FLUSH_ROWS} 行）…",
                         flush=True,
                     )
-                try:
-                    records, status = fut.result()
-                except Exception:
-                    errors += 1
-                    continue
 
-                if status == "uptodate":
-                    skipped_uptodate += 1
-                    continue
-                if status == "bad_range":
-                    skipped_bad_range += 1
-                    continue
-                if status == "empty":
-                    empty_fetch += 1
-                    continue
-                if status == "error":
-                    errors += 1
-                    continue
-                if status == "fetched" and records:
-                    fetch_jobs += 1
-                    upsert_stock_daily_klines(records, connection=conn)
-                    stocks_saved += 1
-                    if stocks_saved % commit_every == 0:
-                        conn.commit()
-
+        if buf:
+            upsert_stock_daily_klines(buf, connection=conn)
+            flush_ops += 1
         conn.commit()
     finally:
         conn.close()
 
-    elapsed = time.perf_counter() - t0
+    t_end = time.perf_counter()
     print(
         f"本轮结束：共 {total} 只股票；无需请求(已跟上最近交易日): {skipped_uptodate}；"
-        f" 区间无效跳过: {skipped_bad_range}；空返回: {empty_fetch}；异常: {errors}；"
-        f" 实际写入批次: {stocks_saved}；总耗时 {elapsed:.1f}s。",
+        f" 区间无效: {skipped_bad_range}；空返回: {empty_fetch}；拉取异常: {errors}；"
+        f" 有效拉取股票数: {fetch_jobs}；参与写入的股票批次数: {stocks_batches}；"
+        f" DB upsert 次数: {flush_ops}；总耗时 {t_end - t0:.1f}s。",
         flush=True,
     )
 
