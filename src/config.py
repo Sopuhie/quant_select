@@ -58,7 +58,7 @@ PREDICT_HISTORY_CALENDAR_DAYS = int(os.environ.get("QUANT_PREDICT_LOOKBACK_DAYS"
 PREDICT_FETCH_WORKERS = int(os.environ.get("QUANT_FETCH_WORKERS", "4"))
 
 # AkShare 全部失败时是否用 Baostock 串行兜底（需安装 baostock；非线程安全故全局锁串行）
-USE_BAOSTOCK_FALLBACK = os.environ.get("QUANT_BAOSTOCK_FALLBACK", "1") not in (
+USE_BAOSTOCK_FALLBACK = os.environ.get("QUANT_BAOSTOCK_FALLBACK", "0") not in (
     "0",
     "false",
     "False",
