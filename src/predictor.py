@@ -41,8 +41,35 @@ from .factor_calculator import (
     compute_factors_for_history,
     normalize_industry_label,
 )
-from .model_trainer import load_model
+from .model_trainer import load_model, load_xgb_ranker_optional
 from .utils import is_kline_too_stale_vs_prediction
+
+
+def blend_ranker_scores(
+    lgb_scores: np.ndarray | pd.Series,
+    xgb_scores: np.ndarray | pd.Series | None,
+    *,
+    lgb_weight: float = 0.6,
+    xgb_weight: float = 0.4,
+) -> np.ndarray:
+    """
+    双排序器融合：将各自原始得分在截面转为分位秩 ``[0,1]`` 后加权；
+    若无 XGBoost 得分则退回 LightGBM 原始 predict（与旧管线兼容）。
+    """
+    ls = np.asarray(lgb_scores, dtype=float).ravel()
+    if xgb_scores is None:
+        return ls.astype(float)
+    xs = np.asarray(xgb_scores, dtype=float).ravel()
+    if xs.shape[0] != ls.shape[0]:
+        raise ValueError("LightGBM 与 XGBoost 预测长度不一致")
+    lgb_r = pd.Series(ls).rank(pct=True).to_numpy(dtype=float)
+    xgb_r = pd.Series(xs).rank(pct=True).to_numpy(dtype=float)
+    w = float(lgb_weight) + float(xgb_weight)
+    if w <= 0:
+        return lgb_r.astype(float)
+    return (
+        (float(lgb_weight) / w) * lgb_r + (float(xgb_weight) / w) * xgb_r
+    ).astype(float)
 
 
 def _normalize_stock_display_name(stock_name: Optional[str]) -> str:
@@ -202,7 +229,8 @@ def predict_universe_scores(
     """
     对股票池用最新一根 K 线计算因子并预测分数。
     并发拉取 K 线（缩短历史窗口），主线程一次性 predict，避免 sklearn 特征名告警与长时间无反馈。
-    返回 (as_of_trade_date, DataFrame columns: stock_code, stock_name, score, close_price)
+    返回 (as_of_trade_date, DataFrame columns: stock_code, stock_name, score, close_price)。
+    ``score``：若存在 ``models/xgb_model.pkl``，为 LightGBM / XGBoost 截面分位秩的 0.6/0.4 融合；否则为 LightGBM 原始得分。
 
     Args:
         target_trade_date: 期望预测所属交易日（YYYY-MM-DD）。传入时以此为锚剔除
@@ -212,7 +240,8 @@ def predict_universe_scores(
     workers = max(1, min(workers, 32))
     start_compact = compact_start_calendar_days_ago()
     timeout = AKSHARE_REQUEST_TIMEOUT
-    model = load_model(model_path)
+    lgb_model = load_model(model_path)
+    xgb_model = load_xgb_ranker_optional()
 
     init_db()
     pool_codes = [str(c).strip().zfill(6) for c, _ in stock_pairs]
@@ -292,8 +321,9 @@ def predict_universe_scores(
         raise RuntimeError("经 ST/涨跌停过滤后无可用股票，请检查股票池或关闭部分过滤开关。")
 
     X = feat_df[FEATURE_COLUMNS].astype(np.float64)
-    scores = model.predict(X)
-    feat_df["score"] = scores.astype(float)
+    lgb_scores = lgb_model.predict(X)
+    xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
+    feat_df["score"] = blend_ranker_scores(lgb_scores, xgb_scores)
     cols = ["trade_date", "stock_code", "stock_name", "score", "close_price"]
     out = feat_df[cols].copy()
     out = out.sort_values("score", ascending=False).reset_index(drop=True)

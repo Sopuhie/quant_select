@@ -12,6 +12,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 MODELS_DIR = PROJECT_ROOT / "models"
 DB_PATH = DATA_DIR / "stocks.db"
 MODEL_PATH = MODELS_DIR / "lgb_model.pkl"
+XGB_MODEL_PATH = MODELS_DIR / "xgb_model.pkl"
 BEST_LGB_PARAMS_JSON = MODELS_DIR / "best_params.json"
 
 # 确保目录存在

@@ -11,6 +11,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor, LGBMRanker, early_stopping
+from xgboost import XGBRanker
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
 
@@ -20,6 +21,7 @@ from .config import (
     LGB_PARAMS,
     LGB_RANKER_DEFAULT_PARAMS,
     MODEL_PATH,
+    XGB_MODEL_PATH,
 )
 from .data_fetcher import fetch_daily_hist, has_enough_history
 from .database import fetch_latest_industry_by_codes, init_db, register_model_version
@@ -251,6 +253,100 @@ def train_lgbm_ranker(
     return model, metrics
 
 
+def train_xgb_ranker(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    best_params: dict[str, Any],
+    feature_cols: list[str] | None = None,
+    date_col: str = "date",
+    label_col: str = "label_ret",
+    n_estimators: int = 200,
+    early_stopping_rounds: int = 50,
+    random_state: int = 42,
+    verbose: bool = False,
+) -> tuple[XGBRanker, dict[str, Any]]:
+    """
+    与 ``train_lgbm_ranker`` 相同的按日分组与 relevance 标签，训练 ``rank:ndcg`` 的 XGBRanker。
+    超参与 Optuna/LightGBM 结果对齐：树深度由 ``num_leaves`` 映射，学习率/子采样等直接沿用。
+    """
+    cols = feature_cols or list(FEATURE_COLUMNS)
+    tr = prepare_ranking_frame(train_df, date_col)
+    va = prepare_ranking_frame(val_df, date_col)
+
+    X_tr = tr[cols].apply(pd.to_numeric, errors="coerce")
+    y_tr = pd.to_numeric(tr[label_col], errors="coerce")
+    X_va = va[cols].apply(pd.to_numeric, errors="coerce")
+    y_va = pd.to_numeric(va[label_col], errors="coerce")
+
+    mt = np.isfinite(X_tr.to_numpy()).all(axis=1) & np.isfinite(y_tr.to_numpy())
+    mv = np.isfinite(X_va.to_numpy()).all(axis=1) & np.isfinite(y_va.to_numpy())
+
+    tr = tr.loc[mt].reset_index(drop=True)
+    va = va.loc[mv].reset_index(drop=True)
+    X_tr = X_tr.loc[mt].reset_index(drop=True)
+    y_tr = y_tr.loc[mt].reset_index(drop=True)
+    X_va = X_va.loc[mv].reset_index(drop=True)
+    y_va = y_va.loc[mv].reset_index(drop=True)
+
+    g_tr = ranking_group_sizes(tr, date_col)
+    g_va = ranking_group_sizes(va, date_col)
+
+    y_tr_rel = relevance_labels_int_from_returns(tr, label_col, date_col)
+    y_va_rel = relevance_labels_int_from_returns(va, label_col, date_col)
+    y_fit_tr = np.ascontiguousarray(y_tr_rel, dtype=np.int32)
+    y_fit_va = np.ascontiguousarray(y_va_rel, dtype=np.int32)
+
+    bp = dict(best_params)
+    lr = float(bp.get("learning_rate", 0.05))
+    num_leaves = int(bp.get("num_leaves", 31))
+    max_depth = int(np.clip(num_leaves // 4, 3, 8))
+    subsample = float(bp.get("subsample", 0.8))
+    colsample_bytree = float(bp.get("colsample_bytree", 0.8))
+
+    model = XGBRanker(
+        objective="rank:ndcg",
+        eval_metric=["ndcg@3", "ndcg@5"],
+        learning_rate=lr,
+        max_depth=max_depth,
+        n_estimators=n_estimators,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        random_state=random_state,
+        early_stopping_rounds=early_stopping_rounds,
+        verbosity=1 if verbose else 0,
+    )
+    model.fit(
+        X_tr,
+        y_fit_tr,
+        group=g_tr,
+        eval_set=[(X_va, y_fit_va)],
+        eval_group=[g_va],
+        verbose=verbose,
+    )
+
+    pred_va = model.predict(X_va)
+    ic_val = mean_cross_sectional_rank_ic(
+        pred_va, va[date_col].to_numpy(), y_va.to_numpy(dtype=float)
+    )
+    metrics: dict[str, Any] = {
+        "xgb_mean_rank_ic_val": ic_val,
+        "xgb_n_train": int(len(y_tr)),
+        "xgb_n_val": int(len(y_va)),
+        "xgb_max_depth": max_depth,
+    }
+    try:
+        er = getattr(model, "evals_result_", None) or {}
+        v0 = er.get("validation_0", er.get("valid_0", {}))
+        for key in sorted(v0.keys()):
+            if "ndcg" in key.lower() and v0[key]:
+                metrics[f"xgb_val_{key}_last"] = float(v0[key][-1])
+    except Exception:
+        pass
+
+    return model, metrics
+
+
 def optuna_tune_lgbm_ranker(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -445,7 +541,7 @@ def feature_importance_table(
 
 
 def save_model(model: Any, path: Path | None = None) -> Path:
-    """序列化 LightGBM 模型（回归或 LambdaRank）。训练时请传入列名为 FEATURE_COLUMNS 的 DataFrame。"""
+    """序列化模型（joblib）：LightGBM / XGBoost Ranker 等。预测特征列须与 ``FEATURE_COLUMNS`` 一致。"""
     p = path or MODEL_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, p)
@@ -455,6 +551,17 @@ def save_model(model: Any, path: Path | None = None) -> Path:
 def load_model(path: Path | None = None) -> Any:
     p = path or MODEL_PATH
     return joblib.load(p)
+
+
+def load_xgb_ranker_optional(path: Path | None = None) -> Any | None:
+    """若 ``models/xgb_model.pkl`` 不存在或损坏则返回 None（预测侧仅 LightGBM）。"""
+    p = path or XGB_MODEL_PATH
+    if not p.exists():
+        return None
+    try:
+        return joblib.load(p)
+    except Exception:
+        return None
 
 
 def train_panel_and_register(
@@ -490,6 +597,16 @@ def train_panel_and_register(
         verbose=False,
     )
     save_model(model, model_path)
+    xgb_model, xgb_metrics = train_xgb_ranker(
+        train_df,
+        val_df,
+        best_params=params,
+        n_estimators=200,
+        early_stopping_rounds=50,
+        verbose=False,
+    )
+    save_model(xgb_model, XGB_MODEL_PATH)
+    metrics = {**metrics, **xgb_metrics}
     register_model_version(
         version=version,
         train_end_date=train_end_date,

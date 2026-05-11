@@ -1,5 +1,5 @@
 """
-每日选股：从本地 stock_daily_kline 读 K 线、截面清洗、LightGBM 打分，写入 daily_predictions / daily_selections。
+每日选股：从本地 stock_daily_kline 读 K 线、截面清洗，LightGBM + XGBoost Ranker 融合打分（若存在 xgb_model.pkl），写入 daily_predictions / daily_selections。
 默认股票池为「本地库中截至预测日有足够历史的代码」；可加 --online-pool 用 AkShare 成分后再与本地求交。
 
 用法:
@@ -54,8 +54,8 @@ from src.factor_calculator import (
     compute_factors_for_history,
     normalize_industry_label,
 )
-from src.model_trainer import load_model
-from src.predictor import filter_predictions
+from src.model_trainer import load_model, load_xgb_ranker_optional
+from src.predictor import blend_ranker_scores, filter_predictions
 from src.utils import get_last_trading_date, is_a_share_trading_day
 
 
@@ -186,7 +186,8 @@ def predict_daily(
     if not MODEL_PATH.exists():
         print(f"错误: 找不到模型文件 {MODEL_PATH}，请先运行 train_model.py")
         sys.exit(1)
-    model = load_model(MODEL_PATH)
+    lgb_model = load_model(MODEL_PATH)
+    xgb_model = load_xgb_ranker_optional()
 
     # 2. 股票池：默认完全来自本地库；--online-pool 时用在线成分与本地可算股票求交
     if use_online_pool:
@@ -306,12 +307,13 @@ def predict_daily(
         print("警告: 板块过滤后没有剩余的候选股票。")
         sys.exit(1)
 
-    # 6. 使用 LightGBM 模型进行打分预测
+    # 6. LightGBM + XGBoost Ranker 打分并截面秩融合（无 xgb 文件时等同仅 LGB）
     X = filtered_df[FEATURE_COLUMNS].astype(np.float64)
-    scores = model.predict(X.values)
+    lgb_scores = lgb_model.predict(X.values)
+    xgb_scores = xgb_model.predict(X.values) if xgb_model is not None else None
 
     filtered_df = filtered_df.copy()
-    filtered_df["score"] = scores.astype(float)
+    filtered_df["score"] = blend_ranker_scores(lgb_scores, xgb_scores)
 
     # 全市场排序并记录预测数据（分数相同时按代码稳定次序，避免重复运行 Top 边界跳动）
     filtered_df = filtered_df.sort_values(

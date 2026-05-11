@@ -1,5 +1,6 @@
 """
-使用本地 SQLite（stock_daily_kline）中的日线计算因子并重训 LightGBM LambdaRank。
+使用本地 SQLite（stock_daily_kline）中的日线计算因子并重训排序模型：
+LightGBM LambdaRank + 配套 XGBoost XGBRanker（rank:ndcg），落盘 lgb_model.pkl / xgb_model.pkl。
 不依赖在线行情拉取；预测侧仍使用 factor_calculator 中同一套因子定义。
 
 用法（在 quant_select 目录下）:
@@ -28,6 +29,7 @@ from src.config import (
     LABEL_HORIZON_DAYS,
     MIN_HISTORY_BARS,
     MODEL_PATH,
+    XGB_MODEL_PATH,
 )
 from src.database import init_db, register_model_version
 from src.factor_calculator import (
@@ -45,6 +47,7 @@ from src.model_trainer import (
     save_model,
     save_ranker_params_json,
     train_lgbm_ranker,
+    train_xgb_ranker,
 )
 
 
@@ -145,7 +148,7 @@ def _load_local_kline_panel(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="本地 SQLite K 线训练 LightGBM LambdaRank")
+    parser = argparse.ArgumentParser(description="本地 SQLite K 线训练 LightGBM LambdaRank + XGBoost Ranker")
     parser.add_argument(
         "--train-end-date",
         type=str,
@@ -262,6 +265,18 @@ def main() -> None:
         verbose=verbose,
     )
 
+    if verbose:
+        print("[XGBRanker] rank:ndcg，与 LightGBM 相同分组与 relevance …", flush=True)
+    xgb_model, xgb_metrics = train_xgb_ranker(
+        train_df,
+        val_df,
+        best_params=best_full,
+        feature_cols=list(FEATURE_COLUMNS),
+        n_estimators=200,
+        early_stopping_rounds=50,
+        verbose=verbose,
+    )
+
     train_end_register = (
         args.train_end_date
         if args.train_end_date
@@ -279,8 +294,10 @@ def main() -> None:
     for k, v in rank_metrics.items():
         if k not in metrics_register and str(k).startswith("val_ndcg"):
             metrics_register[k] = v
+    metrics_register.update({k: v for k, v in xgb_metrics.items() if v is not None})
 
     save_model(model, MODEL_PATH)
+    save_model(xgb_model, XGB_MODEL_PATH)
     register_model_version(
         version=version,
         train_end_date=str(train_end_register)[:10],
@@ -295,7 +312,9 @@ def main() -> None:
             "version": version,
             "train_end_date": train_end_register,
             "mean_rank_ic_val": rank_metrics.get("mean_rank_ic_val"),
+            "xgb_mean_rank_ic_val": xgb_metrics.get("xgb_mean_rank_ic_val"),
             "model_path": str(MODEL_PATH),
+            "xgb_model_path": str(XGB_MODEL_PATH),
             "best_params_json": str(BEST_LGB_PARAMS_JSON) if args.tune else None,
         },
         flush=True,
