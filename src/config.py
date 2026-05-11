@@ -114,4 +114,6 @@ FEATURE_COLUMNS = [
     "factor_wr_14",
     "factor_atr_14",
     "factor_size_mcap",
+    "factor_macd_diff",
+    "factor_close_position",
 ]

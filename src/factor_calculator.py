@@ -206,6 +206,16 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     out["factor_wr_14"] = _williams_r(high, low, close, OSCILLATOR_PERIOD)
     out["factor_atr_14"] = _atr_ratio(high, low, close, OSCILLATOR_PERIOD)
 
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    out["factor_macd_diff"] = (ema12 - ema26) / (close + eps)
+
+    denom = high.astype(float) - low.astype(float)
+    safe_den = denom.where(denom >= eps, eps)
+    out["factor_close_position"] = (
+        (close.astype(float) - low.astype(float)) / safe_den
+    ).clip(0.0, 1.0)
+
     if "market_cap" in df.columns:
         mcap = pd.to_numeric(df["market_cap"], errors="coerce").ffill().bfill()
     else:

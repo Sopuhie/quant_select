@@ -1054,14 +1054,56 @@ with tab_perf:
                         st.warning(
                             "模型特征数与配置 FEATURE_COLUMNS 不一致，已按较短一侧截取展示。"
                         )
+
+                    translation_map = {
+                        "factor_size_mcap": "🏢 企业流通市值 (Log Size)",
+                        "factor_wr_14": "📉 14日威廉指标 (W%R 超买超卖)",
+                        "factor_rsi_14": "📈 14日相对强弱指标 (RSI 强弱趋势)",
+                        "factor_atr_14": "⚡ 14日平均真实振幅 (ATR 波动率)",
+                        "factor_bias_5": "📏 5日乖离率 (价格偏离均线距离)",
+                        "factor_bias_10": "📏 10日乖离率",
+                        "factor_bias_20": "📏 20日乖离率",
+                        "factor_bias_60": "📏 60日乖离率",
+                        "factor_ratio_5_20": "🔀 5日与20日均线距离比",
+                        "factor_ratio_10_60": "🔀 10日与60日均线距离比",
+                        "factor_return_1d": "💵 1日收益率 (昨日涨跌)",
+                        "factor_return_5d": "💵 5日累计收益率",
+                        "factor_momentum_10d": "🚀 10日动量效应 (追涨杀跌度量)",
+                        "factor_volume_ratio": "📊 今日量比 (相比5日均量放量倍数)",
+                        "factor_volume_position": "🔄 5日与20日均量趋势位置",
+                        "factor_volatility_5d": "🌪️ 5日历史波动率 (高低价差比)",
+                        "factor_volatility_20d": "🌪️ 20日历史波动率",
+                        "factor_macd_diff": "📊 MACD 快慢线差 / 收盘 (中长期趋势强度)",
+                        "factor_close_position": "💹 收盘在日内高低区位 (买盘承接强度代理)",
+                    }
+
+                    raw_features = FEATURE_COLUMNS[:n]
+                    translated_features = [
+                        translation_map.get(f, f) for f in raw_features
+                    ]
+
                     feat_imp_df = pd.DataFrame(
                         {
-                            "Feature": FEATURE_COLUMNS[:n],
+                            "Raw_Feature": raw_features,
+                            "Feature": translated_features,
                             "Importance": list(imp_arr)[:n],
                         }
                     )
                     feat_imp_df = feat_imp_df.sort_values(
                         "Importance", ascending=True
+                    )
+
+                    st.markdown(
+                        """
+                        <div style="background-color: rgba(30, 34, 51, 0.4); border-left: 4px solid #00FFCC; padding: 12px; border-radius: 4px; margin-bottom: 20px;">
+                            <strong style="color: #00FFCC;">💡 指标卡片小课堂：</strong>
+                            <span style="color: #8f9cae; font-size: 0.9rem;">
+                                决策树分裂频次代表模型在筛选 Top 推荐股时，<b>使用该因子进行分类和过滤的次数</b>。
+                                柱体越长、排名越靠上，说明该指标在双排序模型中<b>越核心</b>，是主要的超额收益来源。
+                            </span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
                     )
 
                     fig_imp = go.Figure()
@@ -1073,21 +1115,29 @@ with tab_perf:
                             marker=dict(
                                 color=feat_imp_df["Importance"],
                                 colorscale=[
-                                    [0, "rgba(0, 255, 204, 0.2)"],
+                                    [0, "rgba(0, 255, 204, 0.1)"],
                                     [1, "rgba(0, 255, 204, 1.0)"],
                                 ],
                                 line=dict(color=COLOR_CYBER_TEAL, width=1.5),
                             ),
                             name="因子分裂次数",
+                            hovertemplate=(
+                                "<b>%{y}</b><br>贡献分裂次数: %{x}<extra></extra>"
+                            ),
                         )
                     )
 
                     fig_imp.update_layout(
                         get_cyber_layout(
-                            "模型决策树分裂频次排行 (分值越高代表因子越核心)"
+                            "模型决策树核心因子贡献排行 (中文大白话版)"
                         ),
-                        xaxis=dict(showgrid=True, gridcolor=COLOR_GRID),
-                        height=500,
+                        xaxis=dict(
+                            showgrid=True,
+                            gridcolor=COLOR_GRID,
+                            title="分裂频次 (越高代表该因子越核心)",
+                        ),
+                        yaxis=dict(showgrid=False),
+                        height=550,
                     )
                     st.plotly_chart(fig_imp, use_container_width=True)
             else:
