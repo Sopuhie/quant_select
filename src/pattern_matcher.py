@@ -1,16 +1,16 @@
 """
 图形相似度匹配引擎。
 使用本地 SQLite 行情，通过皮尔逊相关系数与归一化序列欧氏距离辅助项对全市场进行形态检索。
+候选打分阶段使用 NumPy 向量化（广播）以加速全市场扫描。
 """
 from __future__ import annotations
 
-import sqlite3
 from datetime import timedelta
 
 import numpy as np
 import pandas as pd
 
-from .config import DB_PATH
+from .database import get_connection
 
 
 def get_normalized_series(series: pd.Series) -> np.ndarray:
@@ -23,6 +23,32 @@ def get_normalized_series(series: pd.Series) -> np.ndarray:
     if abs(max_val - min_val) < 1e-8:
         return np.zeros(len(s))
     return ((s.values - min_val) / (max_val - min_val)).astype(float)
+
+
+def _row_minmax_norm(X: np.ndarray) -> np.ndarray:
+    """对二维收盘价矩阵按行 Min-Max 到 [0,1]，与 ``get_normalized_series`` 规则一致。"""
+    mins = X.min(axis=1, keepdims=True)
+    maxs = X.max(axis=1, keepdims=True)
+    rng = maxs - mins
+    out = np.zeros_like(X, dtype=np.float64)
+    np.divide(X - mins, rng, out=out, where=rng >= 1e-8)
+    return out
+
+
+def _pearson_rows(ref: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """``ref`` 形状 (W,)，``X`` (N, W)；返回每只候选与 ``ref`` 的皮尔逊相关系数 (N,)。"""
+    ref_mean = ref.mean()
+    X_mean = X.mean(axis=1, keepdims=True)
+    rc = ref - ref_mean
+    Xc = X - X_mean
+    num = (Xc * rc).sum(axis=1)
+    den_ref = np.sqrt((rc**2).sum())
+    den_x = np.sqrt((Xc**2).sum(axis=1))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr = num / (den_ref * den_x)
+    bad = ~np.isfinite(corr) | (den_ref < 1e-15) | (den_x < 1e-15)
+    corr = np.where(bad, -1.0, corr)
+    return corr.astype(np.float64)
 
 
 def find_similar_patterns(
@@ -46,37 +72,34 @@ def find_similar_patterns(
     start_date = str(start_date).strip()[:10]
     end_date = str(end_date).strip()[:10]
 
-    conn = sqlite3.connect(str(DB_PATH))
     sql_target = """
         SELECT date, close FROM stock_daily_kline
         WHERE stock_code = ? AND date >= ? AND date <= ?
         ORDER BY date ASC
     """
-    target_df = pd.read_sql_query(
-        sql_target, conn, params=(target_code, start_date, end_date)
-    )
+    with get_connection() as conn:
+        target_df = pd.read_sql_query(
+            sql_target, conn, params=(target_code, start_date, end_date)
+        )
 
-    if target_df.empty or len(target_df) < 5:
-        conn.close()
-        return []
+        if target_df.empty or len(target_df) < 5:
+            return []
 
-    window_size = len(target_df)
-    target_series = get_normalized_series(target_df["close"])
-    if len(target_series) != window_size:
-        conn.close()
-        return []
+        window_size = len(target_df)
+        target_series = get_normalized_series(target_df["close"])
+        if len(target_series) != window_size:
+            return []
 
-    end_dt = pd.Timestamp(end_date)
-    calendar_slack = max(int(compare_days), window_size * 3, 60)
-    cutoff = (end_dt - timedelta(days=calendar_slack)).strftime("%Y-%m-%d")
+        end_dt = pd.Timestamp(end_date)
+        calendar_slack = max(int(compare_days), window_size * 3, 60)
+        cutoff = (end_dt - timedelta(days=calendar_slack)).strftime("%Y-%m-%d")
 
-    sql_all = """
-        SELECT date, stock_code, stock_name, close FROM stock_daily_kline
-        WHERE stock_code != ? AND date >= ?
-        ORDER BY stock_code, date ASC
-    """
-    all_df = pd.read_sql_query(sql_all, conn, params=(target_code, cutoff))
-    conn.close()
+        sql_all = """
+            SELECT date, stock_code, stock_name, close FROM stock_daily_kline
+            WHERE stock_code != ? AND date >= ?
+            ORDER BY stock_code, date ASC
+        """
+        all_df = pd.read_sql_query(sql_all, conn, params=(target_code, cutoff))
 
     if all_df.empty:
         return []
@@ -84,50 +107,71 @@ def find_similar_patterns(
     all_df["close"] = pd.to_numeric(all_df["close"], errors="coerce")
     all_df = all_df.dropna(subset=["close"])
 
-    results: list[dict] = []
+    stock_codes: list[str] = []
+    stock_names: list[str] = []
+    raw_blocks: list[np.ndarray] = []
+    dates_blocks: list[list[str]] = []
+    raw_price_blocks: list[list[float]] = []
+
     grouped = all_df.groupby("stock_code", sort=False)
     for code, group in grouped:
-        if str(code).zfill(6) == target_code:
+        code_z = str(code).strip().zfill(6)
+        if code_z == target_code:
             continue
         if len(group) < window_size:
             continue
 
-        candidate_window = group.tail(window_size).copy()
-        candidate_name = str(candidate_window["stock_name"].iloc[0] or "").strip()
-        candidate_prices = candidate_window["close"]
-
-        candidate_series = get_normalized_series(candidate_prices)
-        if len(candidate_series) != window_size:
+        candidate_window = group.tail(window_size)
+        closes = candidate_window["close"].to_numpy(dtype=np.float64, copy=False)
+        if closes.shape[0] != window_size or not np.all(np.isfinite(closes)):
             continue
 
-        corr = np.corrcoef(target_series, candidate_series)[0, 1]
-        if np.isnan(corr):
-            corr = -1.0
-
-        distance = float(np.sqrt(np.mean((target_series - candidate_series) ** 2)))
-        dist_score = 1.0 / (1.0 + distance)
-
-        similarity_pct = max(
-            0.0, (corr + 1.0) / 2.0 * 80.0 + dist_score * 20.0
-        )
-
+        candidate_name = str(candidate_window["stock_name"].iloc[0] or "").strip()
         dates_fmt = (
             pd.to_datetime(candidate_window["date"], errors="coerce")
             .dt.strftime("%Y-%m-%d")
             .tolist()
         )
+        if len(dates_fmt) != window_size:
+            continue
 
+        stock_codes.append(code_z)
+        stock_names.append(candidate_name)
+        raw_blocks.append(closes)
+        dates_blocks.append(dates_fmt)
+        raw_price_blocks.append(closes.astype(float).tolist())
+
+    if not raw_blocks:
+        return []
+
+    X_raw = np.vstack(raw_blocks)
+    X_norm = _row_minmax_norm(X_raw)
+    ref = np.asarray(target_series, dtype=np.float64)
+
+    corr = _pearson_rows(ref, X_norm)
+    diff = X_norm - ref
+    dist = np.sqrt(np.mean(diff**2, axis=1))
+    dist_score = 1.0 / (1.0 + dist)
+    similarity = np.maximum(0.0, (corr + 1.0) / 2.0 * 80.0 + dist_score * 20.0)
+
+    limit = int(limit_results)
+    order = np.argsort(-similarity)[:limit]
+
+    tgt_list = ref.tolist()
+    results: list[dict] = []
+    for k in order:
+        i = int(k)
+        row_norm = X_norm[i]
         results.append(
             {
-                "stock_code": str(code).zfill(6),
-                "stock_name": candidate_name,
-                "similarity": similarity_pct,
-                "target_trajectory": target_series.tolist(),
-                "candidate_trajectory": candidate_series.tolist(),
-                "dates": dates_fmt,
-                "raw_prices": candidate_prices.astype(float).tolist(),
+                "stock_code": stock_codes[i],
+                "stock_name": stock_names[i],
+                "similarity": float(similarity[i]),
+                "target_trajectory": tgt_list,
+                "candidate_trajectory": row_norm.tolist(),
+                "dates": dates_blocks[i],
+                "raw_prices": raw_price_blocks[i],
             }
         )
 
-    results.sort(key=lambda x: x["similarity"], reverse=True)
-    return results[: int(limit_results)]
+    return results

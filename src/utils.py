@@ -6,6 +6,10 @@ from typing import Optional
 
 import pandas as pd
 
+# 新浪交易日历缓存（进程内），避免频繁请求 AkShare
+_SORTED_TRADE_DATES: list[str] | None = None
+_TRADE_DATE_SET: set[str] | None = None
+
 
 def to_date_str(d: date | datetime | str) -> str:
     if isinstance(d, str):
@@ -25,6 +29,89 @@ def latest_trade_date_from_series(dates: pd.Series) -> Optional[str]:
 def add_calendar_days(d: str, n: int) -> str:
     base = datetime.strptime(d[:10], "%Y-%m-%d").date()
     return (base + timedelta(days=n)).isoformat()
+
+
+def get_sorted_a_share_trade_dates() -> list[str]:
+    """返回升序 A 股交易日字符串列表 YYYY-MM-DD；失败时为空列表。"""
+    global _SORTED_TRADE_DATES
+    if _SORTED_TRADE_DATES is not None:
+        return _SORTED_TRADE_DATES
+    try:
+        from akshare.tool.trade_date_hist import tool_trade_date_hist_sina
+
+        df = tool_trade_date_hist_sina()
+        _SORTED_TRADE_DATES = sorted(
+            pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d").tolist()
+        )
+    except Exception:
+        _SORTED_TRADE_DATES = []
+    return _SORTED_TRADE_DATES
+
+
+def get_a_share_trade_date_set() -> set[str]:
+    """交易日集合，便于 O(1) 判断。"""
+    global _TRADE_DATE_SET
+    if _TRADE_DATE_SET is None:
+        _TRADE_DATE_SET = set(get_sorted_a_share_trade_dates())
+    return _TRADE_DATE_SET
+
+
+def is_a_share_trading_day(d: str) -> bool:
+    """
+    判断 ``d``（YYYY-MM-DD）是否为 A 股交易日。
+    优先新浪日历；日历不可用时退回「周一至周五」近似（节假日可能被误判）。
+    """
+    ds = str(d).strip()[:10]
+    cal = get_sorted_a_share_trade_dates()
+    if cal:
+        return ds in get_a_share_trade_date_set()
+    try:
+        dt = datetime.strptime(ds, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return dt.weekday() < 5
+
+
+def count_trading_days_strictly_after_until(
+    last_bar_date: str, prediction_date: str
+) -> int:
+    """
+    统计满足 ``last_bar_date < d <= prediction_date`` 的交易日个数。
+    用于度量「最新 K 线日期」相对「目标预测日」的滞后（不含 last_bar 当日）。
+    """
+    L = str(last_bar_date).strip()[:10]
+    P = str(prediction_date).strip()[:10]
+    if L >= P:
+        return 0
+    cal = get_sorted_a_share_trade_dates()
+    if cal:
+        return sum(1 for x in cal if L < x <= P)
+    try:
+        a = datetime.strptime(L, "%Y-%m-%d").date()
+        b = datetime.strptime(P, "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+    n = 0
+    cur = a + timedelta(days=1)
+    while cur <= b:
+        if cur.weekday() < 5:
+            n += 1
+        cur += timedelta(days=1)
+    return n
+
+
+def is_kline_too_stale_vs_prediction(
+    last_bar_date: str,
+    prediction_date: str,
+    max_trading_day_lag: int = 5,
+) -> bool:
+    """
+    若最新 K 线日期早于目标预测日，且二者之间的交易日间隔 **大于**
+    ``max_trading_day_lag``，视为停牌/数据过旧，应从截面池中剔除。
+    """
+    return count_trading_days_strictly_after_until(
+        last_bar_date, prediction_date
+    ) > max_trading_day_lag
 
 
 def get_last_trading_date(as_of: date | datetime | str | None = None) -> str:

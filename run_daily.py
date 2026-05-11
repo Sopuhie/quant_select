@@ -52,7 +52,7 @@ from src.dingtalk_notifier import maybe_push_daily_selections
 from src.factor_calculator import clean_cross_sectional_features, compute_factors_for_history
 from src.model_trainer import load_model
 from src.predictor import filter_predictions
-from src.utils import get_last_trading_date
+from src.utils import get_last_trading_date, is_a_share_trading_day
 
 
 def _normalize_stock_code(code: str) -> str:
@@ -88,13 +88,24 @@ def _fetch_one_predict_row(
         return None
 
     last_idx = len(df_today) - 1
+    actual_last = pd.to_datetime(
+        df_today.iloc[last_idx]["date"], errors="coerce"
+    )
+    if pd.isna(actual_last):
+        return None
+    actual_last_str = actual_last.strftime("%Y-%m-%d")
+    td = str(trade_date).strip()[:10]
+    # 本地最新一根必须与预测日对齐，避免用停牌前旧 K 线参与截面排序
+    if actual_last_str != td:
+        return None
+
     last_row = factors.iloc[last_idx]
 
     if last_row[list(FEATURE_COLUMNS)].isna().any():
         return None
 
     row_dict: dict[str, float | str] = {c: float(last_row[c]) for c in FEATURE_COLUMNS}
-    row_dict["trade_date"] = trade_date
+    row_dict["trade_date"] = td
     row_dict["stock_code"] = code
     row_dict["stock_name"] = name
     row_dict["close_price"] = float(df_today.iloc[last_idx]["close"])
@@ -427,6 +438,14 @@ def main() -> None:
             # 简单校验当前是否为交易日（非周末），如果周末则退回上一个交易日
             if now.weekday() >= 5:
                 target_date = get_last_trading_date()
+
+    if not is_a_share_trading_day(target_date):
+        print(
+            f"警告: {target_date} 不是 A 股交易日（或交易日历不可用时的周一至周五近似），"
+            "已跳过选股写入，未修改数据库。",
+            flush=True,
+        )
+        sys.exit(0)
 
     predict_daily(
         trade_date=target_date,

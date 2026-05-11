@@ -47,6 +47,8 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     out["factor_volatility_20d"] = high_low_ratio.rolling(20).mean()
 
     out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.ffill().bfill()
+    out = out.fillna(0.0)
     return out[FEATURE_COLUMNS]
 
 

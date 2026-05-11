@@ -35,6 +35,7 @@ from .database import (
 )
 from .factor_calculator import clean_cross_sectional_features, compute_factors_for_history
 from .model_trainer import load_model
+from .utils import is_kline_too_stale_vs_prediction
 
 
 def _normalize_stock_display_name(stock_name: Optional[str]) -> str:
@@ -164,11 +165,17 @@ def predict_universe_scores(
     model_path: Path | None = None,
     max_workers: int | None = None,
     verbose: bool = True,
+    *,
+    target_trade_date: str | None = None,
 ) -> tuple[str, pd.DataFrame]:
     """
     对股票池用最新一根 K 线计算因子并预测分数。
     并发拉取 K 线（缩短历史窗口），主线程一次性 predict，避免 sklearn 特征名告警与长时间无反馈。
     返回 (as_of_trade_date, DataFrame columns: stock_code, stock_name, score, close_price)
+
+    Args:
+        target_trade_date: 期望预测所属交易日（YYYY-MM-DD）。传入时以此为锚剔除
+            「最新 K 线日晚于该日」或相对该日滞后超过 5 个交易日的标的；不传则以样本中最新交易日为锚。
     """
     workers = int(max_workers if max_workers is not None else PREDICT_FETCH_WORKERS)
     workers = max(1, min(workers, 32))
@@ -205,8 +212,27 @@ def predict_universe_scores(
             "关闭兜底排查：set QUANT_BAOSTOCK_FALLBACK=0"
         )
     feat_df = pd.DataFrame(raw_rows)
-    as_of = str(feat_df["trade_date"].max())
-    feat_df = feat_df[feat_df["trade_date"] == as_of].reset_index(drop=True)
+    tb = feat_df["trade_date"].map(lambda x: str(x).strip()[:10])
+
+    if target_trade_date is not None:
+        anchor = str(target_trade_date).strip()[:10]
+        feat_df = feat_df.loc[tb <= anchor].copy()
+        tb = feat_df["trade_date"].map(lambda x: str(x).strip()[:10])
+    else:
+        anchor = str(tb.max())
+
+    stale_mask = tb.map(
+        lambda lb: is_kline_too_stale_vs_prediction(str(lb), anchor)
+    )
+    feat_df = feat_df.loc[~stale_mask].copy()
+    tb = feat_df["trade_date"].map(lambda x: str(x).strip()[:10])
+    if feat_df.empty:
+        raise RuntimeError(
+            "剔除「最新 K 线相对锚定交易日滞后超过 5 个交易日」的标的后样本为空。"
+        )
+
+    as_of = str(tb.max())
+    feat_df = feat_df.loc[tb == as_of].reset_index(drop=True)
     if feat_df.empty:
         raise RuntimeError("过滤到统一交易日后样本为空。")
 
@@ -232,6 +258,8 @@ def get_full_market_predictions(
     model_path: Path | None = None,
     max_workers: int | None = None,
     verbose: bool = True,
+    *,
+    target_trade_date: str | None = None,
 ) -> tuple[str, pd.DataFrame]:
     """全市场（给定股票池）打分别名，逻辑同 predict_universe_scores。"""
     return predict_universe_scores(
@@ -239,6 +267,7 @@ def get_full_market_predictions(
         model_path=model_path,
         max_workers=max_workers,
         verbose=verbose,
+        target_trade_date=target_trade_date,
     )
 
 
@@ -305,6 +334,7 @@ def run_selection_for_latest(
         model_path=model_path,
         max_workers=fetch_workers,
         verbose=verbose,
+        target_trade_date=as_of,
     )
     if len(df) < TOP_N_SELECTION:
         raise RuntimeError(

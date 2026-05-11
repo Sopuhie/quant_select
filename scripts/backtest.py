@@ -16,6 +16,7 @@
   - 股票池优先 AkShare 成分；失败则自动改为「库内出现的代码」。
   - 沪深300 基准：优先读库内代码 000300；若无则再尝试 AkShare。
   - 净值序列默认写入 data/backtest_results.csv。
+  - 换仓时默认计入双边摩擦：成交价按 ``--slippage-rate`` 劣化，成交额按 ``--transaction-fee-rate`` 扣费（佣金+印花税等合一费率）。
 """
 from __future__ import annotations
 
@@ -500,8 +501,10 @@ class BacktestEngine:
     holding_days: int
     buy_price: PriceKind
     sell_price: PriceKind
-    buy_fee_rate: float
-    sell_fee_rate: float
+    """单边综合费率（佣金+印花税等），按成交名义金额在买卖两端各扣一次。"""
+    transaction_fee_rate: float
+    """买卖冲击成本：买入成交价 = 市价×(1+rate)，卖出 = 市价×(1−rate)。"""
+    slippage_rate: float
     get_universe: Callable[[str], list[tuple[str, str]]]
 
     cash: float = field(init=False)
@@ -550,6 +553,8 @@ class BacktestEngine:
             return
         total_cost = sum(p.cost_cash for p in self.positions)
         proceeds_sum = 0.0
+        slip = max(0.0, float(self.slippage_rate))
+        fee_r = max(0.0, float(self.transaction_fee_rate))
         for pos in self.positions:
             row = self._row(d, pos.code)
             if row is None:
@@ -557,8 +562,11 @@ class BacktestEngine:
             px = _price_on(row, self.sell_price)
             if not np.isfinite(px) or px <= 0:
                 continue
-            gross = pos.shares * px
-            fee = gross * self.sell_fee_rate
+            px_eff = px * (1.0 - slip)
+            if px_eff <= 0:
+                continue
+            gross = pos.shares * px_eff
+            fee = gross * fee_r
             proceeds_sum += gross - fee
         self.trade_pnls.append(float(proceeds_sum - total_cost))
         self.cash += proceeds_sum
@@ -571,6 +579,8 @@ class BacktestEngine:
         per = self.cash / len(codes)
         spent_total = 0.0
         new_holdings: list[HeldShare] = []
+        slip = max(0.0, float(self.slippage_rate))
+        fee_r = max(0.0, float(self.transaction_fee_rate))
         for code in codes:
             row = self._row(d, code)
             if row is None:
@@ -578,13 +588,20 @@ class BacktestEngine:
             px = _price_on(row, self.buy_price)
             if not np.isfinite(px) or px <= 0:
                 continue
+            px_eff = px * (1.0 + slip)
+            if px_eff <= 0:
+                continue
+            denom = px_eff * (1.0 + fee_r)
+            if denom <= 1e-15:
+                continue
             alloc = min(per, max(0.0, self.cash - spent_total))
             if alloc <= 0:
                 break
-            gross_target = alloc / (1 + self.buy_fee_rate)
-            shares = gross_target / px
-            fee = gross_target * self.buy_fee_rate
-            cash_use = gross_target + fee
+            # alloc = shares * px_eff + fee = shares * px_eff * (1+fee_r)
+            shares = alloc / denom
+            gross = shares * px_eff
+            fee = gross * fee_r
+            cash_use = gross + fee
             if cash_use > self.cash - spent_total + 1e-9:
                 continue
             spent_total += cash_use
@@ -697,7 +714,7 @@ def _compute_metrics(
 def _print_report(m: dict[str, Any]) -> None:
     dd0, dd1 = m["drawdown_interval"]
     print("\n" + "=" * 56)
-    print("回测结果摘要")
+    print("回测结果摘要（净值已含滑点与双边综合费率）")
     print("=" * 56)
     print(f"累计收益率:           {m['cumulative_return'] * 100:>10.2f} %")
     print(f"年化收益率 ({TRADING_DAYS_PER_YEAR} 日): {m['annualized_return'] * 100:>10.2f} %")
@@ -740,8 +757,30 @@ def main() -> None:
     parser.add_argument("--initial-cash", type=float, default=1_000_000.0)
     parser.add_argument("--buy-price", type=str, default="open", choices=["open", "close"])
     parser.add_argument("--sell-price", type=str, default="open", choices=["open", "close"])
-    parser.add_argument("--buy-fee-rate", type=float, default=0.0001, help="买入单边费率（例万1）")
-    parser.add_argument("--sell-fee-rate", type=float, default=0.0011, help="卖出单边费率（例千1.1）")
+    parser.add_argument(
+        "--transaction-fee-rate",
+        type=float,
+        default=8e-4,
+        help="换仓单边综合费率（佣金+印花税等），按成交名义金额计；默认 0.0008",
+    )
+    parser.add_argument(
+        "--slippage-rate",
+        type=float,
+        default=1e-3,
+        help="冲击成本：买价×(1+rate)、卖价×(1−rate)；默认 0.001",
+    )
+    parser.add_argument(
+        "--buy-fee-rate",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--sell-fee-rate",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--rf-annual", type=float, default=0.03, help="无风险利率年化，用于夏普")
     parser.add_argument("--max-stocks", type=int, default=MAX_STOCKS_UNIVERSE)
     parser.add_argument("--pool", type=str, default=STOCK_POOL, help="hs300 | zz500 | all")
@@ -759,6 +798,19 @@ def main() -> None:
         help="净值曲线输出路径",
     )
     args = parser.parse_args()
+
+    tx_fee = float(args.transaction_fee_rate)
+    slip = float(args.slippage_rate)
+    if args.buy_fee_rate is not None or args.sell_fee_rate is not None:
+        print(
+            "提示: --buy-fee-rate / --sell-fee-rate 已弃用，统一使用 "
+            "--transaction-fee-rate；本次仍按新参数执行。",
+            flush=True,
+        )
+    if tx_fee < 0 or slip < 0 or slip >= 1:
+        raise SystemExit(
+            "transaction-fee-rate 须 ≥0，slippage-rate 须在 [0, 1) 内。"
+        )
 
     db_lo, db_hi = get_stock_daily_kline_date_bounds(DB_PATH)
     if db_lo is None or db_hi is None:
@@ -836,9 +888,13 @@ def main() -> None:
         holding_days=args.holding_days,
         buy_price=args.buy_price,
         sell_price=args.sell_price,
-        buy_fee_rate=args.buy_fee_rate,
-        sell_fee_rate=args.sell_fee_rate,
+        transaction_fee_rate=tx_fee,
+        slippage_rate=slip,
         get_universe=universe_fn,
+    )
+    print(
+        f"摩擦假设: transaction_fee_rate={tx_fee:.6g}, slippage_rate={slip:.6g}",
+        flush=True,
     )
     engine.run()
 
@@ -866,6 +922,8 @@ def main() -> None:
     nav_out["close_trade_win_rate"] = (
         float(np.mean([1.0 if x > 0 else 0.0 for x in pnls])) if n_close > 0 else float("nan")
     )
+    nav_out["transaction_fee_rate"] = tx_fee
+    nav_out["slippage_rate"] = slip
     nav_out.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"净值序列已写入: {out_path.resolve()}")
 

@@ -12,6 +12,15 @@ from typing import Any, Iterable, Iterator
 
 from .config import DB_PATH
 
+# 高并发读写时延长等待、启用 WAL，降低 "database is locked" 概率
+_SQLITE_CONNECT_TIMEOUT = 30.0
+
+
+def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS daily_selections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,16 +93,21 @@ CREATE INDEX IF NOT EXISTS idx_logs_created ON system_logs(created_at);
 def init_db(db_path: Path | None = None) -> None:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+    try:
+        _apply_sqlite_pragmas(conn)
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+    finally:
+        conn.close()
 
 
 @contextmanager
 def get_connection(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
     path = db_path or DB_PATH
     init_db(path)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -178,7 +192,11 @@ def upsert_stock_daily_klines(
     if not batch:
         return
     own = connection is None
-    conn = connection or sqlite3.connect(str(db_path or DB_PATH))
+    if connection is not None:
+        conn = connection
+    else:
+        conn = sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
+        _apply_sqlite_pragmas(conn)
     try:
         conn.executemany(sql, batch)
         if own:
@@ -421,7 +439,9 @@ def fetch_stock_daily_bars_until(
     code = str(stock_code).strip().zfill(6)
     end = str(end_date).strip()[:10]
     path = str(db_path or DB_PATH)
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
         df = pd.read_sql_query(
             """
             SELECT date, open, high, low, close, volume
@@ -432,6 +452,8 @@ def fetch_stock_daily_bars_until(
             conn,
             params=(code, end),
         )
+    finally:
+        conn.close()
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
@@ -481,8 +503,12 @@ def list_predict_universe_from_kline(
     if use_limit:
         params = (*params, int(max_count))
 
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
         raw = pd.read_sql_query(sql, conn, params=params)
+    finally:
+        conn.close()
     if raw.empty:
         return []
     out: list[tuple[str, str]] = []
@@ -503,7 +529,9 @@ def stock_codes_with_local_bars(
     end = str(trade_date).strip()[:10]
     mb = max(1, int(min_bars))
     path = str(db_path or DB_PATH)
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
         cur = conn.execute(
             """
             SELECT stock_code FROM stock_daily_kline
@@ -514,4 +542,6 @@ def stock_codes_with_local_bars(
             (end, mb),
         )
         rows = cur.fetchall()
+    finally:
+        conn.close()
     return {str(r[0]).strip().zfill(6) for r in rows}
