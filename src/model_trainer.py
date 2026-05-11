@@ -15,8 +15,12 @@ from sklearn.model_selection import train_test_split
 
 from .config import FEATURE_COLUMNS, LGB_PARAMS, MODEL_PATH
 from .data_fetcher import fetch_daily_hist, has_enough_history
-from .database import register_model_version
-from .factor_calculator import build_stock_panel_features, clean_cross_sectional_features
+from .database import fetch_latest_industry_by_codes, init_db, register_model_version
+from .factor_calculator import (
+    build_stock_panel_features,
+    clean_cross_sectional_features,
+    normalize_industry_label,
+)
 
 
 def calculate_ic(factor_values: pd.Series, future_returns: pd.Series) -> float:
@@ -57,6 +61,9 @@ def collect_training_samples(
     """
     parts: list[pd.DataFrame] = []
     end_compact = train_end_date.replace("-", "")
+    init_db()
+    pair_codes = [str(c).strip().zfill(6) for c, _ in stock_pairs]
+    industry_by_code = fetch_latest_industry_by_codes(pair_codes)
     total = len(stock_pairs)
     if progress and total:
         print(
@@ -73,6 +80,8 @@ def collect_training_samples(
                 print(f"          → 跳过（K 线不足或无数据），累计有效 {len(parts)} 只", flush=True)
             continue
         panel = build_stock_panel_features(hist, code, name)
+        code6 = str(code).strip().zfill(6)
+        panel["industry"] = normalize_industry_label(industry_by_code.get(code6))
         panel = panel[panel["date"] <= train_end_date]
         if len(panel) > 0:
             parts.append(panel)

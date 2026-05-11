@@ -27,13 +27,19 @@ from .data_fetcher import (
     has_enough_history,
 )
 from .database import (
+    fetch_latest_industry_by_codes,
     get_active_model_version,
+    init_db,
     insert_daily_predictions,
     delete_daily_outputs_for_trade_date,
     insert_daily_selections,
     selection_exists_for_date,
 )
-from .factor_calculator import clean_cross_sectional_features, compute_factors_for_history
+from .factor_calculator import (
+    clean_cross_sectional_features,
+    compute_factors_for_history,
+    normalize_industry_label,
+)
 from .model_trainer import load_model
 from .utils import is_kline_too_stale_vs_prediction
 
@@ -145,6 +151,7 @@ def _fetch_one_stock_features(
     name: str,
     start_compact: str,
     timeout: float,
+    industry_by_code: dict[str, str] | None,
 ) -> Optional[dict[str, Any]]:
     """仅拉数据算因子；在主线程里统一 predict，避免多线程共用模型。"""
     hist = fetch_daily_hist(code, start_date=start_compact, timeout=timeout)
@@ -161,7 +168,14 @@ def _fetch_one_stock_features(
     }
     for c in FEATURE_COLUMNS:
         row[c] = float(feat[c])
-    row["industry"] = _industry_from_hist_last_bar(hist)
+    hist_ind = _industry_from_hist_last_bar(hist)
+    code6 = str(code).strip().zfill(6)
+    if hist_ind:
+        row["industry"] = normalize_industry_label(hist_ind)
+    else:
+        row["industry"] = normalize_industry_label(
+            (industry_by_code or {}).get(code6)
+        )
     if len(hist) >= 2:
         c0 = float(hist.iloc[-2]["close"])
         c1 = float(hist.iloc[-1]["close"])
@@ -194,12 +208,23 @@ def predict_universe_scores(
     timeout = AKSHARE_REQUEST_TIMEOUT
     model = load_model(model_path)
 
+    init_db()
+    pool_codes = [str(c).strip().zfill(6) for c, _ in stock_pairs]
+    industry_by_code = fetch_latest_industry_by_codes(pool_codes)
+
     raw_rows: list[dict[str, Any]] = []
     total = len(stock_pairs)
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
-            ex.submit(_fetch_one_stock_features, c, n, start_compact, timeout): (c, n)
+            ex.submit(
+                _fetch_one_stock_features,
+                c,
+                n,
+                start_compact,
+                timeout,
+                industry_by_code,
+            ): (c, n)
             for c, n in stock_pairs
         }
         for fut in as_completed(futs):
@@ -247,7 +272,10 @@ def predict_universe_scores(
     if feat_df.empty:
         raise RuntimeError("过滤到统一交易日后样本为空。")
 
+    # 与 train_model / run_daily 一致：按「date」分组做截面清洗（业内 MAD+Z + 分位秩）
+    feat_df["date"] = feat_df["trade_date"]
     feat_df = clean_cross_sectional_features(feat_df)
+    feat_df = feat_df.drop(columns=["date"], errors="ignore")
 
     feat_df = filter_predictions(feat_df)
     if EXCLUDE_ST:

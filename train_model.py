@@ -32,9 +32,11 @@ from src.config import (
 )
 from src.database import init_db, register_model_version
 from src.factor_calculator import (
+    DEFAULT_INDUSTRY_LABEL,
     clean_cross_sectional_features,
     compute_factors_for_history,
     label_forward_return,
+    normalize_industry_column,
 )
 from src.model_trainer import _json_safe, save_model
 
@@ -67,6 +69,10 @@ def _load_local_kline_panel(
         )
 
     raw_df["date"] = raw_df["date"].astype(str).str[:10]
+    if "industry" not in raw_df.columns:
+        raw_df["industry"] = DEFAULT_INDUSTRY_LABEL
+    else:
+        raw_df["industry"] = normalize_industry_column(raw_df["industry"])
     db_date_min = str(raw_df["date"].min())
     db_date_max = str(raw_df["date"].max())
 
@@ -105,11 +111,7 @@ def _load_local_kline_panel(
             skipped_short += 1
             continue
         facts = compute_factors_for_history(g)
-        meta = g[["date", "stock_code", "stock_name"]].copy()
-        if "industry" in g.columns:
-            meta["industry"] = g["industry"].fillna("").astype(str)
-        else:
-            meta["industry"] = ""
+        meta = g[["date", "stock_code", "stock_name", "industry"]].copy()
         merged = pd.concat(
             [meta.reset_index(drop=True), facts.reset_index(drop=True)],
             axis=1,

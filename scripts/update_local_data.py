@@ -10,6 +10,12 @@
 并发策略（SQLite 友好）：
   - **阶段 1**：``ThreadPoolExecutor`` 内仅执行网络拉取，不写数据库；
   - **阶段 2**：线程池结束后，由 **主线程** 将内存中的 K 线分批 ``UPSERT`` 并 ``commit``，避免多线程竞争连接导致锁等待或死锁。
+
+行业字段：
+  - K 线写入后默认调用 ``sync_stock_industries``：经 AkShare **东方财富行业板块** 拉取「板块—成份」，
+    生成 ``{stock_code: 行业名}``，再通过 ``database.bulk_set_stock_daily_industry_by_code`` 批量
+    ``UPDATE stock_daily_kline SET industry=? WHERE stock_code=?``（覆盖该股全部历史行）。
+  - 仅用东方财富接口（``stock_board_industry_name_em`` / ``stock_board_industry_cons_em``），需可用网络。
 """
 from __future__ import annotations
 
@@ -28,7 +34,9 @@ import pandas as pd
 
 from src.config import DB_PATH
 from src.database import (
+    bulk_set_stock_daily_industry_by_code,
     fetch_stock_code_max_dates,
+    get_connection,
     init_db,
     open_sqlite_connection,
     upsert_stock_daily_klines,
@@ -44,6 +52,147 @@ DEFAULT_WORKERS = max(1, int(os.environ.get("QUANT_UPDATE_WORKERS", "8")))
 # 主线程单次 executemany 行数上限（过大易占用内存；过小则事务开销大）
 UPSERT_FLUSH_ROWS = max(1000, int(os.environ.get("QUANT_UPSERT_FLUSH_ROWS", "8000")))
 COMMIT_EVERY_FLUSHES = max(1, int(os.environ.get("QUANT_COMMIT_EVERY_FLUSHES", "3")))
+DEFAULT_INDUSTRY_BOARD_SLEEP = float(os.environ.get("QUANT_INDUSTRY_BOARD_SLEEP", "0.2"))
+
+
+def sync_stock_industries(
+    db_path: Path | None = None,
+    *,
+    verbose: bool = True,
+    board_sleep_sec: float | None = None,
+    max_boards: int | None = None,
+) -> dict[str, int | str]:
+    """
+    从 AkShare（东方财富）拉取 A 股行业板块及成份，构造 ``代码→行业名称`` 映射，
+    并对 SQLite 中 ``stock_daily_kline`` 按 ``stock_code`` 批量写入 ``industry``。
+
+    同一股票若属于多个板块，以**先遍历到的板块**为准（不再覆盖）。
+
+    Returns:
+        统计字典：``n_boards``, ``n_codes_mapped``, ``rows_updated``, ``labeled_rows``, ``total_rows`` 等。
+    """
+    import akshare as ak
+
+    path = db_path or DB_PATH
+    init_db(path)
+    sleep_s = (
+        float(board_sleep_sec)
+        if board_sleep_sec is not None
+        else DEFAULT_INDUSTRY_BOARD_SLEEP
+    )
+
+    if verbose:
+        print("正在从 AkShare 拉取东方财富行业板块列表…", flush=True)
+    try:
+        boards_df = ak.stock_board_industry_name_em()
+    except Exception as exc:
+        raise RuntimeError(
+            f"拉取行业板块列表失败（请检查网络/代理/akshare 版本）: {exc}"
+        ) from exc
+
+    if boards_df is None or boards_df.empty:
+        raise RuntimeError("行业板块列表为空，无法同步 industry。")
+
+    name_col = "板块名称"
+    if name_col not in boards_df.columns:
+        raise RuntimeError(
+            f"行业板块表缺少列「{name_col}」，当前列: {list(boards_df.columns)}"
+        )
+
+    code_to_industry: dict[str, str] = {}
+    boards_ok = 0
+    boards_fail = 0
+    n_loop = 0
+    for _, row in boards_df.iterrows():
+        if max_boards is not None and n_loop >= max_boards:
+            break
+        n_loop += 1
+        board_name = str(row[name_col]).strip()
+        if not board_name:
+            continue
+        try:
+            cons = ak.stock_board_industry_cons_em(symbol=board_name)
+        except Exception:
+            boards_fail += 1
+            time.sleep(sleep_s)
+            continue
+        if cons is None or cons.empty or "代码" not in cons.columns:
+            boards_fail += 1
+            time.sleep(sleep_s)
+            continue
+        boards_ok += 1
+        for _, crow in cons.iterrows():
+            raw = crow.get("代码")
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+                continue
+            c = str(raw).strip().zfill(6)
+            if len(c) != 6 or not c.isdigit():
+                continue
+            if c not in code_to_industry:
+                code_to_industry[c] = board_name
+        if verbose and boards_ok % 15 == 0:
+            print(
+                f"  [行业] 已处理板块 {n_loop} 个，"
+                f"成功 {boards_ok}，失败 {boards_fail}，"
+                f"已映射股票 {len(code_to_industry)} 只…",
+                flush=True,
+            )
+        time.sleep(sleep_s)
+
+    if not code_to_industry:
+        raise RuntimeError(
+            "未能从东方财富接口解析到任何「股票代码→行业」映射，"
+            "请检查网络或稍后重试。"
+        )
+
+    if verbose:
+        print(
+            f"行业映射构建完成：板块请求成功 {boards_ok}，失败 {boards_fail}，"
+            f"去重后股票 {len(code_to_industry)} 只；开始批量 UPDATE SQLite…",
+            flush=True,
+        )
+
+    rows_updated = bulk_set_stock_daily_industry_by_code(code_to_industry, db_path=path)
+
+    with get_connection(path) as conn:
+        total_rows = int(
+            conn.execute("SELECT COUNT(*) FROM stock_daily_kline").fetchone()[0]
+        )
+        labeled_rows = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM stock_daily_kline
+                WHERE industry IS NOT NULL AND TRIM(industry) != ''
+                """
+            ).fetchone()[0]
+        )
+        labeled_codes = int(
+            conn.execute(
+                """
+                SELECT COUNT(DISTINCT stock_code) FROM stock_daily_kline
+                WHERE industry IS NOT NULL AND TRIM(industry) != ''
+                """
+            ).fetchone()[0]
+        )
+
+    if verbose:
+        print(
+            f"行业同步完成：UPDATE 累计变更约 {rows_updated} 行；"
+            f" K 线总行数 {total_rows}，其中 industry 非空行 {labeled_rows}；"
+            f" 至少有一条 industry 非空的股票数 {labeled_codes}。",
+            flush=True,
+        )
+
+    return {
+        "n_boards_requested": n_loop,
+        "n_boards_ok": boards_ok,
+        "n_boards_fail": boards_fail,
+        "n_codes_mapped": len(code_to_industry),
+        "rows_updated_reported": rows_updated,
+        "total_kline_rows": total_rows,
+        "labeled_kline_rows": labeled_rows,
+        "labeled_distinct_codes": labeled_codes,
+    }
 
 
 def _worker_fetch_only(
@@ -103,6 +252,8 @@ def update_database_kline(
     max_stocks: int = 6000,
     pool_type: str = "all",
     workers: int = DEFAULT_WORKERS,
+    run_industry_sync: bool = True,
+    industry_board_limit: int = 0,
 ) -> None:
     init_db()
 
@@ -240,6 +391,14 @@ def update_database_kline(
         flush=True,
     )
 
+    if run_industry_sync:
+        print("", flush=True)
+        lim = industry_board_limit if industry_board_limit > 0 else None
+        try:
+            sync_stock_industries(DB_PATH, verbose=True, max_boards=lim)
+        except RuntimeError as exc:
+            print(f"警告: 行业字段同步未成功（K 线仍已写入）: {exc}", flush=True)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="同步本地 stock_daily_kline")
@@ -261,11 +420,36 @@ def main() -> int:
         default=DEFAULT_WORKERS,
         help=f"并发拉取线程数（默认 {DEFAULT_WORKERS}，可用环境变量 QUANT_UPDATE_WORKERS）",
     )
+    parser.add_argument(
+        "--skip-industry-sync",
+        action="store_true",
+        help="不同步 AkShare 行业板块到 stock_daily_kline.industry",
+    )
+    parser.add_argument(
+        "--only-industry-sync",
+        action="store_true",
+        help="仅执行行业同步（不拉取 K 线）",
+    )
+    parser.add_argument(
+        "--industry-board-limit",
+        type=int,
+        default=0,
+        help="调试：最多遍历前 N 个行业板块（0 表示不限制）",
+    )
     args = parser.parse_args()
+
+    if args.only_industry_sync:
+        init_db()
+        lim = args.industry_board_limit if args.industry_board_limit > 0 else None
+        sync_stock_industries(DB_PATH, verbose=True, max_boards=lim)
+        return 0
+
     update_database_kline(
         max_stocks=args.max_stocks,
         pool_type=args.pool,
         workers=args.workers,
+        run_industry_sync=not args.skip_industry_sync,
+        industry_board_limit=args.industry_board_limit,
     )
     return 0
 

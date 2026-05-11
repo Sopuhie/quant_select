@@ -49,7 +49,11 @@ from src.database import (
     stock_codes_with_local_bars,
 )
 from src.dingtalk_notifier import maybe_push_daily_selections
-from src.factor_calculator import clean_cross_sectional_features, compute_factors_for_history
+from src.factor_calculator import (
+    clean_cross_sectional_features,
+    compute_factors_for_history,
+    normalize_industry_label,
+)
 from src.model_trainer import load_model
 from src.predictor import filter_predictions
 from src.utils import get_last_trading_date, is_a_share_trading_day
@@ -109,14 +113,9 @@ def _fetch_one_predict_row(
     row_dict["stock_code"] = code
     row_dict["stock_name"] = name
     if "industry" in df_today.columns:
-        ir = df_today.iloc[last_idx]["industry"]
-        row_dict["industry"] = (
-            str(ir).strip()
-            if ir is not None and not (isinstance(ir, float) and pd.isna(ir)) and str(ir).strip()
-            else ""
-        )
+        row_dict["industry"] = normalize_industry_label(df_today.iloc[last_idx]["industry"])
     else:
-        row_dict["industry"] = ""
+        row_dict["industry"] = normalize_industry_label(None)
     row_dict["close_price"] = float(df_today.iloc[last_idx]["close"])
 
     if len(df_today) >= 2:

@@ -255,6 +255,39 @@ def upsert_stock_daily_klines(
             conn.close()
 
 
+def bulk_set_stock_daily_industry_by_code(
+    stock_code_to_industry: dict[str, str],
+    db_path: Path | None = None,
+) -> int:
+    """
+    按 6 位 ``stock_code`` 批量更新 ``stock_daily_kline.industry``（该代码下所有历史行）。
+
+    Returns:
+        ``sqlite3`` 连接上累计的 ``total_changes`` 增量（约等于被更新的行数）。
+    """
+    if not stock_code_to_industry:
+        return 0
+    path = db_path or DB_PATH
+    init_db(path)
+    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        before = conn.total_changes
+        payload: list[tuple[str, str]] = []
+        for code, ind in stock_code_to_industry.items():
+            c = str(code).strip().zfill(6)
+            if len(c) == 6 and c.isdigit():
+                payload.append((str(ind).strip(), c))
+        conn.executemany(
+            "UPDATE stock_daily_kline SET industry = ? WHERE stock_code = ?",
+            payload,
+        )
+        conn.commit()
+        return int(conn.total_changes - before)
+    finally:
+        conn.close()
+
+
 def insert_daily_predictions(
     rows: Iterable[dict[str, Any]],
     db_path: Path | None = None,
@@ -511,6 +544,50 @@ def fetch_stock_daily_bars_until(
     if "industry" in df.columns:
         df["industry"] = df["industry"].fillna("").astype(str)
     return df.dropna(subset=["close"]).reset_index(drop=True)
+
+
+def fetch_latest_industry_by_codes(
+    stock_codes: Iterable[str],
+    *,
+    db_path: Path | None = None,
+) -> dict[str, str]:
+    """
+    每只代码取 ``stock_daily_kline`` 中最新交易日一行的 ``industry``（原始库内值，可为空）。
+    供在线拉 K 线训练路径与行业字段对齐；缺失代码不出现在字典中。
+    """
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for c in stock_codes:
+        code = str(c).strip().zfill(6)
+        if len(code) != 6 or not code.isdigit():
+            continue
+        if code not in seen:
+            seen.add(code)
+            uniq.append(code)
+    if not uniq:
+        return {}
+    out: dict[str, str] = {}
+    chunk_size = 400
+    with get_connection(db_path) as conn:
+        for i in range(0, len(uniq), chunk_size):
+            chunk = uniq[i : i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            sql = f"""
+            SELECT k.stock_code, k.industry
+            FROM stock_daily_kline k
+            INNER JOIN (
+                SELECT stock_code, MAX(date) AS mx
+                FROM stock_daily_kline
+                WHERE stock_code IN ({placeholders})
+                GROUP BY stock_code
+            ) t ON k.stock_code = t.stock_code AND k.date = t.mx
+            """
+            cur = conn.execute(sql, chunk)
+            for row in cur.fetchall():
+                sc = str(row[0]).strip().zfill(6)
+                ind = row[1]
+                out[sc] = "" if ind is None else str(ind).strip()
+    return out
 
 
 def list_predict_universe_from_kline(

@@ -13,6 +13,28 @@ from .config import FEATURE_COLUMNS, LABEL_HORIZON_DAYS
 # 行业内样本过少时退回当日全截面 MAD+Z，避免行业组统计不稳
 MIN_INDUSTRY_GROUP_SIZE = 5
 
+# 训练 / 推理共用：缺失或非字符串行业统一为该标签，便于行业内截面标准化成组
+DEFAULT_INDUSTRY_LABEL = "未知行业"
+
+
+def normalize_industry_label(val: object) -> str:
+    """将单行行业字段规范为字符串；空值与空白视为默认标签。"""
+    if val is None:
+        return DEFAULT_INDUSTRY_LABEL
+    if isinstance(val, float) and np.isnan(val):
+        return DEFAULT_INDUSTRY_LABEL
+    s = str(val).strip()
+    if not s or s.lower() == "nan":
+        return DEFAULT_INDUSTRY_LABEL
+    return s
+
+
+def normalize_industry_column(series: pd.Series) -> pd.Series:
+    """整列行业字段批量规范化（SQLite / DataFrame 读入后使用）。"""
+    t = series.fillna("").astype(str).str.strip()
+    t = t.replace("", DEFAULT_INDUSTRY_LABEL).replace("nan", DEFAULT_INDUSTRY_LABEL)
+    return t
+
 # 高波动因子：先做截面分位秩 [-0.5, 0.5]，再参与行业内标准化
 PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
     "factor_return_1d",
@@ -140,15 +162,9 @@ def clean_cross_sectional_features(
         ind_series_name = "_cs_industry_key"
 
         if industry_col is not None:
-            ik = (
-                day_df[industry_col]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                .replace("", "__UNKNOWN__")
-            )
+            ik = normalize_industry_column(day_df[industry_col])
         else:
-            ik = pd.Series("__UNKNOWN__", index=day_df.index)
+            ik = pd.Series(DEFAULT_INDUSTRY_LABEL, index=day_df.index)
         day_df[ind_series_name] = ik
 
         global_z = pd.DataFrame(index=day_df.index)
