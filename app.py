@@ -806,14 +806,13 @@ with tab_match:
                                 )
 
                         st.caption(
-                            "同图叠加：**样板股**与 **Top3 匹配股** 在各自窗口内做 Min-Max 归一化后的收盘价曲线；"
+                            "三张折线图分别对比：**样板股**与 **各 Top 匹配股** 在各自窗口内做 Min-Max 归一化后的收盘价曲线；"
                             "横轴为样板模板区间的交易日顺序。"
                         )
                         tpl_label = f"样板 {code_z}"
                         if qname:
                             tpl_label += f" ({qname[:16]}{'…' if len(qname) > 16 else ''})"
 
-                        fig_combo = go.Figure()
                         ref = match_results[0]
                         n_pts = len(ref["target_trajectory"])
                         x_idx = list(range(n_pts))
@@ -825,19 +824,6 @@ with tab_match:
                         if len(tpl_dates) != n_pts:
                             tpl_dates = [str(i + 1) for i in x_idx]
 
-                        fig_combo.add_trace(
-                            go.Scatter(
-                                x=x_idx,
-                                y=ref["target_trajectory"],
-                                mode="lines",
-                                name=tpl_label,
-                                line=dict(
-                                    color=COLOR_CYBER_TEAL,
-                                    width=3,
-                                    dash="dash",
-                                ),
-                            )
-                        )
                         # 高饱和霓虹色 + 略粗线宽，深色背景下更易辨认
                         match_line_styles: list[dict[str, object]] = [
                             {
@@ -856,12 +842,30 @@ with tab_match:
                                 "shape": "spline",
                             },
                         ]
+
+                        chart_cols = st.columns(3)
                         for i, res in enumerate(match_results):
-                            nm = str(res.get("stock_name") or "")[:12]
+                            if i >= len(chart_cols):
+                                break
                             sty = match_line_styles[
                                 i % len(match_line_styles)
                             ]
-                            fig_combo.add_trace(
+                            nm = str(res.get("stock_name") or "")[:12]
+                            fig_i = go.Figure()
+                            fig_i.add_trace(
+                                go.Scatter(
+                                    x=x_idx,
+                                    y=ref["target_trajectory"],
+                                    mode="lines",
+                                    name=tpl_label,
+                                    line=dict(
+                                        color=COLOR_CYBER_TEAL,
+                                        width=3,
+                                        dash="dash",
+                                    ),
+                                )
+                            )
+                            fig_i.add_trace(
                                 go.Scatter(
                                     x=x_idx,
                                     y=res["candidate_trajectory"],
@@ -874,30 +878,32 @@ with tab_match:
                                     ),
                                 )
                             )
-
-                        fig_combo.update_layout(
-                            get_cyber_layout(
-                                "样板 vs Top3：归一化收盘价同图对比"
-                            ),
-                            showlegend=True,
-                            legend=dict(
-                                orientation="v",
-                                yanchor="top",
-                                y=1,
-                                xanchor="left",
-                                x=1.02,
-                                font=dict(size=11, color=COLOR_TEXT),
-                                bgcolor="rgba(13,14,21,0.7)",
-                            ),
-                            height=460,
-                            margin=dict(l=50, r=180, t=55, b=90),
-                        )
-                        fig_combo.update_xaxes(
-                            ticktext=tpl_dates,
-                            tickvals=x_idx,
-                            tickangle=-50,
-                        )
-                        st.plotly_chart(fig_combo, use_container_width=True)
+                            fig_i.update_layout(
+                                get_cyber_layout(
+                                    f"样板 vs 匹配 #{i + 1} · {res['stock_code']}"
+                                ),
+                                showlegend=True,
+                                legend=dict(
+                                    orientation="h",
+                                    yanchor="top",
+                                    y=-0.08,
+                                    xanchor="center",
+                                    x=0.5,
+                                    font=dict(size=10, color=COLOR_TEXT),
+                                    bgcolor="rgba(13,14,21,0.7)",
+                                ),
+                                height=400,
+                                margin=dict(l=50, r=20, t=55, b=100),
+                            )
+                            fig_i.update_xaxes(
+                                ticktext=tpl_dates,
+                                tickvals=x_idx,
+                                tickangle=-50,
+                            )
+                            with chart_cols[i]:
+                                st.plotly_chart(
+                                    fig_i, use_container_width=True
+                                )
 
 # ----------------- TAB 4: 📈 历史回测 -----------------
 with tab_backtest:
