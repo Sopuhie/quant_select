@@ -108,6 +108,15 @@ def _fetch_one_predict_row(
     row_dict["trade_date"] = td
     row_dict["stock_code"] = code
     row_dict["stock_name"] = name
+    if "industry" in df_today.columns:
+        ir = df_today.iloc[last_idx]["industry"]
+        row_dict["industry"] = (
+            str(ir).strip()
+            if ir is not None and not (isinstance(ir, float) and pd.isna(ir)) and str(ir).strip()
+            else ""
+        )
+    else:
+        row_dict["industry"] = ""
     row_dict["close_price"] = float(df_today.iloc[last_idx]["close"])
 
     if len(df_today) >= 2:

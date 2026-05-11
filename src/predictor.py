@@ -114,6 +114,16 @@ def filter_predictions(scores_df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _industry_from_hist_last_bar(hist: pd.DataFrame) -> str:
+    if hist.empty or "industry" not in hist.columns:
+        return ""
+    raw = hist.iloc[-1].get("industry")
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    s = str(raw).strip()
+    return s if s else ""
+
+
 def latest_feature_row(df: pd.DataFrame) -> Optional[pd.Series]:
     if df.empty or len(df) < 30:
         return None
@@ -151,6 +161,7 @@ def _fetch_one_stock_features(
     }
     for c in FEATURE_COLUMNS:
         row[c] = float(feat[c])
+    row["industry"] = _industry_from_hist_last_bar(hist)
     if len(hist) >= 2:
         c0 = float(hist.iloc[-2]["close"])
         c1 = float(hist.iloc[-1]["close"])

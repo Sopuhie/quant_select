@@ -1,7 +1,6 @@
 """
 图形相似度匹配引擎。
-使用本地 SQLite 行情，通过皮尔逊相关系数与归一化序列欧氏距离辅助项对全市场进行形态检索。
-候选打分阶段使用 NumPy 向量化（广播）以加速全市场扫描。
+使用本地 SQLite 行情：可选皮尔逊相关 + 形状距离（向量化），或 DTW（动态时间规整）度量形态相似度。
 """
 from __future__ import annotations
 
@@ -35,6 +34,24 @@ def _row_minmax_norm(X: np.ndarray) -> np.ndarray:
     return out
 
 
+def _dtw_distance_sq_euclidean(a: np.ndarray, b: np.ndarray) -> float:
+    """经典 DTW，平方欧式路径代价，返回路径长度的欧式距离（非平方）。"""
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return float("inf")
+    inf = np.inf
+    dtw = np.full((n + 1, m + 1), inf, dtype=np.float64)
+    dtw[0, 0] = 0.0
+    for i in range(1, n + 1):
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            cost = (ai - b[j - 1]) ** 2
+            dtw[i, j] = cost + min(dtw[i - 1, j], dtw[i, j - 1], dtw[i - 1, j - 1])
+    return float(np.sqrt(dtw[n, m]))
+
+
 def _pearson_rows(ref: np.ndarray, X: np.ndarray) -> np.ndarray:
     """``ref`` 形状 (W,)，``X`` (N, W)；返回每只候选与 ``ref`` 的皮尔逊相关系数 (N,)。"""
     ref_mean = ref.mean()
@@ -58,6 +75,7 @@ def find_similar_patterns(
     *,
     compare_days: int = 120,
     limit_results: int = 5,
+    algorithm: str = "pearson",
 ) -> list[dict]:
     """
     在本地行情库中，寻找与目标股票给定区间收盘价形态最相似的个股（最近窗口长度与模板一致）。
@@ -67,7 +85,12 @@ def find_similar_patterns(
         start_date / end_date: 模板区间（YYYY-MM-DD）
         compare_days: 日历跨度近似控制候选数据加载起点（越大越耗内存，默认覆盖约一季以上交易日）
         limit_results: 返回前几条
+        algorithm: ``pearson`` | ``dtw``；DTW 适合时间轴伸缩的形态比较。
     """
+    algo = str(algorithm).strip().lower()
+    if algo not in ("pearson", "dtw"):
+        algo = "pearson"
+
     target_code = str(target_code).strip().zfill(6)
     start_date = str(start_date).strip()[:10]
     end_date = str(end_date).strip()[:10]
@@ -148,11 +171,18 @@ def find_similar_patterns(
     X_norm = _row_minmax_norm(X_raw)
     ref = np.asarray(target_series, dtype=np.float64)
 
-    corr = _pearson_rows(ref, X_norm)
-    diff = X_norm - ref
-    dist = np.sqrt(np.mean(diff**2, axis=1))
-    dist_score = 1.0 / (1.0 + dist)
-    similarity = np.maximum(0.0, (corr + 1.0) / 2.0 * 80.0 + dist_score * 20.0)
+    if algo == "dtw":
+        dtw_d = np.array(
+            [_dtw_distance_sq_euclidean(ref, X_norm[i]) for i in range(X_norm.shape[0])],
+            dtype=np.float64,
+        )
+        similarity = 100.0 / (1.0 + dtw_d)
+    else:
+        corr = _pearson_rows(ref, X_norm)
+        diff = X_norm - ref
+        dist = np.sqrt(np.mean(diff**2, axis=1))
+        dist_score = 1.0 / (1.0 + dist)
+        similarity = np.maximum(0.0, (corr + 1.0) / 2.0 * 80.0 + dist_score * 20.0)
 
     limit = int(limit_results)
     order = np.argsort(-similarity)[:limit]

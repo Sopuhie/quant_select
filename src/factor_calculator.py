@@ -6,6 +6,41 @@ import pandas as pd
 
 from .config import FEATURE_COLUMNS, LABEL_HORIZON_DAYS
 
+# 行业内样本过少时退回当日全截面 MAD+Z，避免行业组统计不稳
+MIN_INDUSTRY_GROUP_SIZE = 5
+
+# 高波动因子：先做截面分位秩 [-0.5, 0.5]，再参与行业内标准化
+PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
+    "factor_return_1d",
+    "factor_return_5d",
+    "factor_momentum_10d",
+    "factor_volume_ratio",
+    "factor_volatility_5d",
+    "factor_volatility_20d",
+)
+
+
+def _mad_clip_zscore(series: pd.Series) -> pd.Series:
+    """单截面序列：MAD 截断后 Z-score，索引与原序列对齐。"""
+    s = series.astype(float)
+    idx = s.index
+    if not s.notna().any():
+        return pd.Series(np.nan, index=idx)
+    if float(s.std(ddof=0)) < 1e-8 or float(s.max() - s.min()) < 1e-15:
+        return pd.Series(0.0, index=idx)
+    median = float(s.median())
+    mad = float((s - median).abs().median())
+    threshold = 3.0 * 1.4826 * mad
+    if threshold > 1e-6:
+        lo = median - threshold
+        hi = median + threshold
+        s = s.clip(lower=lo, upper=hi)
+    mean = float(s.mean())
+    std = float(s.std())
+    if std > 1e-6:
+        return (s - mean) / std
+    return pd.Series(0.0, index=idx)
+
 
 def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     """与 ``train_model`` 本地 SQLite 管线一致的技术因子（13 维）。"""
@@ -53,7 +88,10 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def clean_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
-    """按交易日截面 MAD 去极值 + Z-score（训练用 date；推理可用 trade_date）。"""
+    """
+    截面清洗：按交易日分组；高波动因子先做分位秩中心化；
+    优先按（交易日 × 行业）做 MAD 截断 + Z-score，行业内少于 5 只时对该行业标的退回当日全截面标准化。
+    """
     if df.empty:
         return df
 
@@ -61,36 +99,56 @@ def clean_cross_sectional_features(df: pd.DataFrame) -> pd.DataFrame:
     if group_key not in df.columns:
         return df
 
+    industry_col = "industry" if "industry" in df.columns else None
+    ind_series_name = "_cs_industry_key"
+
     cleaned_parts: list[pd.DataFrame] = []
 
-    for _date, group in df.groupby(group_key):
-        group_cleaned = group.copy()
+    for _date, day_df in df.groupby(group_key, sort=False):
+        day_df = day_df.copy()
 
+        for col in PERCENTILE_RANK_FEATURES:
+            if col not in day_df.columns:
+                continue
+            s = day_df[col].astype(float)
+            day_df[col] = s.rank(pct=True, method="average") - 0.5
+
+        if industry_col is not None:
+            ik = (
+                day_df[industry_col]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .replace("", "__UNKNOWN__")
+            )
+        else:
+            ik = pd.Series("__UNKNOWN__", index=day_df.index)
+        day_df[ind_series_name] = ik
+
+        global_z = pd.DataFrame(index=day_df.index)
         for col in FEATURE_COLUMNS:
-            if col not in group_cleaned.columns:
+            if col not in day_df.columns:
                 continue
+            global_z[col] = _mad_clip_zscore(day_df[col])
 
-            series = group_cleaned[col].astype(float)
-            if series.isna().all() or series.std() < 1e-8:
-                continue
+        out_day = day_df.copy()
 
-            median = series.median()
-            mad = (series - median).abs().median()
-            threshold = 3 * 1.4826 * mad
-
-            if threshold > 1e-6:
-                lower_limit = median - threshold
-                upper_limit = median + threshold
-                series = series.clip(lower=lower_limit, upper=upper_limit)
-
-            mean = series.mean()
-            std = series.std()
-            if std > 1e-6:
-                group_cleaned[col] = (series - mean) / std
+        for _ind_val, idx in day_df.groupby(ind_series_name, sort=False).groups.items():
+            idx = pd.Index(idx)
+            if len(idx) >= MIN_INDUSTRY_GROUP_SIZE:
+                sub = day_df.loc[idx]
+                for col in FEATURE_COLUMNS:
+                    if col not in sub.columns:
+                        continue
+                    out_day.loc[idx, col] = _mad_clip_zscore(sub[col]).values
             else:
-                group_cleaned[col] = 0.0
+                for col in FEATURE_COLUMNS:
+                    if col not in global_z.columns:
+                        continue
+                    out_day.loc[idx, col] = global_z.loc[idx, col].values
 
-        cleaned_parts.append(group_cleaned)
+        out_day = out_day.drop(columns=[ind_series_name])
+        cleaned_parts.append(out_day)
 
     return pd.concat(cleaned_parts, ignore_index=True)
 

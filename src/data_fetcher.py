@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import akshare as ak
@@ -440,6 +441,17 @@ def fetch_daily_hist(
         return pd.DataFrame()
 
     return _finalize_hist_columns(df)
+
+
+def load_stock_latest_date_map(db_path: Path | str | None = None) -> dict[str, str]:
+    """
+    返回各股票在本地库中的最新交易日 ``YYYY-MM-DD``（``stock_code -> max(date)``）。
+    供增量同步脚本快速跳过已更新标的；等价于 ``database.fetch_stock_code_max_dates``。
+    """
+    from .database import DB_PATH, fetch_stock_code_max_dates
+
+    p = Path(db_path) if db_path is not None else DB_PATH
+    return fetch_stock_code_max_dates(p)
 
 
 def datetime_today_compact() -> str:

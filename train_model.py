@@ -53,7 +53,7 @@ def _load_local_kline_panel(
     init_db()
     conn = sqlite3.connect(str(DB_PATH))
     sql = """
-        SELECT date, stock_code, stock_name, open, high, low, close, volume
+        SELECT date, stock_code, stock_name, open, high, low, close, volume, industry
         FROM stock_daily_kline
         ORDER BY stock_code, date
     """
@@ -105,11 +105,13 @@ def _load_local_kline_panel(
             skipped_short += 1
             continue
         facts = compute_factors_for_history(g)
+        meta = g[["date", "stock_code", "stock_name"]].copy()
+        if "industry" in g.columns:
+            meta["industry"] = g["industry"].fillna("").astype(str)
+        else:
+            meta["industry"] = ""
         merged = pd.concat(
-            [
-                g[["date", "stock_code", "stock_name"]].reset_index(drop=True),
-                facts.reset_index(drop=True),
-            ],
+            [meta.reset_index(drop=True), facts.reset_index(drop=True)],
             axis=1,
         )
         merged["label_ret"] = label_forward_return(g["close"].astype(float)).values
@@ -164,7 +166,7 @@ def main() -> None:
 
     if verbose:
         print(
-            f"[截面清洗] 行数 {len(panel)}，按交易日 MAD + Z-score …",
+            f"[截面清洗] 行数 {len(panel)}，分位秩 + 行业内 MAD/Z（行业不足则退回当日全截面）…",
             flush=True,
         )
     panel = clean_cross_sectional_features(panel)

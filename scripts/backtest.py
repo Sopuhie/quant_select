@@ -110,7 +110,7 @@ def read_stock_daily_kline_range(
         with sqlite3.connect(db_path) as conn:
             raw = pd.read_sql_query(
                 """
-                SELECT date, stock_code, stock_name, open, high, low, close, volume
+                SELECT date, stock_code, stock_name, open, high, low, close, volume, industry
                 FROM stock_daily_kline
                 WHERE date >= ? AND date <= ?
                 ORDER BY stock_code, date
@@ -130,6 +130,8 @@ def read_stock_daily_kline_range(
     for col in ("open", "high", "low", "close", "volume"):
         raw[col] = pd.to_numeric(raw[col], errors="coerce")
     raw["stock_name"] = raw["stock_name"].astype(str).fillna("")
+    if "industry" in raw.columns:
+        raw["industry"] = raw["industry"].fillna("").astype(str)
     raw = raw.dropna(subset=["close"]).sort_values(["stock_code", "date"])
     print(f"已从本地 stock_daily_kline 读取 OHLCV：{len(raw)} 行（{s} ~ {e}）")
     return raw.reset_index(drop=True)
@@ -339,6 +341,15 @@ def _feature_dict_as_of(
     out["trade_date"] = as_of_date
     out["stock_code"] = code
     out["stock_name"] = name
+    if "industry" in sub.columns:
+        ir = sub.iloc[last_i].get("industry")
+        out["industry"] = (
+            str(ir).strip()
+            if ir is not None and not (isinstance(ir, float) and pd.isna(ir)) and str(ir).strip()
+            else ""
+        )
+    else:
+        out["industry"] = ""
     out["close_price"] = float(sub.iloc[last_i]["close"])
     if len(sub) >= 2:
         c0 = float(sub.iloc[-2]["close"])

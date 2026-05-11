@@ -624,6 +624,19 @@ with tab_match:
             st.session_state.pop("pattern_tpl_range", None)
             st.rerun()
 
+    match_algo = st.radio(
+        "相似度算法",
+        options=["pearson", "dtw"],
+        format_func=lambda x: (
+            "皮尔逊相关 + 形状距离 (Pearson)"
+            if x == "pearson"
+            else "动态时间规整 (DTW)"
+        ),
+        horizontal=True,
+        key="pattern_match_algo",
+        help="Pearson：对齐时间轴的相关性+RMSE；DTW：允许形态在时间轴上伸缩对齐，适合节奏不同的相似走势。",
+    )
+
     code_raw = str(target_stock or "").strip()
     code_z = code_raw.zfill(6) if code_raw else ""
 
@@ -709,6 +722,7 @@ with tab_match:
                 start_str,
                 end_str,
                 int(compare_days_ui),
+                str(match_algo),
             )
 
             if tpl_df.empty:
@@ -766,6 +780,7 @@ with tab_match:
                                 end_date=end_str,
                                 compare_days=int(compare_days_ui),
                                 limit_results=3,
+                                algorithm=str(match_algo),
                             )
                             st.session_state["pm_cached_params"] = params_now
 
@@ -805,9 +820,15 @@ with tab_match:
                                     unsafe_allow_html=True,
                                 )
 
+                        _algo_note = (
+                            "当前排序：**皮尔逊 + 形状距离** 启发式得分。"
+                            if match_algo == "pearson"
+                            else "当前排序：**DTW** 距离换算得分 `100/(1+距离)`。"
+                        )
                         st.caption(
                             "三张折线图分别对比：**样板股**与 **各 Top 匹配股** 在各自窗口内做 Min-Max 归一化后的收盘价曲线；"
                             "横轴为样板模板区间的交易日顺序。"
+                            + _algo_note
                         )
                         tpl_label = f"样板 {code_z}"
                         if qname:

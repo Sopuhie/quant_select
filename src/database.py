@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS stock_daily_kline (
     low REAL,
     close REAL,
     volume REAL,
+    industry TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(date, stock_code)
 );
@@ -90,6 +91,19 @@ CREATE INDEX IF NOT EXISTS idx_logs_created ON system_logs(created_at);
 """
 
 
+def _ensure_stock_daily_kline_industry(conn: sqlite3.Connection) -> None:
+    """旧库升级：为 ``stock_daily_kline`` 增加 ``industry`` 列。"""
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_daily_kline'"
+    )
+    if cur.fetchone() is None:
+        return
+    cur = conn.execute("PRAGMA table_info(stock_daily_kline)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "industry" not in cols:
+        conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN industry TEXT")
+
+
 def init_db(db_path: Path | None = None) -> None:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,9 +111,33 @@ def init_db(db_path: Path | None = None) -> None:
     try:
         _apply_sqlite_pragmas(conn)
         conn.executescript(SCHEMA_SQL)
+        _ensure_stock_daily_kline_industry(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def fetch_stock_code_max_dates(db_path: Path | None = None) -> dict[str, str]:
+    """返回 ``{stock_code(6位): 最新日线日期 YYYY-MM-DD}``，用于增量同步跳过已最新标的。"""
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            "SELECT stock_code, MAX(date) FROM stock_daily_kline GROUP BY stock_code"
+        )
+        out: dict[str, str] = {}
+        for k, v in cur.fetchall():
+            if k is None or v is None:
+                continue
+            out[str(k).strip().zfill(6)] = str(v).strip()[:10]
+        return out
+
+
+def open_sqlite_connection(db_path: Path | None = None) -> sqlite3.Connection:
+    """建立可写连接（WAL + 长超时）。调用方负责 ``commit`` / ``close``。"""
+    path = db_path or DB_PATH
+    init_db(path)
+    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    return conn
 
 
 @contextmanager
@@ -165,10 +203,11 @@ def upsert_stock_daily_klines(
     若传入 ``connection``，则不单独提交/关闭连接（由调用方 ``commit``）。
     """
     sql = """
-    INSERT INTO stock_daily_kline (date, stock_code, stock_name, open, high, low, close, volume)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO stock_daily_kline (date, stock_code, stock_name, industry, open, high, low, close, volume)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(date, stock_code) DO UPDATE SET
         stock_name = excluded.stock_name,
+        industry = COALESCE(NULLIF(TRIM(excluded.industry), ''), stock_daily_kline.industry),
         open = excluded.open,
         high = excluded.high,
         low = excluded.low,
@@ -177,11 +216,18 @@ def upsert_stock_daily_klines(
     """
     batch: list[tuple[Any, ...]] = []
     for r in rows:
+        ind_raw = r.get("industry")
+        industry_val = (
+            str(ind_raw).strip()
+            if ind_raw is not None and str(ind_raw).strip()
+            else ""
+        )
         batch.append(
             (
                 r["date"],
                 str(r["stock_code"]).strip().zfill(6),
                 str(r.get("stock_name") or "").strip(),
+                industry_val,
                 float(r["open"]) if r.get("open") is not None else None,
                 float(r["high"]) if r.get("high") is not None else None,
                 float(r["low"]) if r.get("low") is not None else None,
@@ -444,7 +490,7 @@ def fetch_stock_daily_bars_until(
     try:
         df = pd.read_sql_query(
             """
-            SELECT date, open, high, low, close, volume
+            SELECT date, open, high, low, close, volume, industry
             FROM stock_daily_kline
             WHERE stock_code = ? AND date <= ?
             ORDER BY date ASC
@@ -459,6 +505,8 @@ def fetch_stock_daily_bars_until(
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     for col in ("open", "high", "low", "close", "volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "industry" in df.columns:
+        df["industry"] = df["industry"].fillna("").astype(str)
     return df.dropna(subset=["close"]).reset_index(drop=True)
 
 
