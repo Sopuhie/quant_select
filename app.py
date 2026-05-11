@@ -42,8 +42,6 @@ from src.database import init_db, insert_system_log, query_df
 from src.pattern_matcher import find_similar_patterns
 from src.kline_chart import (
     draw_candlestick,
-    draw_realtime_line_chart,
-    get_realtime_min_data,
     get_stock_kline_data,
     lookup_stock_display_name,
 )
@@ -116,31 +114,6 @@ def draw_cyber_area_trace(
         )
     )
     return fig
-
-
-@st.fragment(run_every=15)
-def render_intraday_live_charts(top3: list[tuple[str, str]]) -> None:
-    """仅重跑本片段以刷新分时图，避免整页 st_autorefresh。"""
-    live_cols = st.columns(3)
-    for i, col in enumerate(live_cols):
-        if i >= len(top3):
-            break
-        code, name = top3[i]
-        with col:
-            with st.spinner(f"正在捕获 {name} 分时..."):
-                df_live = get_realtime_min_data(code)
-                if df_live is not None and not df_live.empty:
-                    fig_live = draw_realtime_line_chart(df_live, code, name)
-                    if fig_live:
-                        st.plotly_chart(
-                            fig_live,
-                            use_container_width=True,
-                            config={"displayModeBar": False},
-                        )
-                    else:
-                        st.info("等候开盘交易数据...")
-                else:
-                    st.info("☕ 非交易时段或无今日分时数据")
 
 
 # ================= 3. 注入自定义 CSS 样式 =================
@@ -461,21 +434,6 @@ with tab_today:
                             "code": row["stock_code"],
                             "name": row["stock_name"],
                         }
-
-        if not today_df.empty:
-            st.markdown(
-                "<div style='margin-top: 30px;'></div>", unsafe_allow_html=True
-            )
-            st.subheader("⏱️ 推荐股今日实时分时走势对比")
-            st.caption(
-                "股市开盘期间（9:30–11:30，13:00–15:00），下方三支分时仅在本区域每约 15 秒刷新一次，"
-                "不会触发整页重载。"
-            )
-            top3_pairs = [
-                (str(row["stock_code"]), str(row["stock_name"]))
-                for _, row in today_df.head(3).iterrows()
-            ]
-            render_intraday_live_charts(top3_pairs)
 
         if not t3.empty and st.session_state.selected_stock:
             st.markdown("---")

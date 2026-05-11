@@ -82,8 +82,6 @@ class DingTalkNotifier:
         发送 Top3 标的（钉钉 markdown）：标题与交易日用钉钉要求的「行尾两空格 + \\n」强制分行，避免手机端与标题挤在同一行；
         页脚三项同样内联换行；列表为「序号.  代码  名称」双空格格式。
         展示用交易日为 trade_date 的下一 A 股交易日；无法解析日期时退回原字符串（如测试文案）。
-        字典中的 score、close_price 等字段会被忽略。
-
         Args:
             trade_date: 选股数据对应的交易日
             selections: 选股列表，每个元素需含 rank, stock_code, stock_name

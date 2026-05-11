@@ -324,9 +324,12 @@ def predict_universe_scores(
     lgb_scores = lgb_model.predict(X)
     xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
     feat_df["score"] = blend_ranker_scores(lgb_scores, xgb_scores)
+    feat_df = feat_df.sort_values(
+        ["score", "stock_code"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
     cols = ["trade_date", "stock_code", "stock_name", "score", "close_price"]
     out = feat_df[cols].copy()
-    out = out.sort_values("score", ascending=False).reset_index(drop=True)
     return as_of, out
 
 
