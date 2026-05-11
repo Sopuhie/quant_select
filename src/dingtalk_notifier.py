@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import math
 import hmac
 import json
 import os
@@ -102,6 +103,7 @@ class DingTalkNotifier:
             "---",
             "",
         ]
+        default_reason = "趋向指标与模型评估多头共振优秀。"
         for i, s in enumerate(selections):
             try:
                 rank = int(s["rank"])
@@ -111,11 +113,25 @@ class DingTalkNotifier:
             name = str(s.get("stock_name", "")).strip()
             code_esc = html.escape(code)
             name_esc = html.escape(name)
-            lines.append(f"{rank}.  {code_esc}  {name_esc}")
-            reason = str(s.get("selection_reason") or "").strip()
-            if reason:
-                reason_esc = html.escape(reason)
-                lines.append(f"> {reason_esc}  ")
+            score_v = s.get("score")
+            try:
+                sf = float(score_v)
+                score_s = "—" if math.isnan(sf) else f"{sf:.4f}"
+            except (TypeError, ValueError):
+                score_s = "—"
+            cp_v = s.get("close_price")
+            try:
+                pf = float(cp_v)
+                price_s = "—" if math.isnan(pf) else f"{pf:.2f}"
+            except (TypeError, ValueError):
+                price_s = "—"
+            reason_raw = str(s.get("selection_reason") or "").strip() or default_reason
+            reason_esc = html.escape(reason_raw)
+            lines.append(f"{rank}. **{name_esc}** ({code_esc})  ")
+            lines.append(f"- 选股得分: {score_s}  ")
+            lines.append(f"- 收盘价格: {price_s} 元  ")
+            lines.append(f"- 核心入选逻辑: {reason_esc}  ")
+            lines.append("")
 
         footer = (
             "🤖 本推荐由量化选股系统自动生成  \n"

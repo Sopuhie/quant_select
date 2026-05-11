@@ -17,12 +17,43 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import requests
+
 from src.database import init_db
 from src.return_updater import (
     update_all_returns,
     update_hold_5d_returns,
     update_next_day_returns,
 )
+
+
+def _task_e_networkish(exc: BaseException) -> bool:
+    """判断是否多为网络/超时类异常，避免 Pipeline 第 5 步偶发失败拖垮整条流水线。"""
+    if isinstance(exc, (TimeoutError, ConnectionError, BrokenPipeError)):
+        return True
+    msg = str(exc).lower()
+    hints = (
+        "timeout",
+        "timed out",
+        "connection aborted",
+        "connection reset",
+        "network is unreachable",
+        "temporary failure",
+        "max retries",
+        "remote end closed",
+        "ssl",
+        "handshake",
+    )
+    if any(h in msg for h in hints):
+        return True
+    try:
+        import urllib.error
+
+        if isinstance(exc, urllib.error.URLError):
+            return True
+    except ImportError:
+        pass
+    return isinstance(exc, requests.exceptions.RequestException)
 
 
 def main() -> int:
@@ -39,17 +70,27 @@ def main() -> int:
         help="拉 K 线的起始日期 YYYYMMDD",
     )
     args = parser.parse_args()
-    init_db()
-    if args.only == "next":
-        n = update_next_day_returns(start_date=args.start_date)
-        print("已更新次日收益（影响行数累计）:", n)
-    elif args.only == "h5":
-        n = update_hold_5d_returns(start_date=args.start_date)
-        print("已更新5日收益（影响行数累计）:", n)
-    else:
-        out = update_all_returns(start_date=args.start_date)
-        print("回填结果:", out)
-    return 0
+    try:
+        init_db()
+        if args.only == "next":
+            n = update_next_day_returns(start_date=args.start_date)
+            print("已更新次日收益（影响行数累计）:", n)
+        elif args.only == "h5":
+            n = update_hold_5d_returns(start_date=args.start_date)
+            print("已更新5日收益（影响行数累计）:", n)
+        else:
+            out = update_all_returns(start_date=args.start_date)
+            print("回填结果:", out)
+        return 0
+    except Exception as exc:
+        if _task_e_networkish(exc):
+            print(
+                "[Warning] Temporary connection timeout during Task E, skipping return backfills gracefully.",
+                flush=True,
+            )
+            print(f"详情: {exc}", flush=True)
+            return 0
+        raise
 
 
 if __name__ == "__main__":

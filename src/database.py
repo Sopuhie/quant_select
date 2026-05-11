@@ -116,9 +116,20 @@ def _ensure_daily_selections_selection_reason(conn: sqlite3.Connection) -> None:
     cur = conn.execute("PRAGMA table_info(daily_selections)")
     cols = {str(row[1]) for row in cur.fetchall()}
     if "selection_reason" not in cols:
-        conn.execute(
-            "ALTER TABLE daily_selections ADD COLUMN selection_reason TEXT"
+        print(
+            "[DB] 检测到缺少 selection_reason 列，正在自动补丁 daily_selections …",
+            flush=True,
         )
+        try:
+            conn.execute(
+                "ALTER TABLE daily_selections ADD COLUMN selection_reason TEXT"
+            )
+            print("[DB] daily_selections.selection_reason 补丁已成功应用。", flush=True)
+        except Exception as exc:
+            print(
+                f"[DB] ALTER TABLE selection_reason 失败（可能已存在）: {exc}",
+                flush=True,
+            )
 
 
 def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
@@ -473,7 +484,7 @@ def fetch_selection_rows_for_dingtalk_push(
 
     df = query_df(
         """
-        SELECT rank, stock_code, stock_name, score, selection_reason
+        SELECT rank, stock_code, stock_name, score, close_price, selection_reason
         FROM daily_selections
         WHERE trade_date = ?
         ORDER BY rank ASC
@@ -499,11 +510,23 @@ def fetch_selection_rows_for_dingtalk_push(
             rk = int(r["rank"])
         except (TypeError, ValueError):
             rk = r["rank"]
+        score_v = r.get("score")
+        try:
+            score_f = float(score_v) if score_v is not None and pd.notna(score_v) else None
+        except (TypeError, ValueError):
+            score_f = None
+        cp_v = r.get("close_price")
+        try:
+            close_f = float(cp_v) if cp_v is not None and pd.notna(cp_v) else None
+        except (TypeError, ValueError):
+            close_f = None
         rows.append(
             {
                 "rank": rk,
                 "stock_code": str(r["stock_code"]).strip(),
                 "stock_name": str(r.get("stock_name") or "").strip(),
+                "score": score_f,
+                "close_price": close_f,
                 "selection_reason": str(r.get("selection_reason") or "").strip(),
             }
         )
