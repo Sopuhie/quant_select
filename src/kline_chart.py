@@ -13,6 +13,7 @@ from plotly.subplots import make_subplots
 from .config import DB_PATH
 from .data_fetcher import fetch_daily_hist
 from .database import upsert_stock_daily_klines
+from .utils import get_last_trading_date
 
 
 def lookup_stock_display_name(stock_code: object) -> str:
@@ -49,6 +50,79 @@ def _append_ma(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _merge_online_tail_if_local_stale(
+    df_local: pd.DataFrame,
+    stock_code: str,
+    *,
+    calendar_days: int,
+) -> pd.DataFrame:
+    """
+    本地最后一根若早于「截至今日的最近交易日」，则用在线日线补尾部并 UPSERT，
+    避免出现图表停在昨日、而增量脚本尚未覆盖该股的情况。
+    """
+    if df_local is None or df_local.empty:
+        return df_local
+    work = df_local.copy()
+    work["date"] = pd.to_datetime(work["date"])
+    anchor = str(get_last_trading_date()).strip()[:10]
+    last_s = work["date"].max().strftime("%Y-%m-%d")
+    if last_s >= anchor:
+        return work
+
+    start_compact = (work["date"].max() - timedelta(days=20)).strftime("%Y%m%d")
+    end_compact = datetime.now().strftime("%Y%m%d")
+    try:
+        tail = fetch_daily_hist(
+            stock_code,
+            start_date=start_compact,
+            end_date=end_compact,
+            adjust="qfq",
+        )
+    except Exception:
+        return work
+
+    if tail is None or tail.empty:
+        return work
+
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in tail.columns:
+            tail[col] = pd.to_numeric(tail[col], errors="coerce")
+    tail["date"] = pd.to_datetime(tail["date"])
+    keep = ["date", "open", "high", "low", "close", "volume"]
+    tail = tail[keep].dropna(subset=["open", "high", "low", "close"])
+    if tail.empty:
+        return work
+
+    merged = pd.concat([work[keep], tail], ignore_index=True)
+    merged = merged.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+
+    limit_dt = datetime.now() - timedelta(days=int(calendar_days))
+    merged = merged[merged["date"] >= pd.Timestamp(limit_dt)].reset_index(drop=True)
+
+    try:
+        disp = lookup_stock_display_name(stock_code) or "未知"
+        save = tail.copy()
+        save["date"] = save["date"].dt.strftime("%Y-%m-%d")
+        recs = [
+            {
+                "date": r["date"],
+                "stock_code": stock_code,
+                "stock_name": disp,
+                "open": r["open"],
+                "high": r["high"],
+                "low": r["low"],
+                "close": r["close"],
+                "volume": r["volume"],
+            }
+            for _, r in save.iterrows()
+        ]
+        upsert_stock_daily_klines(recs)
+    except Exception:
+        pass
+
+    return merged
+
+
 def get_stock_kline_data(stock_code: object, days: int = 365):
     """优先读本地 ``stock_daily_kline``；不足则 ``fetch_daily_hist`` 补全并 UPSERT。"""
     stock_code = str(stock_code).strip().zfill(6)
@@ -67,6 +141,7 @@ def get_stock_kline_data(stock_code: object, days: int = 365):
 
         if df is not None and not df.empty and len(df) >= 30:
             df["date"] = pd.to_datetime(df["date"])
+            df = _merge_online_tail_if_local_stale(df, stock_code, calendar_days=days)
             return _append_ma(df)
 
     except Exception as exc:  # noqa: BLE001

@@ -1182,18 +1182,30 @@ with tab_data:
             """
             <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
                 <h4 style="color: #00FFCC; margin-top:0;">📊 任务 A：全量/增量行情同步</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">写入本地表 stock_daily_kline：无历史则拉约 365 自然日；已有则从最近日期次日增量 UPSERT（默认最多约 6000 只，见脚本参数）。</p>
+                <p style="font-size: 0.85rem; color: #8f9cae;">写入本地表 stock_daily_kline：无历史则拉约 365 自然日；已有则从最近日期次日增量 UPSERT。默认最多约 6000 只；勾选下方「全 A」则不限数量（收盘后补当日日线更完整，但更慢）。</p>
             </div>
             """,
             unsafe_allow_html=True,
+        )
+        sync_full_a_market = st.checkbox(
+            "同步全 A（不限 6000 只，收盘后拉齐当日日线）",
+            value=False,
+            key="sync_full_market_kline",
+            help="等价于命令行 python scripts/update_local_data.py --all-stocks",
         )
         data_btn = st.button(
             "🚀 运行本地行情同步", key="run_data_update", use_container_width=True
         )
         if data_btn:
             with st.spinner("正在下载日线并写入本地 SQLite..."):
+                data_cmd = [
+                    sys.executable,
+                    str(ROOT / "scripts" / "update_local_data.py"),
+                ]
+                if sync_full_a_market:
+                    data_cmd.append("--all-stocks")
                 ret_code, _log = run_command_interactive(
-                    [sys.executable, str(ROOT / "scripts" / "update_local_data.py")],
+                    data_cmd,
                     task_name="本地行情同步",
                 )
                 if ret_code == 0:
@@ -1206,7 +1218,7 @@ with tab_data:
             """
             <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
                 <h4 style="color: #00FFCC; margin-top:0;">🎯 任务 B：重新训练选股模型</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">读取本地 SQLite（stock_daily_kline）计算因子并重训 LightGBM。默认使用库内全部日期；若需截止日可设置环境变量 QUANT_TRAIN_END_DATE。</p>
+                <p style="font-size: 0.85rem; color: #8f9cae;">读取本地 SQLite（stock_daily_kline）计算因子并重训 LightGBM LambdaRank（按交易日分组）。可选命令行 <code>--tune</code> 进行 Optuna 调参；默认使用库内全部日期；截止日可设环境变量 QUANT_TRAIN_END_DATE。</p>
             </div>
             """,
             unsafe_allow_html=True,

@@ -10,3 +10,4 @@ matplotlib>=3.7.0
 plotly>=5.18.0
 baostock>=0.8.8
 requests>=2.27.0
+optuna>=3.5.0

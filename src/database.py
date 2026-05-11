@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 
 import pandas as pd
@@ -104,6 +105,19 @@ def _ensure_stock_daily_kline_industry(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN industry TEXT")
 
 
+def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
+    """旧库升级：为 ``stock_daily_kline`` 增加 ``market_cap``（总市值，元）。"""
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_daily_kline'"
+    )
+    if cur.fetchone() is None:
+        return
+    cur = conn.execute("PRAGMA table_info(stock_daily_kline)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "market_cap" not in cols:
+        conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN market_cap REAL")
+
+
 def init_db(db_path: Path | None = None) -> None:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +126,7 @@ def init_db(db_path: Path | None = None) -> None:
         _apply_sqlite_pragmas(conn)
         conn.executescript(SCHEMA_SQL)
         _ensure_stock_daily_kline_industry(conn)
+        _ensure_stock_daily_kline_market_cap(conn)
         conn.commit()
     finally:
         conn.close()
@@ -206,11 +221,15 @@ def upsert_stock_daily_klines(
     若传入 ``connection``，则不单独提交/关闭连接（由调用方 ``commit``）。
     """
     sql = """
-    INSERT INTO stock_daily_kline (date, stock_code, stock_name, industry, open, high, low, close, volume)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO stock_daily_kline (
+        date, stock_code, stock_name, industry, market_cap,
+        open, high, low, close, volume
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(date, stock_code) DO UPDATE SET
         stock_name = excluded.stock_name,
         industry = COALESCE(NULLIF(TRIM(excluded.industry), ''), stock_daily_kline.industry),
+        market_cap = COALESCE(excluded.market_cap, stock_daily_kline.market_cap),
         open = excluded.open,
         high = excluded.high,
         low = excluded.low,
@@ -225,12 +244,22 @@ def upsert_stock_daily_klines(
             if ind_raw is not None and str(ind_raw).strip()
             else ""
         )
+        mc_raw = r.get("market_cap")
+        try:
+            market_cap_val = (
+                float(mc_raw)
+                if mc_raw is not None and pd.notna(mc_raw)
+                else None
+            )
+        except (TypeError, ValueError):
+            market_cap_val = None
         batch.append(
             (
                 r["date"],
                 str(r["stock_code"]).strip().zfill(6),
                 str(r.get("stock_name") or "").strip(),
                 industry_val,
+                market_cap_val,
                 float(r["open"]) if r.get("open") is not None else None,
                 float(r["high"]) if r.get("high") is not None else None,
                 float(r["low"]) if r.get("low") is not None else None,
@@ -520,13 +549,15 @@ def fetch_stock_daily_bars_until(
     """
     code = str(stock_code).strip().zfill(6)
     end = str(end_date).strip()[:10]
-    path = str(db_path or DB_PATH)
+    path_obj = db_path or DB_PATH
+    init_db(path_obj)
+    path = str(path_obj)
     conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
     _apply_sqlite_pragmas(conn)
     try:
         df = pd.read_sql_query(
             """
-            SELECT date, open, high, low, close, volume, industry
+            SELECT date, open, high, low, close, volume, industry, market_cap
             FROM stock_daily_kline
             WHERE stock_code = ? AND date <= ?
             ORDER BY date ASC
@@ -539,8 +570,9 @@ def fetch_stock_daily_bars_until(
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ("open", "high", "low", "close", "volume", "market_cap"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     if "industry" in df.columns:
         df["industry"] = df["industry"].fillna("").astype(str)
     return df.dropna(subset=["close"]).reset_index(drop=True)
@@ -587,6 +619,55 @@ def fetch_latest_industry_by_codes(
                 sc = str(row[0]).strip().zfill(6)
                 ind = row[1]
                 out[sc] = "" if ind is None else str(ind).strip()
+    return out
+
+
+def fetch_latest_market_cap_by_codes(
+    stock_codes: Iterable[str],
+    *,
+    db_path: Path | None = None,
+) -> dict[str, float]:
+    """
+    每只代码取 ``stock_daily_kline`` 最新交易日一行上的 ``market_cap``（元，>0）。
+    缺失或非正的值不写入字典；供在线 K 线推断 ``factor_size_mcap`` 时广播。
+    """
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for c in stock_codes:
+        code = str(c).strip().zfill(6)
+        if len(code) != 6 or not code.isdigit():
+            continue
+        if code not in seen:
+            seen.add(code)
+            uniq.append(code)
+    if not uniq:
+        return {}
+    out: dict[str, float] = {}
+    chunk_size = 400
+    with get_connection(db_path) as conn:
+        for i in range(0, len(uniq), chunk_size):
+            chunk = uniq[i : i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            sql = f"""
+            SELECT k.stock_code, k.market_cap
+            FROM stock_daily_kline k
+            INNER JOIN (
+                SELECT stock_code, MAX(date) AS mx
+                FROM stock_daily_kline
+                WHERE stock_code IN ({placeholders})
+                GROUP BY stock_code
+            ) t ON k.stock_code = t.stock_code AND k.date = t.mx
+            """
+            cur = conn.execute(sql, chunk)
+            for row in cur.fetchall():
+                sc = str(row[0]).strip().zfill(6)
+                mc = row[1]
+                try:
+                    v = float(mc)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(v) and v > 0:
+                    out[sc] = v
     return out
 
 

@@ -110,7 +110,7 @@ def read_stock_daily_kline_range(
         with sqlite3.connect(db_path) as conn:
             raw = pd.read_sql_query(
                 """
-                SELECT date, stock_code, stock_name, open, high, low, close, volume, industry
+                SELECT date, stock_code, stock_name, open, high, low, close, volume, industry, market_cap
                 FROM stock_daily_kline
                 WHERE date >= ? AND date <= ?
                 ORDER BY stock_code, date
@@ -129,6 +129,8 @@ def read_stock_daily_kline_range(
     raw["stock_code"] = raw["stock_code"].astype(str).str.strip().str.zfill(6)
     for col in ("open", "high", "low", "close", "volume"):
         raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    if "market_cap" in raw.columns:
+        raw["market_cap"] = pd.to_numeric(raw["market_cap"], errors="coerce")
     raw["stock_name"] = raw["stock_name"].astype(str).fillna("")
     if "industry" in raw.columns:
         raw["industry"] = raw["industry"].fillna("").astype(str)

@@ -7,6 +7,8 @@
 逻辑：本地无该代码记录则拉取约 365 自然日；已有则从「最近收盘日」次日增量拉取并 UPSERT。
 启动前一次性查询 ``SELECT stock_code, MAX(date) GROUP BY stock_code`` 建查找表；已对齐最近交易日的标的跳过网络请求。
 
+全 A：使用 ``--all-stocks`` 或 ``--max-stocks 0`` 取消默认 6000 只上限，按 AkShare 全市场列表尽可能同步每一只（耗时更长）。
+
 并发策略（SQLite 友好）：
   - **阶段 1**：``ThreadPoolExecutor`` 内仅执行网络拉取，不写数据库；
   - **阶段 2**：线程池结束后，由 **主线程** 将内存中的 K 线分批 ``UPSERT`` 并 ``commit``，避免多线程竞争连接导致锁等待或死锁。
@@ -257,8 +259,15 @@ def update_database_kline(
 ) -> None:
     init_db()
 
+    max_count = None if max_stocks <= 0 else max_stocks
+
     print("正在拉取全市场股票代码列表...", flush=True)
-    stock_pool = get_stock_pool(pool_type=pool_type, max_count=max_stocks)
+    if max_count is None:
+        print(
+            "股票数量上限: 不限制（全 A，按接口返回列表遍历；未对齐最近交易日的才会请求 K 线）。",
+            flush=True,
+        )
+    stock_pool = get_stock_pool(pool_type=pool_type, max_count=max_count)
     if not stock_pool:
         print("错误: 无法获取股票池，请检查网络连接！", flush=True)
         raise SystemExit(1)
@@ -406,7 +415,12 @@ def main() -> int:
         "--max-stocks",
         type=int,
         default=6000,
-        help="最多同步的股票数量上限",
+        help="最多同步的股票数量上限；0 表示不限制（全 A）。等价于 --all-stocks",
+    )
+    parser.add_argument(
+        "--all-stocks",
+        action="store_true",
+        help="同步 AkShare 全 A 列表中的全部代码（等同于 --max-stocks 0；耗时与流量更大）",
     )
     parser.add_argument(
         "--pool",
@@ -444,8 +458,10 @@ def main() -> int:
         sync_stock_industries(DB_PATH, verbose=True, max_boards=lim)
         return 0
 
+    eff_max = 0 if args.all_stocks else args.max_stocks
+
     update_database_kline(
-        max_stocks=args.max_stocks,
+        max_stocks=eff_max,
         pool_type=args.pool,
         workers=args.workers,
         run_industry_sync=not args.skip_industry_sync,

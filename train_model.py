@@ -1,11 +1,12 @@
 """
-使用本地 SQLite（stock_daily_kline）中的日线计算因子并重训 LightGBM。
+使用本地 SQLite（stock_daily_kline）中的日线计算因子并重训 LightGBM LambdaRank。
 不依赖在线行情拉取；预测侧仍使用 factor_calculator 中同一套因子定义。
 
 用法（在 quant_select 目录下）:
   python train_model.py
   python train_model.py --train-end-date 2024-12-31
-  python train_model.py --train-end-date 2024-12-31 --max-stocks 500 --version v1
+  python train_model.py --tune                    # Optuna 调参并写入 models/best_params.json
+  python train_model.py --tune --tune-trials 30
 """
 from __future__ import annotations
 
@@ -20,13 +21,11 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMRegressor, early_stopping
-from sklearn.metrics import mean_squared_error
 
 from src.config import (
+    BEST_LGB_PARAMS_JSON,
     FEATURE_COLUMNS,
     LABEL_HORIZON_DAYS,
-    LGB_PARAMS,
     MIN_HISTORY_BARS,
     MODEL_PATH,
 )
@@ -38,7 +37,15 @@ from src.factor_calculator import (
     label_forward_return,
     normalize_industry_column,
 )
-from src.model_trainer import _json_safe, save_model
+from src.model_trainer import (
+    _json_safe,
+    load_ranker_params_json,
+    merge_ranker_params,
+    optuna_tune_lgbm_ranker,
+    save_model,
+    save_ranker_params_json,
+    train_lgbm_ranker,
+)
 
 
 def _load_local_kline_panel(
@@ -55,7 +62,7 @@ def _load_local_kline_panel(
     init_db()
     conn = sqlite3.connect(str(DB_PATH))
     sql = """
-        SELECT date, stock_code, stock_name, open, high, low, close, volume, industry
+        SELECT date, stock_code, stock_name, open, high, low, close, volume, industry, market_cap
         FROM stock_daily_kline
         ORDER BY stock_code, date
     """
@@ -138,7 +145,7 @@ def _load_local_kline_panel(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="本地 SQLite K 线训练 LightGBM")
+    parser = argparse.ArgumentParser(description="本地 SQLite K 线训练 LightGBM LambdaRank")
     parser.add_argument(
         "--train-end-date",
         type=str,
@@ -157,6 +164,17 @@ def main() -> None:
         action="store_true",
         help="减少进度输出",
     )
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="使用 Optuna 搜索超参（最大化验证集平均 Rank IC），结果写入 models/best_params.json",
+    )
+    parser.add_argument(
+        "--tune-trials",
+        type=int,
+        default=20,
+        help="Optuna 试验次数（仅 --tune 时生效）",
+    )
     args = parser.parse_args()
 
     verbose = not args.quiet
@@ -168,7 +186,7 @@ def main() -> None:
 
     if verbose:
         print(
-            f"[截面清洗] 行数 {len(panel)}，分位秩 + 行业内 MAD/Z（行业不足则退回当日全截面）…",
+            f"[截面清洗] 行数 {len(panel)}，分位秩 + 行业内 MAD/Z + 市值残差中性化…",
             flush=True,
         )
     panel = clean_cross_sectional_features(panel)
@@ -176,7 +194,7 @@ def main() -> None:
         subset=FEATURE_COLUMNS + ["label_ret"]
     )
 
-    unique_dates = sorted(panel["date"].unique())
+    unique_dates = sorted(panel["date"].astype(str).unique())
     if len(unique_dates) < 30:
         train_df = panel
         val_df = panel
@@ -184,41 +202,65 @@ def main() -> None:
             print("[划分] 交易日不足 30，训练集与验证集相同（仅拟合，慎用）。", flush=True)
     else:
         split_date = unique_dates[-20]
-        train_df = panel[panel["date"] < split_date]
-        val_df = panel[panel["date"] >= split_date]
+        train_df = panel[panel["date"].astype(str) < split_date].copy()
+        val_df = panel[panel["date"].astype(str) >= split_date].copy()
 
     if train_df.empty or val_df.empty:
         raise SystemExit("训练或验证子集为空，请放宽 --train-end-date 或增大股票数量。")
 
-    X_train = train_df[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce")
-    y_train = pd.to_numeric(train_df["label_ret"], errors="coerce")
-    X_val = val_df[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce")
-    y_val = pd.to_numeric(val_df["label_ret"], errors="coerce")
+    x_tr = train_df[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    y_tr = pd.to_numeric(train_df["label_ret"], errors="coerce").to_numpy()
+    mask_tr = np.isfinite(x_tr).all(axis=1) & np.isfinite(y_tr)
 
-    mask_tr = np.isfinite(X_train.to_numpy()).all(axis=1) & np.isfinite(y_train.to_numpy())
-    mask_va = np.isfinite(X_val.to_numpy()).all(axis=1) & np.isfinite(y_val.to_numpy())
-    X_train, y_train = X_train.loc[mask_tr], y_train.loc[mask_tr]
-    X_val, y_val = X_val.loc[mask_va], y_val.loc[mask_va]
+    x_va = val_df[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    y_va = pd.to_numeric(val_df["label_ret"], errors="coerce").to_numpy()
+    mask_va = np.isfinite(x_va).all(axis=1) & np.isfinite(y_va)
 
-    if len(y_train) < 500:
-        raise SystemExit(f"训练样本过少（{len(y_train)}），请同步更多本地行情或放宽筛选。")
+    train_df = train_df.loc[mask_tr].reset_index(drop=True)
+    val_df = val_df.loc[mask_va].reset_index(drop=True)
+
+    if len(train_df) < 500:
+        raise SystemExit(f"训练样本过少（{len(train_df)}），请同步更多本地行情或放宽筛选。")
+
+    if args.tune:
+        if verbose:
+            print(
+                f"[Optuna] 开始调参 n_trials={args.tune_trials}（目标：验证集平均 Rank IC）…",
+                flush=True,
+            )
+        best_full = optuna_tune_lgbm_ranker(
+            train_df,
+            val_df,
+            n_trials=max(1, int(args.tune_trials)),
+            feature_cols=list(FEATURE_COLUMNS),
+            verbose=verbose,
+        )
+        save_ranker_params_json(best_full)
+        if verbose:
+            print("[Optuna] 最优参数:", best_full, flush=True)
+            print(f"[Optuna] 已写入 {BEST_LGB_PARAMS_JSON}", flush=True)
+    else:
+        loaded = load_ranker_params_json()
+        best_full = merge_ranker_params(loaded) if loaded else merge_ranker_params(None)
+        if verbose and loaded:
+            print(f"[训练] 使用 {BEST_LGB_PARAMS_JSON} 中的超参数。", flush=True)
 
     if verbose:
         print(
-            f"[训练] 样本: 训练 {len(X_train)} / 验证 {len(X_val)}；LightGBM 拟合中…",
+            f"[LambdaRank] 样本 训练 {len(train_df)} / 验证 {len(val_df)}；"
+            f" objective=lambdarank，按 date 分组 …",
             flush=True,
         )
 
-    model = LGBMRegressor(**LGB_PARAMS, n_estimators=800)
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        callbacks=[early_stopping(stopping_rounds=50, verbose=verbose)],
+    model, rank_metrics = train_lgbm_ranker(
+        train_df,
+        val_df,
+        params=best_full,
+        feature_cols=list(FEATURE_COLUMNS),
+        n_estimators=800,
+        early_stopping_rounds=50,
+        verbose=verbose,
     )
-
-    pred_val = model.predict(X_val)
-    rmse = float(np.sqrt(mean_squared_error(y_val, pred_val)))
 
     train_end_register = (
         args.train_end_date
@@ -227,20 +269,23 @@ def main() -> None:
     )
     version = args.version or ("local_" + datetime.now().strftime("%Y%m%d.%H%M"))
 
+    metrics_register = {
+        "mean_rank_ic_val": rank_metrics.get("mean_rank_ic_val"),
+        "n_train": rank_metrics.get("n_train"),
+        "n_val": rank_metrics.get("n_val"),
+        "source": "sqlite_stock_daily_kline_lambdarank",
+        "last_panel_date": str(unique_dates[-1]),
+    }
+    for k, v in rank_metrics.items():
+        if k not in metrics_register and str(k).startswith("val_ndcg"):
+            metrics_register[k] = v
+
     save_model(model, MODEL_PATH)
     register_model_version(
         version=version,
         train_end_date=str(train_end_register)[:10],
         features=list(FEATURE_COLUMNS),
-        metrics=_json_safe(
-            {
-                "rmse_val": rmse,
-                "n_train": int(len(y_train)),
-                "n_val": int(len(y_val)),
-                "source": "sqlite_stock_daily_kline",
-                "last_panel_date": str(unique_dates[-1]),
-            }
-        ),
+        metrics=_json_safe(metrics_register),
         set_active=True,
     )
 
@@ -249,8 +294,9 @@ def main() -> None:
         {
             "version": version,
             "train_end_date": train_end_register,
-            "rmse_val": rmse,
+            "mean_rank_ic_val": rank_metrics.get("mean_rank_ic_val"),
             "model_path": str(MODEL_PATH),
+            "best_params_json": str(BEST_LGB_PARAMS_JSON) if args.tune else None,
         },
         flush=True,
     )

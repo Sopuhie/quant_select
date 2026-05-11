@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 # 项目根目录（quant_select/）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -11,6 +12,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 MODELS_DIR = PROJECT_ROOT / "models"
 DB_PATH = DATA_DIR / "stocks.db"
 MODEL_PATH = MODELS_DIR / "lgb_model.pkl"
+BEST_LGB_PARAMS_JSON = MODELS_DIR / "best_params.json"
 
 # 确保目录存在
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -77,6 +79,21 @@ LGB_PARAMS = {
     "seed": 42,
 }
 
+# LambdaRank（LGBMRanker）默认超参；与 Optuna 搜索空间对齐时可覆盖。
+# eval_at 勿写入 JSON/merge 字典；且勿传给 LGBMRanker（sklearn 会与内部 params 重复并告警），用库默认 ndcg@k 即可。
+LGB_RANKER_DEFAULT_PARAMS: dict[str, Any] = {
+    "objective": "lambdarank",
+    "metric": "ndcg",
+    "verbosity": -1,
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "min_child_samples": 50,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "bagging_freq": 1,
+    "seed": 42,
+}
+
 # 特征列名（与 factor_calculator / 本地 K 线训练管线一致）
 FEATURE_COLUMNS = [
     "factor_bias_5",
@@ -92,4 +109,8 @@ FEATURE_COLUMNS = [
     "factor_volume_position",
     "factor_volatility_5d",
     "factor_volatility_20d",
+    "factor_rsi_14",
+    "factor_wr_14",
+    "factor_atr_14",
+    "factor_size_mcap",
 ]

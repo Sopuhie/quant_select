@@ -1,13 +1,17 @@
-"""根据日线回填 daily_selections 的次日与第 5 个交易日收盘收益。"""
+"""根据日线回填 daily_selections 的次日与第 5 个交易日收盘收益。
+
+优先使用本地 ``stock_daily_kline``；若本地缺交易日或后续 K 线不足，再请求 AkShare。
+"""
 from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .config import AKSHARE_REQUEST_TIMEOUT, PREDICT_FETCH_WORKERS
+from .config import AKSHARE_REQUEST_TIMEOUT
 from .data_fetcher import fetch_daily_hist
-from .database import get_connection, update_selection_returns
+from .database import fetch_stock_daily_bars_until, get_connection, update_selection_returns
+from .utils import get_last_trading_date
 
 
 def _norm_code(code: str) -> str:
@@ -23,7 +27,7 @@ def _returns_from_hist(
     if hist is None or getattr(hist, "empty", True):
         return None, None
     dates = hist["date"].astype(str).str[:10].tolist()
-    tid = trade_date[:10]
+    tid = str(trade_date).strip()[:10]
     if tid not in dates:
         return None, None
     idx = dates.index(tid)
@@ -64,6 +68,22 @@ def _pending_rows(
         return [dict(r) for r in cur.fetchall()]
 
 
+def _row_still_needs_remote(
+    r: dict[str, Any],
+    nd: float | None,
+    h5: float | None,
+    *,
+    update_next: bool,
+    update_h5: bool,
+) -> bool:
+    """本地已算出的收益若仍缺库内待填字段，则需要在线补 K 线。"""
+    if update_next and r.get("next_day_return") is None and nd is None:
+        return True
+    if update_h5 and r.get("hold_5d_return") is None and h5 is None:
+        return True
+    return False
+
+
 def _refresh_with_grouped_fetch(
     pending: list[dict[str, Any]],
     db_path: Path | None,
@@ -77,11 +97,33 @@ def _refresh_with_grouped_fetch(
     for r in pending:
         by_code[_norm_code(r["stock_code"])].append(r)
     timeout = AKSHARE_REQUEST_TIMEOUT
+    end_anchor = get_last_trading_date()
     updated = 0
     for code, rows in by_code.items():
-        hist = fetch_daily_hist(code, start_date=start_date, timeout=timeout)
+        hist_local = fetch_stock_daily_bars_until(code, end_anchor, db_path=db_path)
+        hist_remote = None
+
         for r in rows:
-            nd, h5 = _returns_from_hist(hist, r["trade_date"], r.get("close_price"))
+            close_hint = r.get("close_price")
+            td = r["trade_date"]
+
+            nd, h5 = _returns_from_hist(
+                hist_local if not hist_local.empty else None,
+                td,
+                close_hint,
+            )
+
+            if _row_still_needs_remote(r, nd, h5, update_next=update_next, update_h5=update_h5):
+                if hist_remote is None:
+                    hist_remote = fetch_daily_hist(
+                        code, start_date=start_date, timeout=timeout
+                    )
+                nd_r, h5_r = _returns_from_hist(hist_remote, td, close_hint)
+                if nd is None:
+                    nd = nd_r
+                if h5 is None:
+                    h5 = h5_r
+
             kwargs: dict[str, float] = {}
             if update_next and r.get("next_day_return") is None and nd is not None:
                 kwargs["next_day_return"] = nd

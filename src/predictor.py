@@ -28,6 +28,7 @@ from .data_fetcher import (
 )
 from .database import (
     fetch_latest_industry_by_codes,
+    fetch_latest_market_cap_by_codes,
     get_active_model_version,
     init_db,
     insert_daily_predictions,
@@ -152,11 +153,17 @@ def _fetch_one_stock_features(
     start_compact: str,
     timeout: float,
     industry_by_code: dict[str, str] | None,
+    mcap_by_code: dict[str, float] | None,
 ) -> Optional[dict[str, Any]]:
     """仅拉数据算因子；在主线程里统一 predict，避免多线程共用模型。"""
     hist = fetch_daily_hist(code, start_date=start_compact, timeout=timeout)
     if not has_enough_history(hist):
         return None
+    code6 = str(code).strip().zfill(6)
+    mc = (mcap_by_code or {}).get(code6)
+    if mc is not None and np.isfinite(mc) and mc > 0:
+        hist = hist.copy()
+        hist["market_cap"] = float(mc)
     feat = latest_feature_row(hist)
     if feat is None:
         return None
@@ -169,7 +176,6 @@ def _fetch_one_stock_features(
     for c in FEATURE_COLUMNS:
         row[c] = float(feat[c])
     hist_ind = _industry_from_hist_last_bar(hist)
-    code6 = str(code).strip().zfill(6)
     if hist_ind:
         row["industry"] = normalize_industry_label(hist_ind)
     else:
@@ -211,6 +217,7 @@ def predict_universe_scores(
     init_db()
     pool_codes = [str(c).strip().zfill(6) for c, _ in stock_pairs]
     industry_by_code = fetch_latest_industry_by_codes(pool_codes)
+    mcap_by_code = fetch_latest_market_cap_by_codes(pool_codes)
 
     raw_rows: list[dict[str, Any]] = []
     total = len(stock_pairs)
@@ -224,6 +231,7 @@ def predict_universe_scores(
                 start_compact,
                 timeout,
                 industry_by_code,
+                mcap_by_code,
             ): (c, n)
             for c, n in stock_pairs
         }
