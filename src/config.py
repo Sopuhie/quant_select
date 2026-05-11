@@ -34,8 +34,8 @@ STOCK_POOL = os.environ.get("QUANT_STOCK_POOL", "hs300")
 # 排除 ST（名称含 *ST / ST 等）
 EXCLUDE_ST = os.environ.get("QUANT_EXCLUDE_ST", "1") not in ("0", "false", "False")
 
-# 排除选股日「上一交易日」涨跌幅接近涨跌停（主板约 10%）
-EXCLUDE_NEAR_LIMIT_LAST_BAR = os.environ.get("QUANT_EXCLUDE_NEAR_LIMIT", "0") in (
+# 排除选股日「上一交易日」收盘价接近涨停（主板约 10%，科创板/创业板请按需调低阈值）
+EXCLUDE_NEAR_LIMIT_LAST_BAR = os.environ.get("QUANT_EXCLUDE_NEAR_LIMIT", "1") in (
     "1",
     "true",
     "True",

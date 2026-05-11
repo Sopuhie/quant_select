@@ -112,6 +112,10 @@ class DingTalkNotifier:
             code_esc = html.escape(code)
             name_esc = html.escape(name)
             lines.append(f"{rank}.  {code_esc}  {name_esc}")
+            reason = str(s.get("selection_reason") or "").strip()
+            if reason:
+                reason_esc = html.escape(reason)
+                lines.append(f"> {reason_esc}  ")
 
         footer = (
             "🤖 本推荐由量化选股系统自动生成  \n"

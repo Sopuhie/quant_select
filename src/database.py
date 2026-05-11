@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS daily_selections (
     close_price REAL,
     next_day_return REAL,
     hold_5d_return REAL,
+    selection_reason TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(trade_date, stock_code)
 );
@@ -105,6 +106,21 @@ def _ensure_stock_daily_kline_industry(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN industry TEXT")
 
 
+def _ensure_daily_selections_selection_reason(conn: sqlite3.Connection) -> None:
+    """旧库升级：为 ``daily_selections`` 增加 ``selection_reason``（入选原因）。"""
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_selections'"
+    )
+    if cur.fetchone() is None:
+        return
+    cur = conn.execute("PRAGMA table_info(daily_selections)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "selection_reason" not in cols:
+        conn.execute(
+            "ALTER TABLE daily_selections ADD COLUMN selection_reason TEXT"
+        )
+
+
 def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
     """旧库升级：为 ``stock_daily_kline`` 增加 ``market_cap``（总市值，元）。"""
     cur = conn.execute(
@@ -127,6 +143,7 @@ def init_db(db_path: Path | None = None) -> None:
         conn.executescript(SCHEMA_SQL)
         _ensure_stock_daily_kline_industry(conn)
         _ensure_stock_daily_kline_market_cap(conn)
+        _ensure_daily_selections_selection_reason(conn)
         conn.commit()
     finally:
         conn.close()
@@ -177,15 +194,16 @@ def insert_daily_selections(
     sql = """
     INSERT INTO daily_selections
     (trade_date, stock_code, stock_name, rank, score, close_price,
-     next_day_return, hold_5d_return, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     next_day_return, hold_5d_return, selection_reason, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(trade_date, stock_code) DO UPDATE SET
         stock_name = excluded.stock_name,
         rank = excluded.rank,
         score = excluded.score,
         close_price = excluded.close_price,
         next_day_return = coalesce(next_day_return, excluded.next_day_return),
-        hold_5d_return = coalesce(hold_5d_return, excluded.hold_5d_return)
+        hold_5d_return = coalesce(hold_5d_return, excluded.hold_5d_return),
+        selection_reason = excluded.selection_reason
     """
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     batch = []
@@ -200,6 +218,7 @@ def insert_daily_selections(
                 r.get("close_price"),
                 r.get("next_day_return"),
                 r.get("hold_5d_return"),
+                r.get("selection_reason"),
                 r.get("created_at", now),
             )
         )
@@ -429,7 +448,7 @@ def fetch_selection_rows_for_date(
     lim = int(limit if limit is not None else TOP_N_SELECTION)
     df = query_df(
         """
-        SELECT rank, stock_code, stock_name, score, close_price
+        SELECT rank, stock_code, stock_name, score, close_price, selection_reason
         FROM daily_selections
         WHERE trade_date = ?
         ORDER BY rank ASC
@@ -454,7 +473,7 @@ def fetch_selection_rows_for_dingtalk_push(
 
     df = query_df(
         """
-        SELECT rank, stock_code, stock_name, score
+        SELECT rank, stock_code, stock_name, score, selection_reason
         FROM daily_selections
         WHERE trade_date = ?
         ORDER BY rank ASC
@@ -485,6 +504,7 @@ def fetch_selection_rows_for_dingtalk_push(
                 "rank": rk,
                 "stock_code": str(r["stock_code"]).strip(),
                 "stock_name": str(r.get("stock_name") or "").strip(),
+                "selection_reason": str(r.get("selection_reason") or "").strip(),
             }
         )
     return rows

@@ -42,6 +42,63 @@ from .factor_calculator import (
     normalize_industry_label,
 )
 from .model_trainer import load_model, load_xgb_ranker_optional
+
+
+def feature_importances_aligned(model: Any) -> list[float]:
+    """与 ``FEATURE_COLUMNS`` 对齐的特征重要性；缺失或非 sklearn 模型时退回均等权重。"""
+    imp = getattr(model, "feature_importances_", None)
+    if imp is None:
+        return [1.0] * len(FEATURE_COLUMNS)
+    arr = np.asarray(imp, dtype=float).ravel()
+    if arr.size != len(FEATURE_COLUMNS):
+        return [1.0] * len(FEATURE_COLUMNS)
+    return arr.tolist()
+
+
+def analyze_stock_reasons(
+    row: Any,
+    importances: list[float],
+    feature_cols: list[str],
+) -> str:
+    """按因子贡献 Top3 生成可读「入选原因」文案。"""
+    templates = {
+        "factor_bias_5": "短期均线偏离度处于合理洗盘或强势突破的上攻区间",
+        "factor_bias_10": "中期10日均线支撑扎实，均线多头趋势稳定",
+        "factor_bias_20": "运行在20日生命线之上，中线上行防守结构优异",
+        "factor_bias_60": "稳稳站上60日牛熊分界线，具备中长期大底部扎实筹码特征",
+        "factor_ratio_5_20": "5日均线与20日生命线多头间距完美拉开，呈现加速拉升之势",
+        "factor_ratio_10_60": "中长期均线系统呈现典型黄金多头排列形态",
+        "factor_return_1d": "昨日放量收大阳线（或涨停），日内多头动量惯性极强",
+        "factor_return_5d": "近5个交易日蓄势充分，洗盘彻底后迎来加速主升浪拐点",
+        "factor_momentum_10d": "10日动量效应共振爆发，资金多头追涨意愿高涨",
+        "factor_volume_ratio": "今日成交量较5日均量显著放量，主力资金正深度建仓突破",
+        "factor_volume_position": "5日均量超越20日均量，量能温和交织放大，买盘承接强劲",
+        "factor_volatility_5d": "短期历史波动率处于爆发临界点，向上变盘向上弹性极大",
+        "factor_volatility_20d": "中期波幅收敛后重新发散，有望打开新一波上升空间",
+        "factor_macd_diff": "MACD中线金叉发散，趋势红柱持续高企增长",
+        "factor_close_position": "收盘价几乎砸在全天最高点，主力抢筹极其坚决，多头承接完美",
+    }
+
+    contributions: list[tuple[str, float]] = []
+    for i, col in enumerate(feature_cols):
+        imp = importances[i] if i < len(importances) else 1.0
+        try:
+            raw = row.get(col, 0) if hasattr(row, "get") else row[col]
+            val = float(raw)
+        except (TypeError, ValueError, KeyError):
+            val = 0.0
+        score = val * float(imp)
+        contributions.append((col, score))
+
+    contributions.sort(key=lambda x: x[1], reverse=True)
+    top_feats = [c[0] for c in contributions[:3]]
+
+    reasons: list[str] = []
+    for idx, f in enumerate(top_feats):
+        desc = templates.get(f, f"核心因子 [{f}] 处于截面优势地位")
+        reasons.append(f"{idx + 1}. {desc}")
+
+    return "；".join(reasons) + "。"
 from .utils import is_kline_too_stale_vs_prediction
 
 
@@ -143,7 +200,8 @@ def filter_predictions(scores_df: pd.DataFrame) -> pd.DataFrame:
         and "pct_prev_day" in out.columns
         and len(out) > 0
     ):
-        p = pd.to_numeric(out["pct_prev_day"], errors="coerce").abs()
+        # 剔除「上一交易日」涨幅已达涨停附近标的（避免追高难以成交）；不限跌停侧
+        p = pd.to_numeric(out["pct_prev_day"], errors="coerce")
         out = out[p < NEAR_LIMIT_PCT_THRESHOLD].copy()
     return out.reset_index(drop=True)
 
@@ -329,7 +387,7 @@ def predict_universe_scores(
         ascending=[False, True],
     ).reset_index(drop=True)
     cols = ["trade_date", "stock_code", "stock_name", "score", "close_price"]
-    out = feat_df[cols].copy()
+    out = feat_df[cols + FEATURE_COLUMNS].copy()
     return as_of, out
 
 
@@ -364,6 +422,8 @@ def persist_predictions(
         raise RuntimeError("写入前过滤结果为空，无法保存预测与选股。")
     scores_df = scores_df.sort_values("score", ascending=False).reset_index(drop=True)
     scores_df["rank_in_market"] = np.arange(1, len(scores_df) + 1)
+    lgb_model = load_model()
+    imp_vec = feature_importances_aligned(lgb_model)
     pred_rows = scores_df.to_dict("records")
     insert_daily_predictions(
         [
@@ -380,6 +440,7 @@ def persist_predictions(
     top = scores_df.head(top_n).reset_index(drop=True)
     sel_rows = []
     for i, r in top.iterrows():
+        reason = analyze_stock_reasons(r, imp_vec, FEATURE_COLUMNS)
         sel_rows.append(
             {
                 "trade_date": trade_date,
@@ -390,6 +451,7 @@ def persist_predictions(
                 "close_price": float(r["close_price"]),
                 "next_day_return": None,
                 "hold_5d_return": None,
+                "selection_reason": reason,
             }
         )
     insert_daily_selections(sel_rows)

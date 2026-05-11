@@ -55,7 +55,12 @@ from src.factor_calculator import (
     normalize_industry_label,
 )
 from src.model_trainer import load_model, load_xgb_ranker_optional
-from src.predictor import blend_ranker_scores, filter_predictions
+from src.predictor import (
+    analyze_stock_reasons,
+    blend_ranker_scores,
+    feature_importances_aligned,
+    filter_predictions,
+)
 from src.utils import get_last_trading_date, is_a_share_trading_day
 
 
@@ -175,6 +180,7 @@ def predict_daily(
     use_online_pool: bool = False,
     include_300: bool = False,
     include_688: bool = False,
+    skip_dingtalk: bool = False,
 ) -> None:
     print(f"开始执行 {trade_date} 每日预测选股流程...")
     # 默认覆盖写入；仅当 force=False（命令行 --skip-if-exists）时跳过已存在记录
@@ -338,31 +344,38 @@ def predict_daily(
     selections["next_day_return"] = None
     selections["hold_5d_return"] = None
 
-    selection_rows = selections[
-        [
-            "trade_date",
-            "stock_code",
-            "stock_name",
-            "rank",
-            "score",
-            "close_price",
-            "next_day_return",
-            "hold_5d_return",
-        ]
-    ].to_dict("records")
+    imp_vec = feature_importances_aligned(lgb_model)
+    selection_rows: list[dict[str, object]] = []
+    for _, row in selections.iterrows():
+        selection_rows.append(
+            {
+                "trade_date": row["trade_date"],
+                "stock_code": row["stock_code"],
+                "stock_name": row["stock_name"],
+                "rank": int(row["rank"]),
+                "score": float(row["score"]),
+                "close_price": float(row["close_price"]),
+                "next_day_return": None,
+                "hold_5d_return": None,
+                "selection_reason": analyze_stock_reasons(row, imp_vec, FEATURE_COLUMNS),
+            }
+        )
     insert_daily_selections(selection_rows)
 
-    print(f"🎉 今日选股完成！{trade_date} 推荐 Top{TOP_N_SELECTION} 为:")
+    print(f"今日选股完成！{trade_date} 推荐 Top{TOP_N_SELECTION} 为:")
     for r in selection_rows:
         print(
             f"  Rank {r['rank']}: {r['stock_code']} {r['stock_name']} "
             f"(分数: {r['score']:.4f}, 收盘价: {r['close_price']})"
         )
 
-    try:
-        maybe_push_daily_selections(trade_date)
-    except Exception as exc:
-        print(f"钉钉推送环节异常（选股数据已写入）: {exc}")
+    if not skip_dingtalk:
+        try:
+            maybe_push_daily_selections(trade_date)
+        except Exception as exc:
+            print(f"钉钉推送环节异常（选股数据已写入）: {exc}")
+    else:
+        print("已跳过钉钉推送（--skip-dingtalk，由上游流水线统一推送）。", flush=True)
 
 
 def main() -> None:
@@ -423,6 +436,11 @@ def main() -> None:
         action="store_true",
         help="包含代码以 688 开头的股票（科创板）；不传则从选股池中剔除",
     )
+    parser.add_argument(
+        "--skip-dingtalk",
+        action="store_true",
+        help="选股完成后不推送钉钉（供一键流水线等在上游步骤结束后再统一推送）",
+    )
     args = parser.parse_args()
 
     init_db()
@@ -455,6 +473,8 @@ def main() -> None:
             "已跳过选股写入，未修改数据库。",
             flush=True,
         )
+        # 供一键流水线识别：避免末尾按旧 MAX(trade_date) 误推钉钉
+        print("QUANT_RUN_DAILY_SKIPPED=non_trading_day", flush=True)
         sys.exit(0)
 
     predict_daily(
@@ -467,6 +487,7 @@ def main() -> None:
         use_online_pool=args.online_pool,
         include_300=args.include_300,
         include_688=args.include_688,
+        skip_dingtalk=args.skip_dingtalk,
     )
 
 
