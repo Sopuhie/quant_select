@@ -11,6 +11,7 @@
 
 并发策略（SQLite 友好）：
   - **阶段 1**：``ThreadPoolExecutor`` 内仅执行网络拉取，不写数据库；
+    进度约按任务数（默认至多每 50 只一批）打印，且默认 **每 30 秒** 心跳一行（可用环境变量 ``QUANT_UPDATE_FETCH_HEARTBEAT_SEC`` 调整）；
   - **阶段 2**：线程池结束后，由 **主线程** 将内存中的 K 线分批 ``UPSERT`` 并 ``commit``，避免多线程竞争连接导致锁等待或死锁。
 
 行业字段：
@@ -308,6 +309,16 @@ def update_database_kline(
     outcomes: list[tuple[list[dict] | None, str]] = []
     workers_n = max(1, min(workers, 32))
 
+    # 单只股票 HTTP 可能数十秒（超时+重试），若仅按「每 500 只」打印会长时间无输出，误判卡死
+    progress_every = max(1, min(50, max(n_pending // 40, 1)))
+    heartbeat_sec = float(os.environ.get("QUANT_UPDATE_FETCH_HEARTBEAT_SEC", "30"))
+
+    print(
+        f"阶段 1：并发拉取 {n_pending} 只股票（线程 {workers_n}），"
+        f"约每 {progress_every} 只或每 {heartbeat_sec:.0f}s 打印进度…",
+        flush=True,
+    )
+
     with ThreadPoolExecutor(max_workers=workers_n) as ex:
         futs = [
             ex.submit(
@@ -321,13 +332,28 @@ def update_database_kline(
             for code, name, last_raw in pending
         ]
         done = 0
+        last_progress_print = t_fetch0
         for fut in as_completed(futs):
             done += 1
-            if n_pending and (done % 500 == 0 or done == n_pending):
+            now = time.perf_counter()
+            elapsed = now - t_fetch0
+            due_count = done % progress_every == 0
+            due_final = done == n_pending
+            due_heartbeat = heartbeat_sec > 0 and (now - last_progress_print) >= heartbeat_sec
+            if n_pending and (done == 1 or due_count or due_final or due_heartbeat):
+                rate = done / elapsed if elapsed > 1e-6 else 0.0
+                eta_s = (n_pending - done) / rate if rate > 1e-9 else float("nan")
+                eta_txt = (
+                    f"，估计剩余约 {eta_s / 60:.1f} 分钟"
+                    if eta_s == eta_s and eta_s < 864000
+                    else ""
+                )
                 print(
-                    f"  [拉取] {done}/{n_pending} 个任务已完成…",
+                    f"  [拉取] {done}/{n_pending} 已完成；已用时 {elapsed:.0f}s"
+                    f"{eta_txt}…",
                     flush=True,
                 )
+                last_progress_print = now
             try:
                 outcomes.append(fut.result())
             except Exception:
