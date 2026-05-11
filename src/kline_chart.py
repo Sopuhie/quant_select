@@ -219,6 +219,26 @@ def draw_candlestick(df, stock_code, stock_name):
     # 均线后画会挡住 K 线悬浮命中：先画均线并跳过 hover，最后画 K 线置于顶层。
     ohlc_cd = df[["open", "high", "low", "close"]].to_numpy(dtype=float)
 
+    # 相对前一交易日收盘涨跌幅（与行情软件「日涨跌幅」一致）
+    closes = df["close"].astype(float)
+    pct_vs_prev_close: list[str] = []
+    for i in range(len(df)):
+        if i == 0:
+            pct_vs_prev_close.append("—")
+            continue
+        prev_c = float(closes.iloc[i - 1])
+        cur_c = float(closes.iloc[i])
+        if prev_c <= 0 or pd.isna(prev_c) or pd.isna(cur_c):
+            pct_vs_prev_close.append("—")
+            continue
+        p = (cur_c / prev_c - 1.0) * 100.0
+        pct_vs_prev_close.append(f"{p:+.2f}%")
+
+    customdata = [
+        [float(ohlc_cd[i, 0]), float(ohlc_cd[i, 1]), float(ohlc_cd[i, 2]), float(ohlc_cd[i, 3]), pct_vs_prev_close[i]]
+        for i in range(len(df))
+    ]
+
     fig.add_trace(
         go.Scatter(
             x=date_strs,
@@ -266,13 +286,14 @@ def draw_candlestick(df, stock_code, stock_name):
             low=df["low"],
             close=df["close"],
             name="K线",
-            customdata=ohlc_cd,
+            customdata=customdata,
             hovertemplate=(
                 "<b>日期</b>: %{x}<br>"
                 "<b>开盘</b>: %{customdata[0]:.2f}<br>"
                 "<b>最高</b>: %{customdata[1]:.2f}<br>"
                 "<b>最低</b>: %{customdata[2]:.2f}<br>"
-                "<b>收盘</b>: %{customdata[3]:.2f}<extra></extra>"
+                "<b>收盘</b>: %{customdata[3]:.2f}<br>"
+                "<b>涨跌幅</b>: %{customdata[4]}<extra></extra>"
             ),
             increasing_line_color=color_up,
             increasing_fillcolor=color_up,
@@ -291,7 +312,11 @@ def draw_candlestick(df, stock_code, stock_name):
     for pos, (_, row) in enumerate(df.iterrows()):
         date_str = date_strs[pos]
         vol_hand = float(row["volume"]) / 100.0
-        text = f"<b>日期</b>: {date_str}<br><b>成交量</b>: {vol_hand:.2f} 手"
+        text = (
+            f"<b>日期</b>: {date_str}<br>"
+            f"<b>成交量</b>: {vol_hand:.2f} 手<br>"
+            f"<b>涨跌幅</b>: {pct_vs_prev_close[pos]}"
+        )
         hover_text_volume.append(text)
 
     fig.add_trace(

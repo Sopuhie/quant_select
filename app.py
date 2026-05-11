@@ -591,6 +591,36 @@ with tab_hist:
                 display_df[col] = display_df[col].apply(
                     lambda x: f"{float(x):.2%}" if pd.notna(x) else "—"
                 )
+        hist_cn_rename = {
+            "trade_date": "交易日",
+            "rank": "排名",
+            "stock_code": "股票代码",
+            "stock_name": "股票名称",
+            "score": "得分",
+            "close_price": "选股日收盘价",
+            "第二天收盘价": "第二天收盘价",
+            "next_day_return": "次日收益率",
+            "hold_5d_return": "五日收益率",
+            "selection_reason": "入选原因",
+        }
+        display_df = display_df.rename(
+            columns={k: v for k, v in hist_cn_rename.items() if k in display_df.columns}
+        )
+        hist_cn_order = [
+            "交易日",
+            "排名",
+            "股票代码",
+            "股票名称",
+            "得分",
+            "选股日收盘价",
+            "第二天收盘价",
+            "次日收益率",
+            "五日收益率",
+            "入选原因",
+        ]
+        display_df = display_df[
+            [c for c in hist_cn_order if c in display_df.columns]
+        ]
         st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
         st.info("暂无历史推荐股票。")
