@@ -1,5 +1,5 @@
 """
-交易日本地时间 20:00 触发全套工作流（依赖 ``schedule`` 库）。
+交易日本地时间按 ``config.SCHEDULER_RUN_AT``（默认 20:00，环境变量 ``QUANT_SCHEDULER_TIME`` 覆盖）触发全套工作流（依赖 ``schedule`` 库）。
 仅在进程内启动一条守护线程；重复调用 ``start_background_scheduler`` 无效。
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ import time
 
 import schedule
 
+from src.config import SCHEDULER_RUN_AT
 from src.pipeline import is_today_trading_day, run_complete_pipeline
 
 _lock = threading.Lock()
@@ -23,7 +24,7 @@ def scheduled_job() -> None:
     )
     if is_today_trading_day():
         print("[A-Quant] 今日为交易日，启动自动全套工作流...", flush=True)
-        ok = run_complete_pipeline(task_name="定时全套工作流(20:00)")
+        ok = run_complete_pipeline(task_name=f"定时全套工作流({SCHEDULER_RUN_AT})")
         if ok:
             print("[A-Quant] 定时工作流执行成功。", flush=True)
         else:
@@ -40,12 +41,12 @@ def _scheduler_thread_alive() -> bool:
 
 
 def start_background_scheduler() -> None:
-    """注册每日 20:00 任务并启动守护线程（幂等；热重载下依赖线程名防重复）。"""
+    """注册每日定时任务并启动守护线程（幂等；热重载下依赖线程名防重复）。"""
     with _lock:
         if _scheduler_thread_alive():
             return
         schedule.clear()
-        schedule.every().day.at("20:00").do(scheduled_job)
+        schedule.every().day.at(SCHEDULER_RUN_AT).do(scheduled_job)
 
     def _loop() -> None:
         while True:
@@ -55,6 +56,7 @@ def start_background_scheduler() -> None:
     t = threading.Thread(target=_loop, daemon=True, name="QuantSchedulerThread")
     t.start()
     print(
-        "[A-Quant] 后台调度已启动：每个交易日 20:00（本机时间）自动执行全套工作流。",
+        f"[A-Quant] 后台调度已启动：每个交易日 {SCHEDULER_RUN_AT}（本机时间）执行全套工作流。"
+        f" 改时间请设 QUANT_SCHEDULER_TIME=HH:MM 并重启 Streamlit。",
         flush=True,
     )

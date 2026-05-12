@@ -38,7 +38,14 @@ import streamlit as st
 
 import plotly.graph_objects as go
 
-from src.config import DATA_DIR, DB_PATH, FEATURE_COLUMNS, MODEL_PATH, TOP_N_SELECTION
+from src.config import (
+    DATA_DIR,
+    DB_PATH,
+    FEATURE_COLUMNS,
+    MODEL_PATH,
+    SCHEDULER_RUN_AT,
+    TOP_N_SELECTION,
+)
 from src.config_manager import config_manager
 from src.database import init_db, insert_system_log, query_df
 from src.pattern_matcher import find_similar_patterns
@@ -77,7 +84,7 @@ st.set_page_config(
 )
 init_db()
 
-# 后台定时任务：交易日 20:00 自动跑全套 Pipeline（单例守护线程）
+# 后台定时任务：每个交易日 SCHEDULER_RUN_AT（默认 20:00，环境变量 QUANT_SCHEDULER_TIME=HH:MM）跑全套 Pipeline
 if os.environ.get("QUANT_DISABLE_BACKGROUND_SCHEDULER", "").strip().lower() not in (
     "1",
     "true",
@@ -1352,7 +1359,7 @@ with tab_data:
     st.caption("无需打开终端，在这里一键调度并监视所有后台算法与数据任务。")
 
     st.markdown(
-        """
+        f"""
         <div style="background-color: rgba(0, 255, 204, 0.05); border: 2px dashed #00FFCC; padding: 20px; border-radius: 10px; margin-bottom: 25px; text-align: center;">
             <h3 style="color: #00FFCC; margin-top: 0; font-family: monospace;">⚡ 一键贯通全套量化工作流</h3>
             <p style="font-size: 0.85rem; color: #8f9cae; margin-bottom: 8px;">
@@ -1360,7 +1367,8 @@ with tab_data:
                 ➜ <b>每日选股（含入选原因归因）</b> ➜ <b>滚动回测</b> ➜ <b>收益回填</b>。
             </p>
             <p style="font-size: 0.8rem; color: #6272a4;">
-                定时：每个<b>交易日 20:00</b>（本机时间）自动运行同一套流程；
+                定时：每个<b>交易日 {SCHEDULER_RUN_AT}</b>（本机时间）自动运行同一套流程；
+                修改请设环境变量 <code>QUANT_SCHEDULER_TIME</code>（如 <code>09:05</code>）并重启 Streamlit。
                 若不需后台调度，请设置环境变量 <code>QUANT_DISABLE_BACKGROUND_SCHEDULER=1</code>。
             </p>
         </div>

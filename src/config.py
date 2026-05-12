@@ -83,6 +83,28 @@ USE_BAOSTOCK_FALLBACK = os.environ.get("QUANT_BAOSTOCK_FALLBACK", "0") not in (
     "False",
 )
 
+
+def _env_hhmm(name: str, default: str) -> str:
+    """解析 ``HH:MM``（24 小时制），非法则退回 default。"""
+    raw = str(os.environ.get(name, default)).strip().replace("：", ":")
+    if not raw:
+        raw = default
+    parts = raw.split(":")
+    if len(parts) != 2:
+        return default
+    try:
+        h = int(parts[0].strip())
+        m = int(parts[1].strip())
+    except ValueError:
+        return default
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return default
+    return f"{h:02d}:{m:02d}"
+
+
+# Streamlit 内置后台调度触发时刻（本机时间）；自测可设环境变量 QUANT_SCHEDULER_TIME=09:05
+SCHEDULER_RUN_AT = _env_hhmm("QUANT_SCHEDULER_TIME", "20:00")
+
 # LightGBM 训练参数（可按机器性能调整）
 LGB_PARAMS = {
     "objective": "regression",
