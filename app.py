@@ -550,6 +550,8 @@ with tab_advisor:
         "输入 6 位代码或带交易所后缀；基于本地 stock_daily_kline、"
         "与全市场选股相同的 14 个量价因子及 LGB/XGB 融合打分；"
         "审计 config.json 中的经验风控阈值。"
+        "前期涨幅/动量压制由环境变量 QUANT_PREV_GAIN_SUPPRESSION（及 QUANT_MAX_5D_RETURN、QUANT_MAX_20D_MOMENTUM）"
+        "统一控制：与全市场选股、回测、诊股一致，默认关闭（0）。"
         "单股未做当日全截面 MAD/行业中性化，与训练日截面处理存在差异；"
         "得分分位依赖最近一次「每日选股」写入的 daily_predictions。"
     )

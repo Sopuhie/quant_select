@@ -50,6 +50,14 @@ EXCLUDE_NEAR_LIMIT_LAST_BAR = os.environ.get("QUANT_EXCLUDE_NEAR_LIMIT", "1") in
 )
 NEAR_LIMIT_PCT_THRESHOLD = float(os.environ.get("QUANT_NEAR_LIMIT_PCT", "0.095"))
 
+# --- 前期涨幅/动量压制（截面清洗前按原始因子比较）---
+# ``QUANT_PREV_GAIN_SUPPRESSION=0`` 关闭；为 1/true 时同时作用于：全市场选股/回测/在线预测与「智能诊股」硬提示。
+ENABLE_PREV_GAIN_SUPPRESSION = os.environ.get(
+    "QUANT_PREV_GAIN_SUPPRESSION", "0"
+) in ("1", "true", "True")
+MAX_ALLOWED_5D_RETURN = float(os.environ.get("QUANT_MAX_5D_RETURN", "0.12"))
+MAX_ALLOWED_20D_RETURN = float(os.environ.get("QUANT_MAX_20D_MOMENTUM", "0.30"))
+
 # 股票池：训练与预测时最多处理的股票数量（AkShare 全市场较慢，可先调小验证流程）
 MAX_STOCKS_UNIVERSE = int(os.environ.get("QUANT_MAX_STOCKS", "400"))
 

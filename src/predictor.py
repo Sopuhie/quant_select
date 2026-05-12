@@ -11,9 +11,12 @@ import pandas as pd
 
 from .config import (
     AKSHARE_REQUEST_TIMEOUT,
+    ENABLE_PREV_GAIN_SUPPRESSION,
     EXCLUDE_NEAR_LIMIT_LAST_BAR,
     EXCLUDE_ST,
     FEATURE_COLUMNS,
+    MAX_ALLOWED_20D_RETURN,
+    MAX_ALLOWED_5D_RETURN,
     MIN_HISTORY_BARS,
     MODEL_PATH,
     NEAR_LIMIT_PCT_THRESHOLD,
@@ -46,6 +49,37 @@ from .factor_calculator import (
 )
 from .model_trainer import load_model, load_xgb_ranker_optional
 from .utils import get_last_trading_date, is_kline_too_stale_vs_prediction
+
+
+def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    在 ``clean_cross_sectional_features`` 之前：按原始 ``factor_return_5d``、
+    ``factor_momentum_10d`` 剔除短期透支标的（与 ``ENABLE_PREV_GAIN_SUPPRESSION`` 一致）。
+    """
+    if feat_df is None or len(feat_df) == 0:
+        return feat_df
+    try:
+        if not ENABLE_PREV_GAIN_SUPPRESSION:
+            return feat_df
+        out = feat_df.copy()
+        n0 = len(out)
+        if "factor_return_5d" in out.columns:
+            r5 = pd.to_numeric(out["factor_return_5d"], errors="coerce")
+            out = out[r5 <= float(MAX_ALLOWED_5D_RETURN)]
+        if "factor_momentum_10d" in out.columns and len(out) > 0:
+            m10 = pd.to_numeric(out["factor_momentum_10d"], errors="coerce")
+            out = out[m10 <= float(MAX_ALLOWED_20D_RETURN)]
+        if len(out) < n0:
+            print(
+                "[风控增强] 已强行剔除过去5日涨幅过大或中线动量过高的高位超买股 "
+                f"（5日上限 {MAX_ALLOWED_5D_RETURN * 100:.1f}%，动量上限 {MAX_ALLOWED_20D_RETURN * 100:.1f}%），"
+                f"共剔除 {n0 - len(out)} 只。",
+                flush=True,
+            )
+        return out.reset_index(drop=True)
+    except Exception as exc:
+        print(f"[警告] 前期涨幅压制阀门执行异常: {exc}", flush=True)
+        return feat_df
 
 
 def feature_importances_aligned(model: Any) -> list[float]:
@@ -475,6 +509,12 @@ def predict_universe_scores(
 
     # 与 train_model / run_daily 一致：按「date」分组做截面清洗（业内 MAD+Z + 分位秩）
     feat_df["date"] = feat_df["trade_date"]
+    feat_df = suppress_high_recent_gains(feat_df)
+    if feat_df.empty:
+        raise RuntimeError(
+            "前期涨幅压制后无剩余候选股票，可设置 QUANT_PREV_GAIN_SUPPRESSION=0 关闭，"
+            "或放宽 QUANT_MAX_5D_RETURN / QUANT_MAX_20D_MOMENTUM。"
+        )
     feat_df = clean_cross_sectional_features(feat_df)
     feat_df = feat_df.drop(columns=["date"], errors="ignore")
 
@@ -670,7 +710,9 @@ def _reference_score_percentile(blended: float) -> tuple[float | None, str | Non
 
 def diagnose_single_stock(stock_code_raw: str) -> tuple[dict[str, Any] | None, str, str]:
     """
-    单股智能诊断：本地 K 线 + 量价因子 + 经验阈值 + LGB/XGB 融合得分 + 可执行结论。
+    单股智能诊断：本地 K 线 + 量价因子 + LGB/XGB 融合得分；经验阈值见 config.json；
+    与全市场选股共用 ``QUANT_PREV_GAIN_SUPPRESSION``、``QUANT_MAX_5D_RETURN``、
+    ``QUANT_MAX_20D_MOMENTUM`` 做近 5 日/10 日动量硬提示。
 
     返回 ``(result_dict, conclusion_text, theme)``；``theme`` 为
     ``error`` | ``warning`` | ``success`` | ``info``，供 Streamlit 选择展示样式。
@@ -709,6 +751,24 @@ def diagnose_single_stock(stock_code_raw: str) -> tuple[dict[str, Any] | None, s
     if last_row[list(FEATURE_COLUMNS)].isna().any():
         return None, "最新一日因子存在缺失，无法诊断。", "warning"
 
+    try:
+        if "factor_return_5d" in last_row.index:
+            v = last_row["factor_return_5d"]
+            ret_5d = float(v) if pd.notna(v) else 0.0
+        else:
+            ret_5d = 0.0
+    except (TypeError, ValueError, KeyError):
+        ret_5d = 0.0
+
+    try:
+        if "factor_momentum_10d" in last_row.index:
+            v10 = last_row["factor_momentum_10d"]
+            ret_m10 = float(v10) if pd.notna(v10) else 0.0
+        else:
+            ret_m10 = 0.0
+    except (TypeError, ValueError, KeyError):
+        ret_m10 = 0.0
+
     close_price = float(df_hist.iloc[last_i]["close"])
     mc_raw = df_hist.iloc[last_i].get("market_cap")
     try:
@@ -725,6 +785,20 @@ def diagnose_single_stock(stock_code_raw: str) -> tuple[dict[str, Any] | None, s
 
     violated: list[str] = []
     min_p, max_p, min_mc, max_mc, min_to, max_to = get_experience_thresholds()
+    if ENABLE_PREV_GAIN_SUPPRESSION and np.isfinite(ret_5d) and ret_5d > float(
+        MAX_ALLOWED_5D_RETURN
+    ):
+        violated.append(
+            f"近5日累计涨幅 ({ret_5d * 100:.1f}%) 已超过防超买限制线 "
+            f"{MAX_ALLOWED_5D_RETURN * 100:.1f}%"
+        )
+    if ENABLE_PREV_GAIN_SUPPRESSION and np.isfinite(ret_m10) and ret_m10 > float(
+        MAX_ALLOWED_20D_RETURN
+    ):
+        violated.append(
+            f"约 10 日动量约 {ret_m10 * 100:.1f}%，超过动量上限 "
+            f"{MAX_ALLOWED_20D_RETURN * 100:.1f}%"
+        )
     if min_p is not None and close_price < float(min_p):
         violated.append(f"收盘价 {close_price:.2f} 元低于经验下限 {float(min_p):.2f} 元")
     if max_p is not None and close_price > float(max_p):

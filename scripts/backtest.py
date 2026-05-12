@@ -56,7 +56,7 @@ from src.factor_calculator import (  # noqa: E402
     compute_factors_for_history,
 )
 from src.model_trainer import load_model  # noqa: E402
-from src.predictor import filter_predictions  # noqa: E402
+from src.predictor import filter_predictions, suppress_high_recent_gains  # noqa: E402
 
 PriceKind = Literal["open", "close"]
 TRADING_DAYS_PER_YEAR = 242
@@ -379,6 +379,7 @@ def _score_universe_for_date(
     if not rows:
         return []
     feat_df = pd.DataFrame(rows)
+    feat_df = suppress_high_recent_gains(feat_df)
     feat_df = clean_cross_sectional_features(feat_df)
     feat_df = filter_predictions(feat_df)
     if feat_df.empty:
