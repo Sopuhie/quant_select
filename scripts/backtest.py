@@ -332,7 +332,7 @@ def _feature_dict_as_of(
     sub = hist[hist["date"] <= as_of_date].reset_index(drop=True)
     if len(sub) < MIN_HISTORY_BARS:
         return None
-    fac = compute_factors_for_history(sub, stock_code=str(code).strip().zfill(6))
+    fac = compute_factors_for_history(sub)
     if fac.empty:
         return None
     last_i = len(sub) - 1

@@ -63,20 +63,20 @@ def analyze_stock_reasons(
 ) -> str:
     """按因子贡献 Top3 生成可读「入选原因」文案。"""
     templates = {
-        "factor_bias_5": "短期均线偏离度处于合理洗盘或强势突破的上攻区间",
-        "factor_bias_60": "稳稳站上60日牛熊分界线，具备中长期大底部扎实筹码特征",
-        "factor_ratio_5_20": "5日均线与20日生命线多头间距完美拉开，呈现加速拉升之势",
-        "factor_return_1d": "昨日放量收大阳线（或涨停），日内多头动量惯性极强",
-        "factor_momentum_10d": "10日动量效应共振爆发，资金多头追涨意愿高涨",
-        "factor_volume_ratio": "今日成交量较5日均量显著放量，主力资金正深度建仓突破",
-        "factor_volatility_5d": "短期历史波动率处于爆发临界点，向上变盘向上弹性极大",
-        "factor_macd_diff": "MACD中线金叉发散，趋势红柱持续高企增长",
-        "factor_close_position": "收盘价几乎砸在全天最高点，主力抢筹极其坚决，多头承接完美",
-        "factor_pe_ratio": "估值市盈率分位数极具性价比，具备安全边际防御特征",
-        "factor_turnover_rate": "换手率处于高度活跃区间，筹码交换频繁，主力博弈资金关注度极高",
-        "factor_roe": "企业最新季度净资产收益率(ROE)高，展现出极强的资本盈利基因",
-        "factor_net_profit_growth": "扣非净利润同比显著高速增长，公司业务正处于成长爆发主升期",
-        "factor_revenue_growth": "营业收入保持健康同比增长，企业市场空间广阔且产品极具护城河",
+        "factor_bias_5": "短期5日均线乖离率合理，价格处于健康反弹或强势突破拉升通道",
+        "factor_bias_10": "10日均线支撑扎实，多头震荡上行波段形态保持良好",
+        "factor_bias_20": "运行在20日生命线之上，中线上行防守及多头承接结构优异",
+        "factor_bias_60": "站稳60日牛熊分界线，具备中长期大底部扎实换手筑底特征",
+        "factor_ratio_5_20": "短期与中期均线距离拉开，呈现健康的经典多头形态形态",
+        "factor_ratio_10_60": "中长期均线系统发散向上，呈现典型的黄金多头排列形态",
+        "factor_return_1d": "昨日放量收出大阳线，日内多头动量和赚钱效应较强",
+        "factor_return_5d": "近5个交易日蓄势充分，洗盘彻底后迎来加速突破主升拐点",
+        "factor_momentum_10d": "10日截面动量效应爆发，多头追涨及资金吸筹意愿高涨",
+        "factor_volume_ratio": "今日成交量较5日均量显著放量，增量资金正深度建仓突破",
+        "factor_volume_position": "5日均量超越20日均量，量能温和交织放大，买盘换手充分",
+        "factor_volatility_5d": "短期历史波动率处于变盘临界点，个股向上拉升弹性极大",
+        "factor_volatility_20d": "中期波幅收敛后重新发散，有望打开全新一轮上升主升浪",
+        "factor_close_position": "收盘价几乎死死封在全天最高点，日内主力资金控盘和买入抢筹极其坚决",
     }
 
     contributions: list[tuple[str, float]] = []
@@ -220,7 +220,8 @@ def latest_feature_row(
 ) -> Optional[pd.Series]:
     if df.empty or len(df) < 30:
         return None
-    fac = compute_factors_for_history(df, stock_code=stock_code)
+    _ = stock_code
+    fac = compute_factors_for_history(df)
     if fac.empty:
         return None
     last_idx = len(df) - 1

@@ -1,20 +1,16 @@
-"""基于 OHLCV 与可选基本面财报计算因子（仅使用截至当日的历史，避免未来函数）。
+"""基于 OHLCV 计算因子（仅使用截至当日的历史，避免未来函数）。
 
 截面清洗支持「行业内 MAD + Z-score」、指定因子分位秩、以及行业内对
 ``factor_size_mcap``（总市值对数）做最小二乘残差的市值中性化；行业字段由
 ``stock_daily_kline.industry``（或上游 DataFrame）提供。
 
-基本面：当提供 ``stock_code`` 时，从 ``stock_financial_data`` 按 ``pub_date``
-与日线 ``merge_asof``（backward）合并 ROE / 净利同比 / 营收同比，满足 ``k.date >= pub_date`` 语义。
 """
 from __future__ import annotations
-
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .config import DB_PATH, FEATURE_COLUMNS, LABEL_HORIZON_DAYS
+from .config import FEATURE_COLUMNS, LABEL_HORIZON_DAYS
 
 # 行业内样本过少时退回当日全截面 MAD+Z，避免行业组统计不稳
 MIN_INDUSTRY_GROUP_SIZE = 5
@@ -50,14 +46,11 @@ def normalize_industry_column(series: pd.Series) -> pd.Series:
 # 高波动 / 重尾因子：先做截面分位秩 [-0.5, 0.5]，再参与行业内标准化
 PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
     "factor_return_1d",
+    "factor_return_5d",
     "factor_momentum_10d",
     "factor_volume_ratio",
     "factor_volatility_5d",
-    "factor_pe_ratio",
-    "factor_turnover_rate",
-    "factor_roe",
-    "factor_net_profit_growth",
-    "factor_revenue_growth",
+    "factor_volatility_20d",
 )
 
 
@@ -124,62 +117,12 @@ def _apply_size_residual_regression(sub_df: pd.DataFrame) -> pd.DataFrame:
     return sub_df
 
 
-def _merge_fundamentals_asof_on_dates(
-    work: pd.DataFrame,
-    stock_code: str,
-    db_path: Path | None,
-) -> pd.DataFrame:
-    """按公告日 ``pub_date`` 与日线 ``date`` 做 merge_asof（backward），禁止前视。"""
-    from .database import fetch_stock_financial_panel
-
-    fin = fetch_stock_financial_panel(stock_code, db_path=db_path)
-    out = work.copy()
-    if fin.empty:
-        out["roe"] = np.nan
-        out["net_profit_growth"] = np.nan
-        out["revenue_growth"] = np.nan
-        return out
-
-    f = fin.copy()
-    f["pub_dt"] = pd.to_datetime(f["pub_date"], errors="coerce")
-    f = f.dropna(subset=["pub_dt"]).sort_values(["pub_dt", "report_date"])
-    f = f.drop_duplicates(subset=["pub_dt"], keep="last")
-    right = f[["pub_dt", "roe", "net_profit_growth", "revenue_growth"]].sort_values(
-        "pub_dt"
-    )
-
-    left = out.reset_index(drop=True)
-    left["_dt"] = pd.to_datetime(left["date"], errors="coerce").ffill().bfill()
-    left["_ord"] = np.arange(len(left), dtype=np.int64)
-    merged = pd.merge_asof(
-        left.sort_values("_dt"),
-        right,
-        left_on="_dt",
-        right_on="pub_dt",
-        direction="backward",
-    ).sort_values("_ord")
-    merged = merged.drop(columns=["_dt", "_ord", "pub_dt"], errors="ignore")
-    return merged
-
-
-def compute_factors_for_history(
-    df: pd.DataFrame,
-    *,
-    stock_code: str | None = None,
-    db_path: Path | None = None,
-) -> pd.DataFrame:
-    """与 ``train_model`` / ``run_daily`` 一致：按 ``FEATURE_COLUMNS`` 输出因子列。
-
-    ``stock_code`` 非空时从 ``stock_financial_data`` 按公告日无偏合并 ROE/净利同比/营收同比。
-    """
+def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
+    """与 ``train_model`` / ``run_daily`` 一致：按 ``FEATURE_COLUMNS`` 输出因子列。"""
     if df.empty:
         return pd.DataFrame(columns=FEATURE_COLUMNS)
 
     work = df.sort_values("date").reset_index(drop=True)
-    if stock_code:
-        work = _merge_fundamentals_asof_on_dates(
-            work, str(stock_code).strip().zfill(6), db_path or DB_PATH
-        )
 
     close = work["close"].astype(float)
     high = work["high"].astype(float)
@@ -188,26 +131,30 @@ def compute_factors_for_history(
 
     eps = 1e-12
     ma5 = close.rolling(5).mean()
+    ma10 = close.rolling(10).mean()
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
 
     out = pd.DataFrame(index=work.index)
     out["factor_bias_5"] = (close - ma5) / (ma5 + eps)
+    out["factor_bias_10"] = (close - ma10) / (ma10 + eps)
+    out["factor_bias_20"] = (close - ma20) / (ma20 + eps)
     out["factor_bias_60"] = (close - ma60) / (ma60 + eps)
     out["factor_ratio_5_20"] = ma5 / (ma20 + eps) - 1.0
+    out["factor_ratio_10_60"] = ma10 / (ma60 + eps) - 1.0
 
     out["factor_return_1d"] = close.pct_change(1)
+    out["factor_return_5d"] = close.pct_change(5)
     out["factor_momentum_10d"] = close / (close.shift(10) + eps) - 1.0
 
     vol_ma5 = vol.rolling(5).mean()
+    vol_ma20 = vol.rolling(20).mean()
     out["factor_volume_ratio"] = vol / (vol_ma5 + eps)
+    out["factor_volume_position"] = vol_ma5 / (vol_ma20 + eps) - 1.0
 
     high_low_ratio = (high - low) / (close + eps)
     out["factor_volatility_5d"] = high_low_ratio.rolling(5).mean()
-
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    out["factor_macd_diff"] = (ema12 - ema26) / (close + eps)
+    out["factor_volatility_20d"] = high_low_ratio.rolling(20).mean()
 
     denom = high.astype(float) - low.astype(float)
     l = low.astype(float)
@@ -220,48 +167,7 @@ def compute_factors_for_history(
         dtype=float,
     ).clip(0.0, 1.0)
 
-    pe_src = None
-    for col in ("pe", "pe_ratio", "pe_ttm", "市盈率"):
-        if col in work.columns:
-            pe_src = col
-            break
-    if pe_src is not None:
-        raw_pe = pd.to_numeric(work[pe_src], errors="coerce").to_numpy(dtype=float)
-        safe_pe = np.where((raw_pe <= 0) | ~np.isfinite(raw_pe), 999.0, raw_pe)
-        out["factor_pe_ratio"] = pd.Series(np.log(safe_pe), index=work.index, dtype=float)
-    else:
-        out["factor_pe_ratio"] = pd.Series(0.0, index=work.index, dtype=float)
-
-    if "turnover_rate" in work.columns:
-        out["factor_turnover_rate"] = pd.to_numeric(
-            work["turnover_rate"], errors="coerce"
-        ).fillna(0.0)
-    elif "turnover" in work.columns:
-        out["factor_turnover_rate"] = pd.to_numeric(
-            work["turnover"], errors="coerce"
-        ).fillna(0.0)
-    else:
-        vol_ma20 = vol.rolling(20).mean()
-        out["factor_turnover_rate"] = vol / (vol_ma20 + eps)
-
-    roe_raw = pd.to_numeric(work.get("roe"), errors="coerce")
-    np_raw = pd.to_numeric(work.get("net_profit_growth"), errors="coerce")
-    rev_raw = pd.to_numeric(work.get("revenue_growth"), errors="coerce")
-
-    def _fill_med(s: pd.Series) -> pd.Series:
-        med = float(s.median()) if s.notna().any() else 0.0
-        if not np.isfinite(med):
-            med = 0.0
-        return s.fillna(med)
-
-    out["factor_roe"] = _fill_med(roe_raw)
-    out["factor_net_profit_growth"] = _fill_med(np_raw)
-    out["factor_revenue_growth"] = _fill_med(rev_raw)
-
     out = out.replace([np.inf, -np.inf], np.nan)
-    for col in FEATURE_COLUMNS:
-        if col not in out.columns:
-            out[col] = 0.0
     out[FEATURE_COLUMNS] = out[FEATURE_COLUMNS].ffill().bfill().fillna(0.0)
 
     return out[FEATURE_COLUMNS]
@@ -364,10 +270,9 @@ def build_stock_panel_features(
     df: pd.DataFrame,
     stock_code: str,
     stock_name: str,
-    *,
-    db_path: Path | None = None,
 ) -> pd.DataFrame:
-    factors = compute_factors_for_history(df, stock_code=stock_code, db_path=db_path)
+    _ = (stock_code, stock_name)
+    factors = compute_factors_for_history(df)
     lab = label_forward_return(df["close"].astype(float))
     meta_cols = ["date"]
     if "industry" in df.columns:

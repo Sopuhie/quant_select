@@ -103,20 +103,20 @@ LGB_RANKER_DEFAULT_PARAMS: dict[str, Any] = {
     "seed": 42,
 }
 
-# 特征列（瘦身：弱化高共线因子；含估值/换手；与 factor_calculator / 训练一致）
+# 特征列：稳定量价框架（14 个纯技术/量价因子；不含 MACD 与基本面）
 FEATURE_COLUMNS = [
-    "factor_bias_5",
-    "factor_bias_60",
-    "factor_ratio_5_20",
-    "factor_return_1d",
-    "factor_momentum_10d",
-    "factor_volume_ratio",
-    "factor_volatility_5d",
-    "factor_macd_diff",
-    "factor_close_position",
-    "factor_pe_ratio",
-    "factor_turnover_rate",
-    "factor_roe",
-    "factor_net_profit_growth",
-    "factor_revenue_growth",
+    "factor_bias_5",  # 5日均线乖离
+    "factor_bias_10",  # 10日均线乖离
+    "factor_bias_20",  # 20日均线乖离（生命线）
+    "factor_bias_60",  # 60日均线乖离（牛熊线）
+    "factor_ratio_5_20",  # 5日/20日均线距离比
+    "factor_ratio_10_60",  # 10日/60日均线距离比
+    "factor_return_1d",  # 1日收益
+    "factor_return_5d",  # 5日收益
+    "factor_momentum_10d",  # 10日动量
+    "factor_volume_ratio",  # 量比（相对5日均量）
+    "factor_volume_position",  # 量能位置（5日均量相对20日均量）
+    "factor_volatility_5d",  # 5日波动
+    "factor_volatility_20d",  # 20日波动
+    "factor_close_position",  # 收盘位置（资金承接代理）
 ]

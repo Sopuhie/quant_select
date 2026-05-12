@@ -143,7 +143,7 @@ def _fetch_one_predict_row(
     if df_today.empty:
         return None
 
-    factors = compute_factors_for_history(df_today, stock_code=str(code).strip().zfill(6))
+    factors = compute_factors_for_history(df_today)
     if factors.empty:
         return None
 
