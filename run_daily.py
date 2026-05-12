@@ -60,6 +60,7 @@ from src.predictor import (
     blend_ranker_scores,
     feature_importances_aligned,
     filter_predictions,
+    suppress_high_recent_gains,
 )
 from src.utils import get_last_trading_date, is_a_share_trading_day
 
@@ -356,6 +357,13 @@ def predict_daily(
     # 4. 【核心升级】执行多因子截面去极值与 Z-Score 标准化清洗
     # 构造临时的 'date' 列以适配 clean_cross_sectional_features 的按日期分组逻辑
     feat_df["date"] = feat_df["trade_date"]
+    feat_df = suppress_high_recent_gains(feat_df)
+    if feat_df.empty:
+        print(
+            "警告: 前期涨幅压制后无剩余候选股票，可设置 QUANT_PREV_GAIN_SUPPRESSION=0 关闭，"
+            "或放宽 QUANT_MAX_5D_RETURN / QUANT_MAX_20D_MOMENTUM。"
+        )
+        sys.exit(1)
     feat_df = clean_cross_sectional_features(feat_df)
     feat_df = feat_df.drop(columns=["date"])
 

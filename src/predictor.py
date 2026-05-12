@@ -11,9 +11,12 @@ import pandas as pd
 
 from .config import (
     AKSHARE_REQUEST_TIMEOUT,
+    ENABLE_PREV_GAIN_SUPPRESSION,
     EXCLUDE_NEAR_LIMIT_LAST_BAR,
     EXCLUDE_ST,
     FEATURE_COLUMNS,
+    MAX_ALLOWED_20D_RETURN,
+    MAX_ALLOWED_5D_RETURN,
     MODEL_PATH,
     NEAR_LIMIT_PCT_THRESHOLD,
     PREDICT_FETCH_WORKERS,
@@ -45,6 +48,37 @@ from .model_trainer import load_model, load_xgb_ranker_optional
 from .utils import is_kline_too_stale_vs_prediction
 
 
+def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    在 ``clean_cross_sectional_features`` 之前执行：按**原始** ``factor_return_5d``、
+    ``factor_momentum_10d`` 剔除短期涨幅透支标的（清洗后该列已非收益率，不可再比阈值）。
+    """
+    if feat_df is None or len(feat_df) == 0:
+        return feat_df
+    try:
+        if not ENABLE_PREV_GAIN_SUPPRESSION:
+            return feat_df
+        out = feat_df.copy()
+        n0 = len(out)
+        if "factor_return_5d" in out.columns:
+            r5 = pd.to_numeric(out["factor_return_5d"], errors="coerce")
+            out = out[r5 <= float(MAX_ALLOWED_5D_RETURN)]
+        if "factor_momentum_10d" in out.columns and len(out) > 0:
+            m10 = pd.to_numeric(out["factor_momentum_10d"], errors="coerce")
+            out = out[m10 <= float(MAX_ALLOWED_20D_RETURN)]
+        if len(out) < n0:
+            print(
+                "[风控增强] 已强行剔除过去5日涨幅过大或中线动量过高的高位超买股 "
+                f"（5日上限 {MAX_ALLOWED_5D_RETURN * 100:.1f}%，动量上限 {MAX_ALLOWED_20D_RETURN * 100:.1f}%），"
+                f"共剔除 {n0 - len(out)} 只。",
+                flush=True,
+            )
+        return out.reset_index(drop=True)
+    except Exception as exc:
+        print(f"[警告] 前期涨幅压制阀门执行异常: {exc}", flush=True)
+        return feat_df
+
+
 def feature_importances_aligned(model: Any) -> list[float]:
     """与 ``FEATURE_COLUMNS`` 对齐的特征重要性；缺失或非 sklearn 模型时退回均等权重。"""
     imp = getattr(model, "feature_importances_", None)
@@ -63,14 +97,14 @@ def analyze_stock_reasons(
 ) -> str:
     """按因子贡献 Top3 生成可读「入选原因」文案。"""
     templates = {
-        "factor_bias_5": "短期5日均线乖离率合理，价格处于健康反弹或强势突破拉升通道",
-        "factor_bias_10": "10日均线支撑扎实，多头震荡上行波段形态保持良好",
-        "factor_bias_20": "运行在20日生命线之上，中线上行防守及多头承接结构优异",
+        "factor_bias_5": "短期5日均线乖离温和，低位安全蓄势区，价格处于健康反弹或突破通道",
+        "factor_bias_10": "10日均线支撑扎实，低位换手充分，多头震荡上行形态保持良好",
+        "factor_bias_20": "运行在20日生命线之上，低位安全垫较厚，中线上行防守及承接结构优异",
         "factor_bias_60": "站稳60日牛熊分界线，具备中长期大底部扎实换手筑底特征",
         "factor_ratio_5_20": "短期与中期均线距离拉开，呈现健康的经典多头形态形态",
         "factor_ratio_10_60": "中长期均线系统发散向上，呈现典型的黄金多头排列形态",
         "factor_return_1d": "昨日放量收出大阳线，日内多头动量和赚钱效应较强",
-        "factor_return_5d": "近5个交易日蓄势充分，洗盘彻底后迎来加速突破主升拐点",
+        "factor_return_5d": "近5个交易日表现温和、蓄势充分，并未透支暴涨，属于典型的安全低位起步拐点",
         "factor_momentum_10d": "10日截面动量效应爆发，多头追涨及资金吸筹意愿高涨",
         "factor_volume_ratio": "今日成交量较5日均量显著放量，增量资金正深度建仓突破",
         "factor_volume_position": "5日均量超越20日均量，量能温和交织放大，买盘换手充分",
@@ -371,6 +405,12 @@ def predict_universe_scores(
 
     # 与 train_model / run_daily 一致：按「date」分组做截面清洗（业内 MAD+Z + 分位秩）
     feat_df["date"] = feat_df["trade_date"]
+    feat_df = suppress_high_recent_gains(feat_df)
+    if feat_df.empty:
+        raise RuntimeError(
+            "前期涨幅压制后无剩余候选股票，可设置 QUANT_PREV_GAIN_SUPPRESSION=0 关闭，"
+            "或放宽 QUANT_MAX_5D_RETURN / QUANT_MAX_20D_MOMENTUM。"
+        )
     feat_df = clean_cross_sectional_features(feat_df)
     feat_df = feat_df.drop(columns=["date"], errors="ignore")
 
