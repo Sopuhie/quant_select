@@ -25,8 +25,16 @@ LABEL_HORIZON_DAYS = 5
 # 用于训练/预测的历史 K 线最少条数
 MIN_HISTORY_BARS = 60
 
-# 每日选股数量
-TOP_N_SELECTION = 3
+# 每日选股 TopN（环境变量 QUANT_TOP_N 可调，例如 5、10；默认 3）
+def _env_int_bounded(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(str(os.environ.get(name, str(default))).strip())
+    except ValueError:
+        v = default
+    return max(lo, min(hi, v))
+
+
+TOP_N_SELECTION = _env_int_bounded("QUANT_TOP_N", 3, 1, 50)
 
 # 股票池：all | hs300 | zz500（中证500）
 STOCK_POOL = os.environ.get("QUANT_STOCK_POOL", "hs300")
@@ -95,25 +103,17 @@ LGB_RANKER_DEFAULT_PARAMS: dict[str, Any] = {
     "seed": 42,
 }
 
-# 特征列名（与 factor_calculator / 本地 K 线训练管线一致）
+# 特征列（瘦身：弱化高共线因子；含估值/换手；与 factor_calculator / 训练一致）
 FEATURE_COLUMNS = [
     "factor_bias_5",
-    "factor_bias_10",
-    "factor_bias_20",
     "factor_bias_60",
     "factor_ratio_5_20",
-    "factor_ratio_10_60",
     "factor_return_1d",
-    "factor_return_5d",
     "factor_momentum_10d",
     "factor_volume_ratio",
-    "factor_volume_position",
     "factor_volatility_5d",
-    "factor_volatility_20d",
-    "factor_rsi_14",
-    "factor_wr_14",
-    "factor_atr_14",
-    "factor_size_mcap",
-    "factor_macd_diff",  # MACD 快慢线差 / 收盘，中长期趋势强度
-    "factor_close_position",  # 日内收盘在高低区间位置，资金承接代理
+    "factor_macd_diff",
+    "factor_close_position",
+    "factor_pe_ratio",
+    "factor_turnover_rate",
 ]

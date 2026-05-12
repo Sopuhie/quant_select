@@ -42,6 +42,7 @@ from .factor_calculator import (
     normalize_industry_label,
 )
 from .model_trainer import load_model, load_xgb_ranker_optional
+from .utils import is_kline_too_stale_vs_prediction
 
 
 def feature_importances_aligned(model: Any) -> list[float]:
@@ -63,20 +64,16 @@ def analyze_stock_reasons(
     """按因子贡献 Top3 生成可读「入选原因」文案。"""
     templates = {
         "factor_bias_5": "短期均线偏离度处于合理洗盘或强势突破的上攻区间",
-        "factor_bias_10": "中期10日均线支撑扎实，均线多头趋势稳定",
-        "factor_bias_20": "运行在20日生命线之上，中线上行防守结构优异",
         "factor_bias_60": "稳稳站上60日牛熊分界线，具备中长期大底部扎实筹码特征",
         "factor_ratio_5_20": "5日均线与20日生命线多头间距完美拉开，呈现加速拉升之势",
-        "factor_ratio_10_60": "中长期均线系统呈现典型黄金多头排列形态",
         "factor_return_1d": "昨日放量收大阳线（或涨停），日内多头动量惯性极强",
-        "factor_return_5d": "近5个交易日蓄势充分，洗盘彻底后迎来加速主升浪拐点",
         "factor_momentum_10d": "10日动量效应共振爆发，资金多头追涨意愿高涨",
         "factor_volume_ratio": "今日成交量较5日均量显著放量，主力资金正深度建仓突破",
-        "factor_volume_position": "5日均量超越20日均量，量能温和交织放大，买盘承接强劲",
         "factor_volatility_5d": "短期历史波动率处于爆发临界点，向上变盘向上弹性极大",
-        "factor_volatility_20d": "中期波幅收敛后重新发散，有望打开新一波上升空间",
         "factor_macd_diff": "MACD中线金叉发散，趋势红柱持续高企增长",
         "factor_close_position": "收盘价几乎砸在全天最高点，主力抢筹极其坚决，多头承接完美",
+        "factor_pe_ratio": "估值市盈率分位数极具性价比，具备安全边际防御特征",
+        "factor_turnover_rate": "换手率处于高度活跃区间，筹码交换频繁，主力博弈资金关注度极高",
     }
 
     contributions: list[tuple[str, float]] = []
@@ -99,7 +96,6 @@ def analyze_stock_reasons(
         reasons.append(f"{idx + 1}. {desc}")
 
     return "；".join(reasons) + "。"
-from .utils import is_kline_too_stale_vs_prediction
 
 
 def blend_ranker_scores(

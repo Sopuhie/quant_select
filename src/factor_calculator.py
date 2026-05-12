@@ -17,9 +17,6 @@ MIN_INDUSTRY_GROUP_SIZE = 5
 # 行业内市值回归样本过少则跳过残差中性化（保留原值）
 MIN_SIZE_NEUTRAL_GROUP = 5
 
-# RSI / W%R / ATR 窗口（与因子列名一致）
-OSCILLATOR_PERIOD = 14
-
 SIZE_FACTOR_COL = "factor_size_mcap"
 
 # 训练 / 推理共用：缺失或非字符串行业统一为该标签，便于行业内截面标准化成组
@@ -45,59 +42,15 @@ def normalize_industry_column(series: pd.Series) -> pd.Series:
     return t
 
 
-# 高波动因子：先做截面分位秩 [-0.5, 0.5]，再参与行业内标准化
+# 高波动 / 重尾因子：先做截面分位秩 [-0.5, 0.5]，再参与行业内标准化
 PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
     "factor_return_1d",
-    "factor_return_5d",
     "factor_momentum_10d",
     "factor_volume_ratio",
     "factor_volatility_5d",
-    "factor_volatility_20d",
+    "factor_pe_ratio",
+    "factor_turnover_rate",
 )
-
-
-def _rsi(close: pd.Series, period: int = OSCILLATOR_PERIOD) -> pd.Series:
-    """Wilder RSI，区间约 [0,100]。"""
-    eps = 1e-12
-    delta = close.astype(float).diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta.clip(upper=0.0))
-    ag = gain.ewm(alpha=1.0 / period, adjust=False).mean()
-    al = loss.ewm(alpha=1.0 / period, adjust=False).mean()
-    rs = ag / (al + eps)
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def _williams_r(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    period: int = OSCILLATOR_PERIOD,
-) -> pd.Series:
-    """Williams %R，典型区间 [-100, 0]。"""
-    eps = 1e-12
-    hh = high.astype(float).rolling(period).max()
-    ll = low.astype(float).rolling(period).min()
-    return -100.0 * (hh - close.astype(float)) / (hh - ll + eps)
-
-
-def _atr_ratio(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    period: int = OSCILLATOR_PERIOD,
-) -> pd.Series:
-    """Wilder ATR / 收盘价，无量纲波动尺度。"""
-    eps = 1e-12
-    h = high.astype(float)
-    l = low.astype(float)
-    c = close.astype(float)
-    prev_c = c.shift(1)
-    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(
-        axis=1
-    )
-    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-    return atr / (c + eps)
 
 
 def _mad_clip_zscore(series: pd.Series) -> pd.Series:
@@ -164,7 +117,7 @@ def _apply_size_residual_regression(sub_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
-    """与 ``train_model`` 本地 SQLite 管线一致的技术因子（FEATURE_COLUMNS 维）。"""
+    """与 ``train_model`` / ``run_daily`` 一致：按 ``FEATURE_COLUMNS`` 输出因子列。"""
     if df.empty:
         return pd.DataFrame(columns=FEATURE_COLUMNS)
 
@@ -176,42 +129,27 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
 
     eps = 1e-12
     ma5 = close.rolling(5).mean()
-    ma10 = close.rolling(10).mean()
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
 
     out = pd.DataFrame(index=df.index)
     out["factor_bias_5"] = (close - ma5) / (ma5 + eps)
-    out["factor_bias_10"] = (close - ma10) / (ma10 + eps)
-    out["factor_bias_20"] = (close - ma20) / (ma20 + eps)
     out["factor_bias_60"] = (close - ma60) / (ma60 + eps)
-
     out["factor_ratio_5_20"] = ma5 / (ma20 + eps) - 1.0
-    out["factor_ratio_10_60"] = ma10 / (ma60 + eps) - 1.0
 
     out["factor_return_1d"] = close.pct_change(1)
-    out["factor_return_5d"] = close.pct_change(5)
     out["factor_momentum_10d"] = close / (close.shift(10) + eps) - 1.0
 
     vol_ma5 = vol.rolling(5).mean()
-    vol_ma20 = vol.rolling(20).mean()
     out["factor_volume_ratio"] = vol / (vol_ma5 + eps)
-    out["factor_volume_position"] = vol_ma5 / (vol_ma20 + eps) - 1.0
 
     high_low_ratio = (high - low) / (close + eps)
     out["factor_volatility_5d"] = high_low_ratio.rolling(5).mean()
-    out["factor_volatility_20d"] = high_low_ratio.rolling(20).mean()
 
-    out["factor_rsi_14"] = _rsi(close, OSCILLATOR_PERIOD)
-    out["factor_wr_14"] = _williams_r(high, low, close, OSCILLATOR_PERIOD)
-    out["factor_atr_14"] = _atr_ratio(high, low, close, OSCILLATOR_PERIOD)
-
-    # MACD Difference（EMA12 − EMA26，按收盘价缩放消除量纲）
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     out["factor_macd_diff"] = (ema12 - ema26) / (close + eps)
 
-    # 日内收盘位置：(收盘−最低)/(最高−最低)，近似资金承接强度；零振幅时用 eps 避免除零
     denom = high.astype(float) - low.astype(float)
     l = low.astype(float)
     c = close.astype(float)
@@ -223,20 +161,32 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
         dtype=float,
     ).clip(0.0, 1.0)
 
-    if "market_cap" in df.columns:
-        mcap = pd.to_numeric(df["market_cap"], errors="coerce").ffill().bfill()
+    pe_src = None
+    for col in ("pe", "pe_ratio", "pe_ttm", "市盈率"):
+        if col in df.columns:
+            pe_src = col
+            break
+    if pe_src is not None:
+        raw_pe = pd.to_numeric(df[pe_src], errors="coerce").to_numpy(dtype=float)
+        safe_pe = np.where((raw_pe <= 0) | ~np.isfinite(raw_pe), 999.0, raw_pe)
+        out["factor_pe_ratio"] = pd.Series(np.log(safe_pe), index=df.index, dtype=float)
     else:
-        mcap = pd.Series(np.nan, index=df.index)
-    mcap = mcap.clip(lower=0.0).fillna(0.0)
-    out[SIZE_FACTOR_COL] = np.log(np.maximum(mcap.to_numpy(dtype=float), 1.0))
+        out["factor_pe_ratio"] = pd.Series(0.0, index=df.index, dtype=float)
+
+    if "turnover_rate" in df.columns:
+        out["factor_turnover_rate"] = pd.to_numeric(
+            df["turnover_rate"], errors="coerce"
+        ).fillna(0.0)
+    elif "turnover" in df.columns:
+        out["factor_turnover_rate"] = pd.to_numeric(
+            df["turnover"], errors="coerce"
+        ).fillna(0.0)
+    else:
+        vol_ma20 = vol.rolling(20).mean()
+        out["factor_turnover_rate"] = vol / (vol_ma20 + eps)
 
     out = out.replace([np.inf, -np.inf], np.nan)
-
-    tech_cols = [c for c in FEATURE_COLUMNS if c != SIZE_FACTOR_COL]
-    out[tech_cols] = out[tech_cols].ffill().bfill().fillna(0.0)
-    out[SIZE_FACTOR_COL] = (
-        pd.to_numeric(out[SIZE_FACTOR_COL], errors="coerce").ffill().bfill().fillna(0.0)
-    )
+    out[FEATURE_COLUMNS] = out[FEATURE_COLUMNS].ffill().bfill().fillna(0.0)
 
     return out[FEATURE_COLUMNS]
 
