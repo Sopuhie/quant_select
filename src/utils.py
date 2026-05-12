@@ -1,7 +1,8 @@
 """日期与交易日工具。"""
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import os
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -146,6 +147,39 @@ def get_last_trading_date(as_of: date | datetime | str | None = None) -> str:
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.isoformat()
+
+
+def get_kline_incremental_end_trade_date(now: datetime | None = None) -> str:
+    """
+    增量日线应对齐的「最新交易日」（YYYY-MM-DD）。
+
+    - 非交易日：与 ``get_last_trading_date(as_of=now)`` 一致。
+    - 交易日收盘前：不把当日未收盘 K 当作应对齐目标，对齐到截至「昨自然日」的最近交易日。
+    - 交易日收盘起（默认本地 15:00，可用 ``QUANT_MARKET_CLOSE_HOUR`` / ``QUANT_MARKET_CLOSE_MINUTE`` 覆盖）：
+      将当日纳入增量；若新浪日历滞后，仍与自然日今天取较大者，便于盘后立刻拉当日收盘线。
+    """
+    n = now or datetime.now()
+    today_str = n.strftime("%Y-%m-%d")
+    if not is_a_share_trading_day(today_str):
+        return get_last_trading_date(as_of=n)
+
+    try:
+        close_h = int(str(os.environ.get("QUANT_MARKET_CLOSE_HOUR", "15")).strip())
+    except ValueError:
+        close_h = 15
+    try:
+        close_m = int(str(os.environ.get("QUANT_MARKET_CLOSE_MINUTE", "0")).strip())
+    except ValueError:
+        close_m = 0
+    close_h = max(0, min(23, close_h))
+    close_m = max(0, min(59, close_m))
+
+    if n.time() >= time(close_h, close_m):
+        cal_last = get_last_trading_date(as_of=n)
+        return max(today_str, cal_last)
+
+    prev_cal = (n.date() - timedelta(days=1)).isoformat()
+    return get_last_trading_date(as_of=prev_cal)
 
 
 def next_trade_day_after(d: str) -> str | None:

@@ -11,7 +11,7 @@ from typing import Any
 from .config import AKSHARE_REQUEST_TIMEOUT
 from .data_fetcher import fetch_daily_hist
 from .database import fetch_stock_daily_bars_until, get_connection, update_selection_returns
-from .utils import get_last_trading_date
+from .utils import get_kline_incremental_end_trade_date
 
 
 def _norm_code(code: str) -> str:
@@ -97,7 +97,7 @@ def _refresh_with_grouped_fetch(
     for r in pending:
         by_code[_norm_code(r["stock_code"])].append(r)
     timeout = AKSHARE_REQUEST_TIMEOUT
-    end_anchor = get_last_trading_date()
+    end_anchor = get_kline_incremental_end_trade_date()
     updated = 0
     for code, rows in by_code.items():
         hist_local = fetch_stock_daily_bars_until(code, end_anchor, db_path=db_path)

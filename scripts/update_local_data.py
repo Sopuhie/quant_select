@@ -5,6 +5,7 @@
   python scripts/update_local_data.py
 
 逻辑：本地无该代码记录则拉取约 365 自然日；已有则从「最近收盘日」次日增量拉取并 UPSERT。
+交易日默认本地 15:00 起将当日收盘线纳入增量锚点（环境变量 ``QUANT_MARKET_CLOSE_HOUR`` / ``QUANT_MARKET_CLOSE_MINUTE`` 可调）；此前不含当日未收盘 K。
 启动前一次性查询 ``SELECT stock_code, MAX(date) GROUP BY stock_code`` 建查找表；已对齐最近交易日的标的跳过网络请求。
 
 全 A：使用 ``--all-stocks`` 或 ``--max-stocks 0`` 取消默认 6000 只上限，按 AkShare 全市场列表尽可能同步每一只（耗时更长）。
@@ -51,7 +52,7 @@ from src.data_fetcher import (
     get_stock_pool,
     resolve_incremental_daily_fetch_window,
 )
-from src.utils import get_last_trading_date
+from src.utils import get_kline_incremental_end_trade_date
 
 DEFAULT_WORKERS = max(1, int(os.environ.get("QUANT_UPDATE_WORKERS", "8")))
 # 主线程单次 executemany 行数上限（过大易占用内存；过小则事务开销大）
@@ -280,7 +281,7 @@ def update_database_kline(
     t_map = time.perf_counter()
 
     total = len(stock_pool)
-    latest_trade = get_last_trading_date()
+    latest_trade = get_kline_incremental_end_trade_date()
     end_compact = latest_trade.replace("-", "")
 
     print(

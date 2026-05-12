@@ -13,7 +13,7 @@ from plotly.subplots import make_subplots
 from .config import DB_PATH
 from .data_fetcher import fetch_daily_hist
 from .database import upsert_stock_daily_klines
-from .utils import get_last_trading_date
+from .utils import get_kline_incremental_end_trade_date
 
 
 def lookup_stock_display_name(stock_code: object) -> str:
@@ -64,7 +64,7 @@ def _merge_online_tail_if_local_stale(
         return df_local
     work = df_local.copy()
     work["date"] = pd.to_datetime(work["date"])
-    anchor = str(get_last_trading_date()).strip()[:10]
+    anchor = str(get_kline_incremental_end_trade_date()).strip()[:10]
     last_s = work["date"].max().strftime("%Y-%m-%d")
     if last_s >= anchor:
         return work
@@ -246,7 +246,7 @@ def draw_candlestick(df, stock_code, stock_name):
             name="MA5",
             hoverinfo="skip",
             mode="lines",
-            line=dict(color="#00FFCC", width=1.5),
+            line=dict(color="#0d9488", width=1.5),
         ),
         row=1,
         col=1,
@@ -259,7 +259,7 @@ def draw_candlestick(df, stock_code, stock_name):
             name="MA10",
             hoverinfo="skip",
             mode="lines",
-            line=dict(color="#FF00FF", width=1.5),
+            line=dict(color="#9333ea", width=1.5),
         ),
         row=1,
         col=1,
@@ -272,7 +272,7 @@ def draw_candlestick(df, stock_code, stock_name):
             name="MA20",
             hoverinfo="skip",
             mode="lines",
-            line=dict(color="#FFFF00", width=1.5),
+            line=dict(color="#ca8a04", width=1.5),
         ),
         row=1,
         col=1,
@@ -333,22 +333,22 @@ def draw_candlestick(df, stock_code, stock_name):
         col=1,
     )
 
-    color_grid = "rgba(255, 255, 255, 0.04)"
+    color_grid = "rgba(15, 23, 42, 0.08)"
 
     fig.update_layout(
         title=f"{stock_code} {stock_name} (连续K线)",
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        template="plotly_white",
+        paper_bgcolor="rgba(255,255,255,0)",
+        plot_bgcolor="#f8fafc",
         xaxis_rangeslider_visible=False,
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=50, r=20, t=60, b=40),
         hovermode="x unified",
         hoverlabel=dict(
-            bgcolor="#141622",
-            bordercolor="#00FFCC",
-            font=dict(color="#ffffff", size=13, family="monospace"),
+            bgcolor="#ffffff",
+            bordercolor="#0d9488",
+            font=dict(color="#0f172a", size=13, family="monospace"),
         ),
     )
 
@@ -356,7 +356,7 @@ def draw_candlestick(df, stock_code, stock_name):
         type="category",
         showgrid=False,
         linecolor=color_grid,
-        tickfont=dict(color="#8f9cae"),
+        tickfont=dict(color="#475569"),
         showspikes=False,
         row=1,
         col=1,
@@ -365,7 +365,7 @@ def draw_candlestick(df, stock_code, stock_name):
         type="category",
         showgrid=False,
         linecolor=color_grid,
-        tickfont=dict(color="#8f9cae"),
+        tickfont=dict(color="#475569"),
         showspikes=False,
         row=2,
         col=1,
@@ -375,7 +375,7 @@ def draw_candlestick(df, stock_code, stock_name):
         gridcolor=color_grid,
         zeroline=False,
         linecolor=color_grid,
-        tickfont=dict(color="#8f9cae"),
+        tickfont=dict(color="#475569"),
         showspikes=False,
         row=1,
         col=1,
@@ -385,7 +385,7 @@ def draw_candlestick(df, stock_code, stock_name):
         gridcolor=color_grid,
         zeroline=False,
         linecolor=color_grid,
-        tickfont=dict(color="#8f9cae"),
+        tickfont=dict(color="#475569"),
         showspikes=False,
         row=2,
         col=1,
@@ -446,7 +446,7 @@ def draw_realtime_line_chart(
     stock_name: object,
 ) -> go.Figure | None:
     """
-    绘制极简暗黑霓虹风分时折线图（无网格、面积填充）。
+    绘制浅色主题下的极简分时折线图（无网格、面积填充）。
     """
     if df is None or df.empty:
         return None
@@ -482,9 +482,9 @@ def draw_realtime_line_chart(
 
     fig.update_layout(
         title=f"⏳ {code_s} {name_s} ({pct_chg:+.2f}%)",
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        template="plotly_white",
+        paper_bgcolor="rgba(255,255,255,0)",
+        plot_bgcolor="#f8fafc",
         showlegend=False,
         margin=dict(l=10, r=10, t=40, b=10),
         height=180,
@@ -494,13 +494,13 @@ def draw_realtime_line_chart(
         showgrid=False,
         zeroline=False,
         visible=True,
-        tickfont=dict(color="#6272a4", size=9),
+        tickfont=dict(color="#64748b", size=9),
     )
     fig.update_yaxes(
         showgrid=False,
         zeroline=False,
         visible=True,
-        tickfont=dict(color="#6272a4", size=9),
+        tickfont=dict(color="#64748b", size=9),
     )
 
     return fig

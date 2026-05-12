@@ -1,5 +1,5 @@
 """
-Streamlit 复盘与全功能控制台（暗黑霓虹科技风最终整合版）。
+Streamlit 复盘与全功能控制台（浅色清晰主题）。
 支持一键在界面运行：
   1. 全量/增量本地行情同步（stock_daily_kline，对齐「全 A」上限可配）
   2. 模型重新训练
@@ -103,31 +103,32 @@ if os.environ.get("QUANT_DISABLE_BACKGROUND_SCHEDULER", "").strip().lower() not 
                 print(f"后台调度启动失败: {exc}", flush=True)
         st.session_state["quant_scheduler_started"] = True
 
-# ================= 2. 定义全局酷炫 Plotly 绘图模板 =================
-COLOR_CYBER_TEAL = "#00FFCC"  # 霓虹青色
-COLOR_CYBER_ORANGE = "#FF9900"  # 基准橙色线
-COLOR_TEXT = "#8f9cae"
-COLOR_GRID = "rgba(255, 255, 255, 0.04)"  # 非常淡的网格
+# ================= 2. Plotly 与界面配色（浅色主题，保证对比度）=================
+COLOR_CYBER_TEAL = "#0d9488"
+COLOR_CYBER_ORANGE = "#ea580c"
+COLOR_TEXT = "#334155"
+COLOR_GRID = "rgba(15, 23, 42, 0.08)"
 
 
 def get_cyber_layout(title: str = "图表名称") -> go.Layout:
     return go.Layout(
         title=title,
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        template="plotly_white",
+        paper_bgcolor="rgba(255,255,255,0)",
+        plot_bgcolor="#f8fafc",
         font=dict(color=COLOR_TEXT),
+        title_font=dict(color="#0f172a", size=16),
         xaxis=dict(
             showgrid=False,
             linecolor=COLOR_GRID,
-            tickfont=dict(color="#8f9cae"),
+            tickfont=dict(color="#475569"),
         ),
         yaxis=dict(
             showgrid=True,
             gridcolor=COLOR_GRID,
             zeroline=False,
             linecolor=COLOR_GRID,
-            tickfont=dict(color="#8f9cae"),
+            tickfont=dict(color="#475569"),
         ),
         legend=dict(
             orientation="h",
@@ -156,7 +157,7 @@ def draw_cyber_area_trace(
             name=name,
             line=dict(color=COLOR_CYBER_TEAL, width=3, shape="spline"),
             fill="tozeroy",
-            fillcolor="rgba(0, 255, 204, 0.04)",
+            fillcolor="rgba(13, 148, 136, 0.12)",
         )
     )
     return fig
@@ -171,63 +172,68 @@ st.markdown(
     #MainMenu {visibility: hidden;}
 
     .stApp {
-        background-color: #0d0e15;
+        background-color: #f1f5f9;
     }
 
-    /* 指标卡片玻璃拟态 */
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li {
+        color: #1e293b;
+    }
+
     [data-testid="stMetricValue"] {
-        font-family: 'Courier New', Courier, monospace;
-        color: #00FFCC !important;
-        text-shadow: 0 0 10px rgba(0, 255, 204, 0.4);
-        font-size: 1.8rem !important;
-        font-weight: bold;
+        font-family: ui-monospace, 'Cascadia Code', monospace;
+        color: #0f766e !important;
+        font-size: 1.75rem !important;
+        font-weight: 700;
     }
     [data-testid="stMetricLabel"] {
-        color: #8f9cae !important;
+        color: #64748b !important;
         font-size: 0.9rem !important;
     }
     [data-testid="stMetric"] {
-        background: rgba(30, 34, 51, 0.3);
-        border: 1px solid rgba(0, 255, 204, 0.15);
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
         border-radius: 10px;
         padding: 12px 20px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
     }
 
-    /* 选项卡美化 */
     .stTabs [data-baseweb="tab-list"] {
-        gap: 10px;
-        background-color: rgba(30, 34, 51, 0.3);
+        gap: 8px;
+        background-color: #ffffff;
         padding: 8px;
         border-radius: 8px;
-        border: 1px solid rgba(255, 255, 255, 0.05);
+        border: 1px solid #e2e8f0;
     }
     .stTabs [data-baseweb="tab"] {
-        color: #8f9cae !important;
+        color: #64748b !important;
         background-color: transparent !important;
-        border-radius: 4px;
-        padding: 8px 16px;
+        border-radius: 6px;
+        padding: 8px 14px;
         font-weight: 600;
-        transition: all 0.3s;
     }
     .stTabs [aria-selected="true"] {
-        color: #00FFCC !important;
-        background-color: rgba(0, 255, 204, 0.1) !important;
-        border-bottom: 2px solid #00FFCC !important;
-        text-shadow: 0 0 5px rgba(0, 255, 204, 0.3);
+        color: #0f766e !important;
+        background-color: #ecfdf5 !important;
+        border-bottom: 2px solid #0d9488 !important;
     }
 
-    /* 按钮微调：突出主按钮的霓虹感 */
     .stButton>button {
-        background-color: rgba(30, 34, 51, 0.5);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        color: #ffffff;
-        transition: all 0.3s;
+        background-color: #ffffff;
+        border: 1px solid #cbd5e1;
+        color: #0f172a;
     }
     .stButton>button:hover {
-        border-color: #00FFCC;
-        color: #00FFCC;
-        box-shadow: 0 0 8px rgba(0, 255, 204, 0.2);
+        border-color: #0d9488;
+        color: #0f766e;
+        background-color: #f8fafc;
+    }
+
+    [data-testid="stCodeBlock"] pre {
+        background-color: #f8fafc !important;
+        color: #0f172a !important;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
     }
     </style>
     """,
@@ -313,8 +319,8 @@ def run_command_interactive(
 st.markdown(
     """
     <div style="display: flex; align-items: center; margin-bottom: 25px;">
-        <div style="background-color: #00FFCC; width: 6px; height: 35px; border-radius: 3px; margin-right: 15px; box-shadow: 0 0 10px #00FFCC;"></div>
-        <h1 style="color: #ffffff; margin: 0; font-family: 'Segoe UI', sans-serif; font-weight: 800; letter-spacing: 1px;">A-QUANT LITE <span style="color: #00FFCC; font-size: 1.2rem; font-weight: 400;">智能选股控制舱</span></h1>
+        <div style="background-color: #0d9488; width: 6px; height: 35px; border-radius: 3px; margin-right: 15px;"></div>
+        <h1 style="color: #0f172a; margin: 0; font-family: 'Segoe UI', sans-serif; font-weight: 800; letter-spacing: 0.5px;">A-QUANT LITE <span style="color: #0d9488; font-size: 1.2rem; font-weight: 500;">智能选股控制舱</span></h1>
     </div>
     """,
     unsafe_allow_html=True,
@@ -440,7 +446,7 @@ with tab_today:
                     rv = row.get("selection_reason")
                     if pd.notna(rv) and str(rv).strip():
                         reason_html = (
-                            '<p style="font-size: 0.78rem; color: #a8b2d1; text-align: left; '
+                            '<p style="font-size: 0.78rem; color: #475569; text-align: left; '
                             'margin-top: 14px; line-height: 1.45;">'
                             f'{html.escape(str(rv).strip())}'
                             "</p>"
@@ -449,32 +455,32 @@ with tab_today:
                     st.markdown(
                         f"""
                 <div style="
-                            background-color: #141622;
-                            border: 2px solid #00FFCC;
+                            background-color: #ffffff;
+                            border: 2px solid #0d9488;
                             padding: 22px;
                             border-radius: 12px;
                             margin: 10px 0;
                     text-align: center;
-                            box-shadow: 0 4px 20px rgba(0, 255, 204, 0.15);
+                            box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08);
                         ">
                             <span style="
-                                background-color: #00FFCC;
-                                color: #0d0e15;
+                                background-color: #0d9488;
+                                color: #ffffff;
                                 font-weight: bold;
                                 padding: 3px 12px;
                                 border-radius: 20px;
                                 font-size: 0.85rem;
                             ">RANK #{int(row["rank"])}</span>
-                            <h2 style="color: #ffffff; margin: 15px 0 5px 0; font-family: monospace; font-size: 2rem; letter-spacing: 1px;">{row["stock_code"]}</h2>
-                            <h4 style="color: #8f9cae; margin: 0 0 15px 0; font-weight: 500;">{row["stock_name"]}</h4>
-                            <div style="border-top: 1px solid rgba(255, 255, 255, 0.05); padding-top: 12px; display: flex; justify-content: space-around;">
+                            <h2 style="color: #0f172a; margin: 15px 0 5px 0; font-family: monospace; font-size: 2rem; letter-spacing: 1px;">{row["stock_code"]}</h2>
+                            <h4 style="color: #64748b; margin: 0 0 15px 0; font-weight: 500;">{row["stock_name"]}</h4>
+                            <div style="border-top: 1px solid #e2e8f0; padding-top: 12px; display: flex; justify-content: space-around;">
                                 <div>
-                                    <div style="font-size: 0.75rem; color: #6272a4;">得分</div>
-                                    <div style="color: #00FFCC; font-weight: bold; font-family: monospace;">{float(row["score"]):.4f}</div>
+                                    <div style="font-size: 0.75rem; color: #64748b;">得分</div>
+                                    <div style="color: #0d9488; font-weight: bold; font-family: monospace;">{float(row["score"]):.4f}</div>
                                 </div>
                                 <div>
-                                    <div style="font-size: 0.75rem; color: #6272a4;">收盘价</div>
-                                    <div style="color: #ffffff; font-weight: bold; font-family: monospace;">{row["close_price"]}</div>
+                                    <div style="font-size: 0.75rem; color: #64748b;">收盘价</div>
+                                    <div style="color: #0f172a; font-weight: bold; font-family: monospace;">{row["close_price"]}</div>
                                 </div>
                             </div>
                             {reason_html}
@@ -970,11 +976,11 @@ with tab_match:
                             with col:
                                 st.markdown(
                                     f"""
-                        <div style="background-color:#141622;border:1.5px solid {COLOR_CYBER_ORANGE};padding:14px;border-radius:8px;text-align:center;margin-bottom:12px;">
-                            <span style="background-color:{COLOR_CYBER_ORANGE};color:#0d0e15;font-weight:bold;padding:2px 10px;border-radius:12px;font-size:0.78rem;">MATCH #{i + 1}</span>
-                            <h3 style="color:#fff;margin:10px 0 2px 0;font-family:monospace;">{res["stock_code"]}</h3>
-                            <h5 style="color:#8f9cae;margin:0 0 8px 0;">{res["stock_name"]}</h5>
-                            <div style="font-size:0.78rem;color:#6272a4;">形态契合度（启发式）</div>
+                        <div style="background-color:#ffffff;border:1.5px solid {COLOR_CYBER_ORANGE};padding:14px;border-radius:8px;text-align:center;margin-bottom:12px;box-shadow:0 1px 4px rgba(15,23,42,0.06);">
+                            <span style="background-color:{COLOR_CYBER_ORANGE};color:#ffffff;font-weight:bold;padding:2px 10px;border-radius:12px;font-size:0.78rem;">MATCH #{i + 1}</span>
+                            <h3 style="color:#0f172a;margin:10px 0 2px 0;font-family:monospace;">{res["stock_code"]}</h3>
+                            <h5 style="color:#64748b;margin:0 0 8px 0;">{res["stock_name"]}</h5>
+                            <div style="font-size:0.78rem;color:#64748b;">形态契合度（启发式）</div>
                             <div style="color:{COLOR_CYBER_TEAL};font-size:1.45rem;font-weight:bold;font-family:monospace;">{res["similarity"]:.1f}%</div>
                         </div>
                                     """,
@@ -1009,7 +1015,7 @@ with tab_match:
                         if len(tpl_dates) != n_pts:
                             tpl_dates = [str(i + 1) for i in x_idx]
 
-                        # 高饱和霓虹色 + 略粗线宽，深色背景下更易辨认
+                        # 高对比配色，浅色背景下易辨认
                         match_line_styles: list[dict[str, object]] = [
                             {
                                 "color": "#FF2D95",
@@ -1075,7 +1081,7 @@ with tab_match:
                                     xanchor="center",
                                     x=0.5,
                                     font=dict(size=10, color=COLOR_TEXT),
-                                    bgcolor="rgba(13,14,21,0.7)",
+                                    bgcolor="rgba(248, 250, 252, 0.96)",
                                 ),
                                 height=400,
                                 margin=dict(l=50, r=20, t=55, b=100),
@@ -1242,9 +1248,9 @@ with tab_perf:
 
                     st.markdown(
                         """
-                        <div style="background-color: rgba(30, 34, 51, 0.4); border-left: 4px solid #00FFCC; padding: 12px; border-radius: 4px; margin-bottom: 20px;">
-                            <strong style="color: #00FFCC;">💡 指标重要性看板说明：</strong>
-                            <span style="color: #8f9cae; font-size: 0.9rem;">
+                        <div style="background-color: #f1f5f9; border-left: 4px solid #0d9488; padding: 12px; border-radius: 4px; margin-bottom: 20px;">
+                            <strong style="color: #0f766e;">💡 指标重要性看板说明：</strong>
+                            <span style="color: #475569; font-size: 0.9rem;">
                                 决策树分裂频次代表双排序模型在筛选优秀推荐股时，<b>使用该因子进行截面排序和筛选的权重次数</b>。
                                 柱体越长，说明该指标在当前的 LTR（Learning to Rank）排序决策体系中<b>贡献的超额收益越核心</b>。
                             </span>
@@ -1262,8 +1268,8 @@ with tab_perf:
                             marker=dict(
                                 color=feat_imp_df["Importance"],
                                 colorscale=[
-                                    [0, "rgba(0, 255, 204, 0.1)"],
-                                    [1, "rgba(0, 255, 204, 1.0)"],
+                                    [0, "rgba(13, 148, 136, 0.2)"],
+                                    [1, "rgba(13, 148, 136, 0.9)"],
                                 ],
                                 line=dict(color=COLOR_CYBER_TEAL, width=1.5),
                             ),
@@ -1371,13 +1377,13 @@ with tab_data:
 
     st.markdown(
         f"""
-        <div style="background-color: rgba(0, 255, 204, 0.05); border: 2px dashed #00FFCC; padding: 20px; border-radius: 10px; margin-bottom: 25px; text-align: center;">
-            <h3 style="color: #00FFCC; margin-top: 0; font-family: monospace;">⚡ 一键贯通全套量化工作流</h3>
-            <p style="font-size: 0.85rem; color: #8f9cae; margin-bottom: 8px;">
+        <div style="background-color: rgba(13, 148, 136, 0.08); border: 2px dashed #0d9488; padding: 20px; border-radius: 10px; margin-bottom: 25px; text-align: center;">
+            <h3 style="color: #0f766e; margin-top: 0; font-family: monospace;">⚡ 一键贯通全套量化工作流</h3>
+            <p style="font-size: 0.85rem; color: #475569; margin-bottom: 8px;">
                 依次执行：<b>同步行情与行业</b> ➜ <b>重训双排序模型</b>（耗时视数据量）
                 ➜ <b>每日选股（含入选原因归因）</b> ➜ <b>滚动回测</b> ➜ <b>收益回填</b>。
             </p>
-            <p style="font-size: 0.8rem; color: #6272a4;">
+            <p style="font-size: 0.8rem; color: #64748b;">
                 定时：每个<b>交易日 {SCHEDULER_RUN_AT}</b>（本机时间）自动运行同一套流程；
                 修改请设环境变量 <code>QUANT_SCHEDULER_TIME</code>（如 <code>09:05</code>）并重启 Streamlit。
                 若不需后台调度，请设置环境变量 <code>QUANT_DISABLE_BACKGROUND_SCHEDULER=1</code>。
@@ -1423,9 +1429,9 @@ with tab_data:
     with row1_col1:
         st.markdown(
             """
-            <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
-                <h4 style="color: #00FFCC; margin-top:0;">📊 任务 A：全量/增量行情同步</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">写入本地表 stock_daily_kline：无历史则拉约 365 自然日；已有则从最近日期次日增量 UPSERT。默认最多约 6000 只；勾选下方「全 A」则不限数量（收盘后补当日日线更完整，但更慢）。</p>
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
+                <h4 style="color: #0f766e; margin-top:0;">📊 任务 A：全量/增量行情同步</h4>
+                <p style="font-size: 0.85rem; color: #475569;">写入本地表 stock_daily_kline：无历史则拉约 365 自然日；已有则从最近日期次日增量 UPSERT。默认最多约 6000 只；勾选下方「全 A」则不限数量（收盘后补当日日线更完整，但更慢）。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1459,9 +1465,9 @@ with tab_data:
     with row1_col2:
         st.markdown(
             """
-            <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
-                <h4 style="color: #00FFCC; margin-top:0;">🎯 任务 B：重新训练选股模型</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">读取本地 SQLite（stock_daily_kline）计算因子并重训 LightGBM LambdaRank（按交易日分组）。可选命令行 <code>--tune</code> 进行 Optuna 调参；默认使用库内全部日期；截止日可设环境变量 QUANT_TRAIN_END_DATE。</p>
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
+                <h4 style="color: #0f766e; margin-top:0;">🎯 任务 B：重新训练选股模型</h4>
+                <p style="font-size: 0.85rem; color: #475569;">读取本地 SQLite（stock_daily_kline）计算因子并重训 LightGBM LambdaRank（按交易日分组）。可选命令行 <code>--tune</code> 进行 Optuna 调参；默认使用库内全部日期；截止日可设环境变量 QUANT_TRAIN_END_DATE。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1487,9 +1493,9 @@ with tab_data:
     with row2_col1:
         st.markdown(
             """
-            <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
-                <h4 style="color: #00FFCC; margin-top:0;">📡 任务 C：执行每日智能选股</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">K 线与因子计算均基于本地 stock_daily_kline；截面清洗与 LightGBM 打分后产出 Top 推荐。股票池默认取库内有足够历史的代码；需要成分池时可命令行加 --online-pool。可在下方「经验风控阈值」中设置价格/市值/换手硬过滤（写入 config.json，子进程 run_daily 自动读取）。</p>
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
+                <h4 style="color: #0f766e; margin-top:0;">📡 任务 C：执行每日智能选股</h4>
+                <p style="font-size: 0.85rem; color: #475569;">K 线与因子计算均基于本地 stock_daily_kline；截面清洗与 LightGBM 打分后产出 Top 推荐。股票池默认取库内有足够历史的代码；需要成分池时可命令行加 --online-pool。可在下方「经验风控阈值」中设置价格/市值/换手硬过滤（写入 config.json，子进程 run_daily 自动读取）。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1557,7 +1563,7 @@ with tab_data:
                 )
             with _ec3:
                 st.markdown(
-                    "<p style='font-size:0.82rem;color:#8f9cae;margin-top:0.2rem;'>"
+                    "<p style='font-size:0.82rem;color:#475569;margin-top:0.2rem;'>"
                     "也可直接编辑 <code>config.json</code> 中 <code>experience_filters</code>；"
                     "代码级默认见 <code>src/config.py</code> 中 MIN_PRICE 等（仅当 JSON 未写该键时生效）。"
                     "</p>",
@@ -1624,9 +1630,9 @@ with tab_data:
     with row2_col2:
         st.markdown(
             """
-            <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
-                <h4 style="color: #00FFCC; margin-top:0;">📈 任务 D：运行策略历史滚动回测</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">基于本地 stock_daily_kline；不传日期时默认回测区间为库内最早日至最晚日。基准 000300 优先读库。不足可加 --online-fallback。</p>
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
+                <h4 style="color: #0f766e; margin-top:0;">📈 任务 D：运行策略历史滚动回测</h4>
+                <p style="font-size: 0.85rem; color: #475569;">基于本地 stock_daily_kline；不传日期时默认回测区间为库内最早日至最晚日。基准 000300 优先读库。不足可加 --online-fallback。</p>
             </div>
             """,
             unsafe_allow_html=True,

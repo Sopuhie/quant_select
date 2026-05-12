@@ -1,0 +1,8 @@
+# 浅色主题：与 app.py 注入样式一致，保证原生控件与正文对比度
+[theme]
+base = "light"
+primaryColor = "#0d9488"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f1f5f9"
+textColor = "#1e293b"
+font = "sans serif"
