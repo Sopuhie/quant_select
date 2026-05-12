@@ -56,7 +56,11 @@ from src.factor_calculator import (  # noqa: E402
     compute_factors_for_history,
 )
 from src.model_trainer import load_model  # noqa: E402
-from src.predictor import filter_predictions, suppress_high_recent_gains  # noqa: E402
+from src.predictor import (  # noqa: E402
+    filter_predictions,
+    prune_zero_volume_rows,
+    suppress_high_recent_gains,
+)
 
 PriceKind = Literal["open", "close"]
 TRADING_DAYS_PER_YEAR = 242
@@ -353,6 +357,10 @@ def _feature_dict_as_of(
     else:
         out["industry"] = ""
     out["close_price"] = float(sub.iloc[last_i]["close"])
+    lv = float(pd.to_numeric(sub.iloc[last_i].get("volume"), errors="coerce") or 0.0)
+    if not np.isfinite(lv) or lv <= 0:
+        return None
+    out["volume"] = lv
     if len(sub) >= 2:
         c0 = float(sub.iloc[-2]["close"])
         c1 = float(sub.iloc[-1]["close"])
@@ -379,6 +387,10 @@ def _score_universe_for_date(
     if not rows:
         return []
     feat_df = pd.DataFrame(rows)
+    feat_df = prune_zero_volume_rows(feat_df)
+    feat_df = feat_df.drop(columns=["volume"], errors="ignore")
+    if feat_df.empty:
+        return []
     feat_df = suppress_high_recent_gains(feat_df)
     feat_df = clean_cross_sectional_features(feat_df)
     feat_df = filter_predictions(feat_df)

@@ -13,13 +13,14 @@ from typing import Any, Iterable, Iterator
 
 from .config import DB_PATH
 
-# 高并发读写时延长等待、启用 WAL，降低 "database is locked" 概率
+# 高并发读写时延长连接等待、WAL、busy_timeout，降低 "database is locked" 概率
 _SQLITE_CONNECT_TIMEOUT = 30.0
 
 
 def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
 
 
 SCHEMA_SQL = """

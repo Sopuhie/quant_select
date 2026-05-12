@@ -61,6 +61,7 @@ from src.predictor import (
     blend_ranker_scores,
     feature_importances_aligned,
     filter_predictions,
+    prune_zero_volume_rows,
     suppress_high_recent_gains,
 )
 from src.utils import get_last_trading_date, is_a_share_trading_day
@@ -161,6 +162,10 @@ def _fetch_one_predict_row(
     if actual_last_str != td:
         return None
 
+    last_vol = float(pd.to_numeric(df_today.iloc[last_idx].get("volume"), errors="coerce") or 0.0)
+    if not np.isfinite(last_vol) or last_vol <= 0:
+        return None
+
     last_row = factors.iloc[last_idx]
 
     if last_row[list(FEATURE_COLUMNS)].isna().any():
@@ -198,6 +203,7 @@ def _fetch_one_predict_row(
     else:
         row_dict["pct_prev_day"] = 0.0
 
+    row_dict["volume"] = last_vol
     return row_dict
 
 
@@ -369,6 +375,11 @@ def predict_daily(
 
     # 转化为 DataFrame（已按 pairs 顺序，便于与训练/排查对齐）
     feat_df = pd.DataFrame(rows)
+    feat_df = prune_zero_volume_rows(feat_df)
+    feat_df = feat_df.drop(columns=["volume"], errors="ignore")
+    if feat_df.empty:
+        print("警告: 剔除停牌或零成交量标的后没有剩余的候选股票。")
+        sys.exit(1)
 
     # 4. 【核心升级】执行多因子截面去极值与 Z-Score 标准化清洗
     # 构造临时的 'date' 列以适配 clean_cross_sectional_features 的按日期分组逻辑

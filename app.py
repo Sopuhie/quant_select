@@ -22,7 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -561,6 +561,7 @@ with tab_advisor:
         "统一控制：与全市场选股、回测、诊股一致，默认关闭（0）。"
         "单股未做当日全截面 MAD/行业中性化，与训练日截面处理存在差异；"
         "得分分位依赖最近一次「每日选股」写入的 daily_predictions。"
+        "下方「诊断截止日」控制仅用该日及以前的日线，便于历史复盘对齐。"
     )
     col_in1, col_in2 = st.columns([3, 1])
     with col_in1:
@@ -576,10 +577,19 @@ with tab_advisor:
             use_container_width=True,
             key="advisor_run_btn",
         )
+    advisor_anchor = st.date_input(
+        "诊断截止日（含）",
+        value=date.today(),
+        key="advisor_anchor_date",
+        help="仅使用 stock_daily_kline 中 date ≤ 该日的数据计算因子；默认今天。",
+    )
 
     if diag_btn and str(advisor_code).strip():
         with st.spinner("正在计算因子、比对风控并执行模型打分..."):
-            res, conclusion, theme = diagnose_single_stock(advisor_code.strip())
+            res, conclusion, theme = diagnose_single_stock(
+                advisor_code.strip(),
+                end_date=advisor_anchor.strftime("%Y-%m-%d"),
+            )
         if res is None:
             if theme == "error":
                 st.error(conclusion)
@@ -589,7 +599,8 @@ with tab_advisor:
             st.markdown("---")
             title_name = res.get("stock_name") or ""
             st.subheader(
-                f"📊 {res['stock_code']} {title_name} · 锚定日 {res.get('trade_date', '—')}"
+                f"📊 {res['stock_code']} {title_name} · 截止 {res.get('anchor_date', '—')} "
+                f"· 末根交易日 {res.get('trade_date', '—')}"
             )
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("最新收盘价", f"{float(res['price']):.2f} 元")

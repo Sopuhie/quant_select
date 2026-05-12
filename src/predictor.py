@@ -48,7 +48,7 @@ from .factor_calculator import (
     normalize_industry_label,
 )
 from .model_trainer import load_model, load_xgb_ranker_optional
-from .utils import get_last_trading_date, is_kline_too_stale_vs_prediction
+from .utils import is_kline_too_stale_vs_prediction
 
 
 def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
@@ -331,7 +331,18 @@ def filter_predictions(scores_df: pd.DataFrame) -> pd.DataFrame:
         # 剔除「上一交易日」涨幅已达涨停附近标的（避免追高难以成交）；不限跌停侧
         p = pd.to_numeric(out["pct_prev_day"], errors="coerce")
         out = out[p < NEAR_LIMIT_PCT_THRESHOLD].copy()
+    if "volume" in out.columns and len(out) > 0:
+        v = pd.to_numeric(out["volume"], errors="coerce")
+        out = out[v > 0].copy()
     return out.reset_index(drop=True)
+
+
+def prune_zero_volume_rows(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """剔除锚定日成交量 ≤0 的标的（停牌/无量），需存在 ``volume`` 列。"""
+    if feat_df is None or feat_df.empty or "volume" not in feat_df.columns:
+        return feat_df
+    v = pd.to_numeric(feat_df["volume"], errors="coerce")
+    return feat_df[v > 0].reset_index(drop=True)
 
 
 def _industry_from_hist_last_bar(hist: pd.DataFrame) -> str:
@@ -375,6 +386,9 @@ def _fetch_one_stock_features(
     hist = fetch_daily_hist(code, start_date=start_compact, timeout=timeout)
     if not has_enough_history(hist):
         return None
+    last_vol = float(pd.to_numeric(hist.iloc[-1]["volume"], errors="coerce") or 0.0)
+    if not np.isfinite(last_vol) or last_vol <= 0:
+        return None
     code6 = str(code).strip().zfill(6)
     mc = (mcap_by_code or {}).get(code6)
     if mc is not None and np.isfinite(mc) and mc > 0:
@@ -413,6 +427,7 @@ def _fetch_one_stock_features(
     vma5 = vol_s.rolling(5).mean()
     li = len(hist) - 1
     row["volume_ratio_raw"] = float(vol_s.iloc[li] / (float(vma5.iloc[li]) + 1e-12))
+    row["volume"] = float(vol_s.iloc[li])
     return row
 
 
@@ -506,6 +521,11 @@ def predict_universe_scores(
     feat_df = feat_df.loc[tb == as_of].reset_index(drop=True)
     if feat_df.empty:
         raise RuntimeError("过滤到统一交易日后样本为空。")
+
+    feat_df = prune_zero_volume_rows(feat_df)
+    feat_df = feat_df.drop(columns=["volume"], errors="ignore")
+    if feat_df.empty:
+        raise RuntimeError("剔除停牌或锚定日零成交量标的后样本为空。")
 
     # 与 train_model / run_daily 一致：按「date」分组做截面清洗（业内 MAD+Z + 分位秩）
     feat_df["date"] = feat_df["trade_date"]
@@ -708,15 +728,23 @@ def _reference_score_percentile(blended: float) -> tuple[float | None, str | Non
         return None, None
 
 
-def diagnose_single_stock(stock_code_raw: str) -> tuple[dict[str, Any] | None, str, str]:
+def diagnose_single_stock(
+    stock_code_raw: str,
+    end_date: str | None = None,
+) -> tuple[dict[str, Any] | None, str, str]:
     """
     单股智能诊断：本地 K 线 + 量价因子 + LGB/XGB 融合得分；经验阈值见 config.json；
     与全市场选股共用 ``QUANT_PREV_GAIN_SUPPRESSION``、``QUANT_MAX_5D_RETURN``、
     ``QUANT_MAX_20D_MOMENTUM`` 做近 5 日/10 日动量硬提示。
 
+    ``end_date``：诊断截止日 YYYY-MM-DD（含），仅使用 ``date <= end_date`` 的 K 线；
+    未传时默认取当前日历日，与 ``fetch_stock_daily_bars_until`` 的截面对齐。
+
     返回 ``(result_dict, conclusion_text, theme)``；``theme`` 为
     ``error`` | ``warning`` | ``success`` | ``info``，供 Streamlit 选择展示样式。
     """
+    from datetime import datetime
+
     from .kline_chart import lookup_stock_display_name
 
     code6 = normalize_advisor_stock_code(stock_code_raw)
@@ -727,17 +755,28 @@ def diagnose_single_stock(stock_code_raw: str) -> tuple[dict[str, Any] | None, s
             "error",
         )
 
+    anchor = str(end_date).strip()[:10] if end_date and str(end_date).strip() else ""
+    if not anchor:
+        anchor = datetime.now().strftime("%Y-%m-%d")
+
     init_db()
-    end_anchor = get_last_trading_date()
     try:
-        df_hist = fetch_stock_daily_bars_until(code6, end_anchor)
+        df_hist = fetch_stock_daily_bars_until(code6, anchor)
     except Exception as exc:
         return None, f"读取本地 K 线失败：{exc}", "error"
 
     if df_hist is None or df_hist.empty or len(df_hist) < MIN_HISTORY_BARS:
         return (
             None,
-            f"未找到 {code6} 的足够本地日线（需 ≥{MIN_HISTORY_BARS} 根），请先运行行情同步脚本。",
+            f"未找到 {code6} 在 {anchor} 及以前的足够本地日线（需 ≥{MIN_HISTORY_BARS} 根），请先同步行情。",
+            "warning",
+        )
+
+    last_vol = float(pd.to_numeric(df_hist.iloc[-1]["volume"], errors="coerce") or 0.0)
+    if not np.isfinite(last_vol) or last_vol <= 0:
+        return (
+            None,
+            f"{code6} 在锚定日 {anchor} 成交量为 0（停牌或无量），无法作为可操作诊断样本。",
             "warning",
         )
 
@@ -883,6 +922,7 @@ def diagnose_single_stock(stock_code_raw: str) -> tuple[dict[str, Any] | None, s
     result: dict[str, Any] = {
         "stock_code": code6,
         "stock_name": stock_name,
+        "anchor_date": anchor,
         "trade_date": td,
         "price": close_price,
         "mcap_bn": mcap_bn,
