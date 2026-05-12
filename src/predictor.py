@@ -21,6 +21,7 @@ from .config import (
     NEAR_LIMIT_PCT_THRESHOLD,
     PREDICT_FETCH_WORKERS,
     TOP_N_SELECTION,
+    get_experience_thresholds,
 )
 from .data_fetcher import (
     compact_start_calendar_days_ago,
@@ -213,6 +214,98 @@ def filter_st_stocks(df: pd.DataFrame) -> pd.DataFrame:
     return df[~hit].reset_index(drop=True)
 
 
+def apply_experience_trading_filters(scores_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    交易员经验硬过滤：在取 Top N 前按价格、总市值（亿元）、换手（或量比代理）裁剪。
+    各阈值为 ``None`` 时不启用该项；``mcap`` 为 NaN 时不因市值上下限丢行。
+    阈值优先来自 ``config.json`` → ``experience_filters``，见 ``get_experience_thresholds``。
+    """
+    if scores_df is None or scores_df.empty:
+        return scores_df
+    (
+        min_price,
+        max_price,
+        min_mcap,
+        max_mcap,
+        min_turnover,
+        max_turnover,
+    ) = get_experience_thresholds()
+    if all(
+        v is None
+        for v in (
+            min_price,
+            max_price,
+            min_mcap,
+            max_mcap,
+            min_turnover,
+            max_turnover,
+        )
+    ):
+        return scores_df
+    filtered_df = scores_df.copy()
+    n0 = len(filtered_df)
+    try:
+        if "close_price" in filtered_df.columns:
+            if min_price is not None:
+                cp = pd.to_numeric(filtered_df["close_price"], errors="coerce")
+                filtered_df = filtered_df[cp >= float(min_price)]
+            if max_price is not None and len(filtered_df) > 0:
+                cp = pd.to_numeric(filtered_df["close_price"], errors="coerce")
+                filtered_df = filtered_df[cp <= float(max_price)]
+
+        if "mcap" in filtered_df.columns and (
+            min_mcap is not None or max_mcap is not None
+        ):
+            m_bn = pd.to_numeric(filtered_df["mcap"], errors="coerce") / 1e8
+            if min_mcap is not None:
+                filtered_df = filtered_df[m_bn.isna() | (m_bn >= float(min_mcap))]
+                m_bn = pd.to_numeric(filtered_df["mcap"], errors="coerce") / 1e8
+            if max_mcap is not None and len(filtered_df) > 0:
+                filtered_df = filtered_df[m_bn.isna() | (m_bn <= float(max_mcap))]
+
+        if (min_turnover is not None or max_turnover is not None) and len(
+            filtered_df
+        ) > 0:
+            if "turnover_rate" in filtered_df.columns:
+                tr = pd.to_numeric(filtered_df["turnover_rate"], errors="coerce")
+                if min_turnover is not None:
+                    filtered_df = filtered_df[tr >= float(min_turnover)]
+                    tr = pd.to_numeric(filtered_df["turnover_rate"], errors="coerce")
+                if max_turnover is not None and len(filtered_df) > 0:
+                    filtered_df = filtered_df[tr <= float(max_turnover)]
+            elif "volume_ratio_raw" in filtered_df.columns:
+                vr = pd.to_numeric(filtered_df["volume_ratio_raw"], errors="coerce")
+                if min_turnover is not None:
+                    filtered_df = filtered_df[vr >= (float(min_turnover) / 2.0)]
+                    vr = pd.to_numeric(
+                        filtered_df["volume_ratio_raw"], errors="coerce"
+                    )
+                if max_turnover is not None and len(filtered_df) > 0:
+                    filtered_df = filtered_df[vr <= (float(max_turnover) / 2.0)]
+            elif "factor_volume_ratio" in filtered_df.columns:
+                vr = pd.to_numeric(filtered_df["factor_volume_ratio"], errors="coerce")
+                if min_turnover is not None:
+                    filtered_df = filtered_df[vr >= (float(min_turnover) / 2.0)]
+                    vr = pd.to_numeric(
+                        filtered_df["factor_volume_ratio"], errors="coerce"
+                    )
+                if max_turnover is not None and len(filtered_df) > 0:
+                    filtered_df = filtered_df[vr <= (float(max_turnover) / 2.0)]
+
+        n1 = len(filtered_df)
+        print(
+            "[经验风控] 已按阈值裁剪："
+            f"价格[{min_price}-{max_price}] 元，"
+            f"市值[{min_mcap}-{max_mcap}] 亿元，"
+            f"换手/量比代理[{min_turnover}-{max_turnover}]% → {n0} → {n1} 只",
+            flush=True,
+        )
+        return filtered_df.reset_index(drop=True)
+    except Exception as exc:
+        print(f"[警告] 执行交易员经验条件过滤失败: {exc}", flush=True)
+        return scores_df
+
+
 def filter_predictions(scores_df: pd.DataFrame) -> pd.DataFrame:
     """
     过滤打分结果：剔除 ST；可选剔除上一交易日接近涨跌停。
@@ -309,6 +402,15 @@ def _fetch_one_stock_features(
         row["pct_prev_day"] = (c1 / c0 - 1.0) if c0 > 1e-12 else float("nan")
     else:
         row["pct_prev_day"] = float("nan")
+
+    if mc is not None and np.isfinite(mc) and mc > 0:
+        row["mcap"] = float(mc)
+    else:
+        row["mcap"] = float("nan")
+    vol_s = hist["volume"].astype(float)
+    vma5 = vol_s.rolling(5).mean()
+    li = len(hist) - 1
+    row["volume_ratio_raw"] = float(vol_s.iloc[li] / (float(vma5.iloc[li]) + 1e-12))
     return row
 
 
@@ -428,7 +530,8 @@ def predict_universe_scores(
         ["score", "stock_code"],
         ascending=[False, True],
     ).reset_index(drop=True)
-    cols = ["trade_date", "stock_code", "stock_name", "score", "close_price"]
+    meta_keep = [c for c in ("mcap", "volume_ratio_raw") if c in feat_df.columns]
+    cols = ["trade_date", "stock_code", "stock_name", "score", "close_price"] + meta_keep
     out = feat_df[cols + FEATURE_COLUMNS].copy()
     return as_of, out
 
@@ -463,6 +566,13 @@ def persist_predictions(
     if scores_df.empty:
         raise RuntimeError("写入前过滤结果为空，无法保存预测与选股。")
     scores_df = scores_df.sort_values("score", ascending=False).reset_index(drop=True)
+    scores_df = apply_experience_trading_filters(scores_df)
+    if scores_df.empty:
+        raise RuntimeError(
+            "经验风控过滤后无剩余股票，请在 config.json 的 experience_filters 放宽阈值，"
+            "或在 Streamlit「任务 C」展开面板中调整。"
+        )
+    scores_df = scores_df.reset_index(drop=True)
     scores_df["rank_in_market"] = np.arange(1, len(scores_df) + 1)
     lgb_model = load_model()
     imp_vec = feature_importances_aligned(lgb_model)

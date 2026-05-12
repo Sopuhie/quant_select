@@ -51,6 +51,23 @@ from src.kline_chart import (
 # 若设置 QUANT_TRAIN_END_DATE=YYYY-MM-DD，面板训练将仅使用该日及以前的本地 K 线；不设则使用库内全部日期。
 _QUANT_TRAIN_END_DATE_ENV = os.environ.get("QUANT_TRAIN_END_DATE", "").strip()
 
+
+def _experience_filter_display_str(ef: dict, key: str) -> str:
+    v = ef.get(key)
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v).strip()
+    return s
+
+
+def _parse_experience_filter_text(s: object) -> float | None:
+    t = str(s).strip() if s is not None else ""
+    if not t:
+        return None
+    return float(t)
+
 # ================= 1. 全局页面配置 =================
 st.set_page_config(
     page_title="A-Quant Lite 控制台",
@@ -1370,7 +1387,7 @@ with tab_data:
             """
             <div style="background-color: rgba(30, 34, 51, 0.4); border: 1px solid rgba(255,255,255,0.05); padding: 18px; border-radius: 8px;">
                 <h4 style="color: #00FFCC; margin-top:0;">📡 任务 C：执行每日智能选股</h4>
-                <p style="font-size: 0.85rem; color: #8f9cae;">K 线与因子计算均基于本地 stock_daily_kline；截面清洗与 LightGBM 打分后产出 Top 推荐。股票池默认取库内有足够历史的代码；需要成分池时可命令行加 --online-pool。</p>
+                <p style="font-size: 0.85rem; color: #8f9cae;">K 线与因子计算均基于本地 stock_daily_kline；截面清洗与 LightGBM 打分后产出 Top 推荐。股票池默认取库内有足够历史的代码；需要成分池时可命令行加 --online-pool。可在下方「经验风控阈值」中设置价格/市值/换手硬过滤（写入 config.json，子进程 run_daily 自动读取）。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1391,11 +1408,102 @@ with tab_data:
                 value=True,
                 help="未勾选时，选股池将排除代码以 688 开头的股票",
             )
+
+        config_manager.reload()
+        _ef_ui = dict(config_manager.config.get("experience_filters") or {})
+        with st.expander(
+            "⚙️ 经验风控阈值（打分后、取 Top 前硬过滤；留空表示不限制）",
+            expanded=False,
+        ):
+            st.caption(
+                "单位：价格为元，市值为亿元，换手为百分比（%）。"
+                "无日线换手率列时用量比代理，与控制台日志说明一致。"
+                "点击「运行每日预测」时会先写入项目根目录 config.json，再启动子进程。"
+            )
+            _ec1, _ec2, _ec3 = st.columns(3)
+            with _ec1:
+                st.text_input(
+                    "最低价 (元)",
+                    value=_experience_filter_display_str(_ef_ui, "min_price"),
+                    key="task_c_ef_min_price",
+                )
+                st.text_input(
+                    "最低市值 (亿元)",
+                    value=_experience_filter_display_str(_ef_ui, "min_mcap"),
+                    key="task_c_ef_min_mcap",
+                )
+                st.text_input(
+                    "最低换手 (%)",
+                    value=_experience_filter_display_str(_ef_ui, "min_turnover"),
+                    key="task_c_ef_min_turnover",
+                )
+            with _ec2:
+                st.text_input(
+                    "最高价 (元)",
+                    value=_experience_filter_display_str(_ef_ui, "max_price"),
+                    key="task_c_ef_max_price",
+                )
+                st.text_input(
+                    "最高市值 (亿元)",
+                    value=_experience_filter_display_str(_ef_ui, "max_mcap"),
+                    key="task_c_ef_max_mcap",
+                )
+                st.text_input(
+                    "最高换手 (%)",
+                    value=_experience_filter_display_str(_ef_ui, "max_turnover"),
+                    key="task_c_ef_max_turnover",
+                )
+            with _ec3:
+                st.markdown(
+                    "<p style='font-size:0.82rem;color:#8f9cae;margin-top:0.2rem;'>"
+                    "也可直接编辑 <code>config.json</code> 中 <code>experience_filters</code>；"
+                    "代码级默认见 <code>src/config.py</code> 中 MIN_PRICE 等（仅当 JSON 未写该键时生效）。"
+                    "</p>",
+                    unsafe_allow_html=True,
+                )
+
         predict_btn = st.button(
             "🚀 运行每日预测", key="run_predict", use_container_width=True
         )
         if predict_btn:
             with st.spinner("提取全市场实时因子，进行 LightGBM 测算中..."):
+                save_ok = False
+                try:
+                    config_manager.config.setdefault(
+                        "notification",
+                        {"send_on_success": True, "send_on_error": True},
+                    )
+                    config_manager.config["experience_filters"] = {
+                        "min_price": _parse_experience_filter_text(
+                            st.session_state.get("task_c_ef_min_price", "")
+                        ),
+                        "max_price": _parse_experience_filter_text(
+                            st.session_state.get("task_c_ef_max_price", "")
+                        ),
+                        "min_mcap": _parse_experience_filter_text(
+                            st.session_state.get("task_c_ef_min_mcap", "")
+                        ),
+                        "max_mcap": _parse_experience_filter_text(
+                            st.session_state.get("task_c_ef_max_mcap", "")
+                        ),
+                        "min_turnover": _parse_experience_filter_text(
+                            st.session_state.get("task_c_ef_min_turnover", "")
+                        ),
+                        "max_turnover": _parse_experience_filter_text(
+                            st.session_state.get("task_c_ef_max_turnover", "")
+                        ),
+                    }
+                    save_ok = bool(config_manager.save_config())
+                    if save_ok:
+                        config_manager.reload()
+                    else:
+                        st.error("❌ 保存经验风控配置到 config.json 失败，未启动选股。")
+                except ValueError as exc:
+                    st.error(f"❌ 经验风控参数须为数字或留空：{exc}")
+
+                if not save_ok:
+                    st.stop()
+
                 cmd = [sys.executable, str(ROOT / "run_daily.py")]
                 if include_300:
                     cmd.append("--include-300")

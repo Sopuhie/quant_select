@@ -60,6 +60,14 @@ class ConfigManager:
                 "send_on_success": True,
                 "send_on_error": True,
             },
+            "experience_filters": {
+                "min_price": None,
+                "max_price": None,
+                "min_mcap": None,
+                "max_mcap": None,
+                "min_turnover": None,
+                "max_turnover": None,
+            },
         }
 
     def save_config(self) -> bool:

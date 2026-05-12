@@ -57,6 +57,7 @@ from src.factor_calculator import (
 from src.model_trainer import load_model, load_xgb_ranker_optional
 from src.predictor import (
     analyze_stock_reasons,
+    apply_experience_trading_filters,
     blend_ranker_scores,
     feature_importances_aligned,
     filter_predictions,
@@ -174,6 +175,21 @@ def _fetch_one_predict_row(
     else:
         row_dict["industry"] = normalize_industry_label(None)
     row_dict["close_price"] = float(df_today.iloc[last_idx]["close"])
+
+    vol_s = df_today["volume"].astype(float)
+    vma5 = vol_s.rolling(5).mean()
+    row_dict["volume_ratio_raw"] = float(
+        vol_s.iloc[last_idx] / (float(vma5.iloc[last_idx]) + 1e-12)
+    )
+    if "market_cap" in df_today.columns:
+        mc_raw = df_today.iloc[last_idx].get("market_cap")
+        try:
+            mc_f = float(mc_raw) if mc_raw is not None else float("nan")
+        except (TypeError, ValueError):
+            mc_f = float("nan")
+        row_dict["mcap"] = mc_f if np.isfinite(mc_f) and mc_f > 0 else float("nan")
+    else:
+        row_dict["mcap"] = float("nan")
 
     if len(df_today) >= 2:
         c_prev = float(df_today.iloc[-2]["close"])
@@ -397,6 +413,15 @@ def predict_daily(
         ["score", "stock_code"],
         ascending=[False, True],
     ).reset_index(drop=True)
+
+    filtered_df = apply_experience_trading_filters(filtered_df)
+    if filtered_df.empty:
+        print(
+            "警告: 经验风控过滤后没有剩余的候选股票，请在 config.json 的 experience_filters 放宽阈值，"
+            "或在 Streamlit「任务 C」展开面板中调整。"
+        )
+        sys.exit(1)
+
     filtered_df["rank_in_market"] = range(1, len(filtered_df) + 1)
 
     # 清理当天旧数据，防止重复写入

@@ -130,3 +130,69 @@ FEATURE_COLUMNS = [
     "factor_volatility_20d",  # 20日波动
     "factor_close_position",  # 收盘位置（资金承接代理）
 ]
+
+# --- 交易员经验硬过滤参数 (留空或为 None 时代表不限制) ---
+# 1. 价格范围 (单位: 元)
+MIN_PRICE = None  # 例如: 5.0
+MAX_PRICE = None  # 例如: 100.0
+
+# 2. 流通市值范围 (单位: 亿元；与库内 mcap 元字段对齐时除以 1e8)
+MIN_MCAP = None  # 例如: 30.0 (低于30亿的微盘股不要)
+MAX_MCAP = None  # 例如: 500.0 (大于500亿的巨无霸不要)
+
+# 3. 股票热度范围（以今日换手率 % 为代理指标；无换手列时用 volume_ratio_raw 近似，阈值同文档除以 2）
+MIN_TURNOVER = None  # 例如: 1.5 (过滤掉无人关注的僵尸股)
+MAX_TURNOVER = None  # 例如: 15.0 (过滤掉短期极度亢奋、换手过热的筹码松动股)
+
+
+def get_experience_thresholds() -> tuple[
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+]:
+    """
+    经验硬过滤阈值：优先读取项目根目录 ``config.json`` 中 ``experience_filters``
+    （由 Streamlit「任务 C」面板写入）；缺省或解析失败时退回本模块上述常量。
+    """
+    mp, Mxp, mm, Mxm, mt, Mxt = (
+        MIN_PRICE,
+        MAX_PRICE,
+        MIN_MCAP,
+        MAX_MCAP,
+        MIN_TURNOVER,
+        MAX_TURNOVER,
+    )
+    try:
+        from .config_manager import config_manager
+
+        config_manager.reload()
+        raw = config_manager.config.get("experience_filters")
+        if not isinstance(raw, dict):
+            return (mp, Mxp, mm, Mxm, mt, Mxt)
+
+        def _pick(key: str, cur: float | None) -> float | None:
+            if key not in raw:
+                return cur
+            v = raw[key]
+            if v is None:
+                return None
+            if isinstance(v, str) and not str(v).strip():
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return cur
+
+        return (
+            _pick("min_price", mp),
+            _pick("max_price", Mxp),
+            _pick("min_mcap", mm),
+            _pick("max_mcap", Mxm),
+            _pick("min_turnover", mt),
+            _pick("max_turnover", Mxt),
+        )
+    except Exception:
+        return (mp, Mxp, mm, Mxm, mt, Mxt)
