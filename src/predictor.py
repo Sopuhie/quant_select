@@ -11,12 +11,10 @@ import pandas as pd
 
 from .config import (
     AKSHARE_REQUEST_TIMEOUT,
-    ENABLE_PREV_GAIN_SUPPRESSION,
     EXCLUDE_NEAR_LIMIT_LAST_BAR,
     EXCLUDE_ST,
     FEATURE_COLUMNS,
-    MAX_ALLOWED_20D_RETURN,
-    MAX_ALLOWED_5D_RETURN,
+    MIN_HISTORY_BARS,
     MODEL_PATH,
     NEAR_LIMIT_PCT_THRESHOLD,
     PREDICT_FETCH_WORKERS,
@@ -31,12 +29,13 @@ from .data_fetcher import (
     has_enough_history,
 )
 from .database import (
+    delete_daily_outputs_for_trade_date,
     fetch_latest_industry_by_codes,
     fetch_latest_market_cap_by_codes,
+    fetch_stock_daily_bars_until,
     get_active_model_version,
     init_db,
     insert_daily_predictions,
-    delete_daily_outputs_for_trade_date,
     insert_daily_selections,
     selection_exists_for_date,
 )
@@ -46,38 +45,7 @@ from .factor_calculator import (
     normalize_industry_label,
 )
 from .model_trainer import load_model, load_xgb_ranker_optional
-from .utils import is_kline_too_stale_vs_prediction
-
-
-def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    在 ``clean_cross_sectional_features`` 之前执行：按**原始** ``factor_return_5d``、
-    ``factor_momentum_10d`` 剔除短期涨幅透支标的（清洗后该列已非收益率，不可再比阈值）。
-    """
-    if feat_df is None or len(feat_df) == 0:
-        return feat_df
-    try:
-        if not ENABLE_PREV_GAIN_SUPPRESSION:
-            return feat_df
-        out = feat_df.copy()
-        n0 = len(out)
-        if "factor_return_5d" in out.columns:
-            r5 = pd.to_numeric(out["factor_return_5d"], errors="coerce")
-            out = out[r5 <= float(MAX_ALLOWED_5D_RETURN)]
-        if "factor_momentum_10d" in out.columns and len(out) > 0:
-            m10 = pd.to_numeric(out["factor_momentum_10d"], errors="coerce")
-            out = out[m10 <= float(MAX_ALLOWED_20D_RETURN)]
-        if len(out) < n0:
-            print(
-                "[风控增强] 已强行剔除过去5日涨幅过大或中线动量过高的高位超买股 "
-                f"（5日上限 {MAX_ALLOWED_5D_RETURN * 100:.1f}%，动量上限 {MAX_ALLOWED_20D_RETURN * 100:.1f}%），"
-                f"共剔除 {n0 - len(out)} 只。",
-                flush=True,
-            )
-        return out.reset_index(drop=True)
-    except Exception as exc:
-        print(f"[警告] 前期涨幅压制阀门执行异常: {exc}", flush=True)
-        return feat_df
+from .utils import get_last_trading_date, is_kline_too_stale_vs_prediction
 
 
 def feature_importances_aligned(model: Any) -> list[float]:
@@ -507,12 +475,6 @@ def predict_universe_scores(
 
     # 与 train_model / run_daily 一致：按「date」分组做截面清洗（业内 MAD+Z + 分位秩）
     feat_df["date"] = feat_df["trade_date"]
-    feat_df = suppress_high_recent_gains(feat_df)
-    if feat_df.empty:
-        raise RuntimeError(
-            "前期涨幅压制后无剩余候选股票，可设置 QUANT_PREV_GAIN_SUPPRESSION=0 关闭，"
-            "或放宽 QUANT_MAX_5D_RETURN / QUANT_MAX_20D_MOMENTUM。"
-        )
     feat_df = clean_cross_sectional_features(feat_df)
     feat_df = feat_df.drop(columns=["date"], errors="ignore")
 
@@ -655,3 +617,207 @@ def backfill_selection_returns(
     _ = max_stocks
     out = update_all_returns()
     return int(out.get("rows_updated", 0))
+
+
+def normalize_advisor_stock_code(raw: str) -> str:
+    """将 ``600519.SH``、``000001.SZ`` 等规范为 6 位数字代码。"""
+    s = str(raw).strip().upper()
+    for suf in (".XSHE", ".XSHG"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    if "." in s:
+        s = s.split(".", 1)[0]
+    digits = "".join(c for c in s if c.isdigit())
+    if len(digits) >= 6:
+        return digits[-6:].zfill(6)
+    if digits:
+        return digits.zfill(6)[-6:]
+    return ""
+
+
+def _reference_score_percentile(blended: float) -> tuple[float | None, str | None]:
+    """
+    用 ``daily_predictions`` 最近一交易日的全市场得分，估计 ``blended`` 的截面分位 [0,1]。
+    值越大表示当日得分不低于该股的标的占比越高（相对越强）。
+    """
+    try:
+        from .database import get_connection
+
+        with get_connection() as conn:
+            mx = conn.execute("SELECT MAX(trade_date) FROM daily_predictions").fetchone()
+            if not mx or mx[0] is None:
+                return None, None
+            td = str(mx[0]).strip()[:10]
+            cur = conn.execute(
+                """
+                SELECT score FROM daily_predictions
+                WHERE trade_date = ? AND score IS NOT NULL
+                """,
+                (td,),
+            )
+            rows = [
+                float(r[0])
+                for r in cur.fetchall()
+                if r[0] is not None and np.isfinite(float(r[0]))
+            ]
+        if len(rows) < 15:
+            return None, td
+        arr = np.asarray(rows, dtype=float)
+        return float((arr <= float(blended)).mean()), td
+    except Exception:
+        return None, None
+
+
+def diagnose_single_stock(stock_code_raw: str) -> tuple[dict[str, Any] | None, str, str]:
+    """
+    单股智能诊断：本地 K 线 + 量价因子 + 经验阈值 + LGB/XGB 融合得分 + 可执行结论。
+
+    返回 ``(result_dict, conclusion_text, theme)``；``theme`` 为
+    ``error`` | ``warning`` | ``success`` | ``info``，供 Streamlit 选择展示样式。
+    """
+    from .kline_chart import lookup_stock_display_name
+
+    code6 = normalize_advisor_stock_code(stock_code_raw)
+    if len(code6) != 6 or not code6.isdigit():
+        return (
+            None,
+            f"股票代码格式无效：{stock_code_raw!r}，请输入 6 位数字或带交易所后缀（如 600519.SH）。",
+            "error",
+        )
+
+    init_db()
+    end_anchor = get_last_trading_date()
+    try:
+        df_hist = fetch_stock_daily_bars_until(code6, end_anchor)
+    except Exception as exc:
+        return None, f"读取本地 K 线失败：{exc}", "error"
+
+    if df_hist is None or df_hist.empty or len(df_hist) < MIN_HISTORY_BARS:
+        return (
+            None,
+            f"未找到 {code6} 的足够本地日线（需 ≥{MIN_HISTORY_BARS} 根），请先运行行情同步脚本。",
+            "warning",
+        )
+
+    factors = compute_factors_for_history(df_hist)
+    if factors.empty:
+        return None, "因子计算结果为空。", "error"
+
+    last_i = len(df_hist) - 1
+    td = str(df_hist.iloc[last_i]["date"]).strip()[:10]
+    last_row = factors.iloc[last_i]
+    if last_row[list(FEATURE_COLUMNS)].isna().any():
+        return None, "最新一日因子存在缺失，无法诊断。", "warning"
+
+    close_price = float(df_hist.iloc[last_i]["close"])
+    mc_raw = df_hist.iloc[last_i].get("market_cap")
+    try:
+        mc_yuan = float(mc_raw) if mc_raw is not None and pd.notna(mc_raw) else float("nan")
+    except (TypeError, ValueError):
+        mc_yuan = float("nan")
+    mcap_bn = mc_yuan / 1e8 if np.isfinite(mc_yuan) and mc_yuan > 0 else float("nan")
+
+    vol_s = df_hist["volume"].astype(float)
+    vma5 = vol_s.rolling(5).mean()
+    volume_ratio_raw = float(vol_s.iloc[last_i] / (float(vma5.iloc[last_i]) + 1e-12))
+
+    feat_map = {c: float(last_row[c]) for c in FEATURE_COLUMNS}
+
+    violated: list[str] = []
+    min_p, max_p, min_mc, max_mc, min_to, max_to = get_experience_thresholds()
+    if min_p is not None and close_price < float(min_p):
+        violated.append(f"收盘价 {close_price:.2f} 元低于经验下限 {float(min_p):.2f} 元")
+    if max_p is not None and close_price > float(max_p):
+        violated.append(f"收盘价 {close_price:.2f} 元高于经验上限 {float(max_p):.2f} 元")
+    if min_mc is not None and np.isfinite(mcap_bn) and mcap_bn < float(min_mc):
+        violated.append(
+            f"总市值约 {mcap_bn:.2f} 亿元，低于经验下限 {float(min_mc):.2f} 亿元"
+        )
+    if max_mc is not None and np.isfinite(mcap_bn) and mcap_bn > float(max_mc):
+        violated.append(
+            f"总市值约 {mcap_bn:.2f} 亿元，高于经验上限 {float(max_mc):.2f} 亿元"
+        )
+    if min_to is not None and volume_ratio_raw < float(min_to) / 2.0:
+        violated.append(
+            f"量比代理 {volume_ratio_raw:.2f} 低于经验换手下限对应阈值（{float(min_to):.1f}%→量比≥{float(min_to)/2:.2f}）"
+        )
+    if max_to is not None and volume_ratio_raw > float(max_to) / 2.0:
+        violated.append(
+            f"量比代理 {volume_ratio_raw:.2f} 高于经验换手上限对应阈值（{float(max_to):.1f}%→量比≤{float(max_to)/2:.2f}）"
+        )
+
+    try:
+        lgb_model = load_model()
+    except Exception as exc:
+        return None, f"无法加载模型：{exc}", "error"
+
+    xgb_model = load_xgb_ranker_optional()
+    X = pd.DataFrame([[feat_map[c] for c in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
+    lgb_scores = lgb_model.predict(X)
+    xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
+    blended = float(np.asarray(blend_ranker_scores(lgb_scores, xgb_scores), dtype=float).ravel()[0])
+
+    pct, ref_td = _reference_score_percentile(blended)
+    stock_name = lookup_stock_display_name(code6)
+
+    if violated:
+        bullets = "\n".join(f"- {x}" for x in violated)
+        conclusion = (
+            "🚨 【强风险警告：建议卖出/避险】\n"
+            "该标的未通过硬性风控审查：\n"
+            f"{bullets}\n\n"
+            "建议控制仓位，防范高位透支、流动性或过热换手等风险。"
+        )
+        theme = "error"
+    elif pct is not None and pct >= 0.72:
+        conclusion = (
+            "🟢 【相对强势：可考虑持有或择机介入】\n"
+            f"融合模型得分在最新截面（{ref_td}）中处于较高分位（约 {pct * 100:.0f}% 的标的得分不高于该股），"
+            f"且未触发经验硬过滤。原始融合分 {blended:.6f} 仅供参考。"
+        )
+        theme = "success"
+    elif pct is not None and pct <= 0.35:
+        conclusion = (
+            "🟡 【相对偏弱：建议谨慎或逢高减仓】\n"
+            f"融合得分在截面（{ref_td}）中偏低（约 {pct * 100:.0f}% 分位），"
+            "量价信号性价比一般；未触犯硬过滤但仍建议控制仓位。"
+        )
+        theme = "warning"
+    else:
+        if pct is not None:
+            conclusion = (
+                "🔵 【中性蓄势：建议观望或维持轻仓】\n"
+                f"截面分位约 {pct * 100:.0f}%（参考日 {ref_td}），"
+                f"融合分 {blended:.6f}；未触发硬过滤，可等待更明确放量或趋势信号。"
+            )
+        else:
+            conclusion = (
+                "🔵 【中性参考】\n"
+                f"融合模型得分 {blended:.6f}。"
+                "当前缺少足够「全市场同日预测」样本，无法计算截面排名分位；"
+                "请先运行每日选股以生成 daily_predictions 后再看分位解读。"
+            )
+        theme = "info"
+
+    imp_vec = feature_importances_aligned(lgb_model)
+    reason_line = analyze_stock_reasons(
+        {**feat_map, "stock_code": code6, "stock_name": stock_name},
+        imp_vec,
+        FEATURE_COLUMNS,
+    )
+
+    result: dict[str, Any] = {
+        "stock_code": code6,
+        "stock_name": stock_name,
+        "trade_date": td,
+        "price": close_price,
+        "mcap_bn": mcap_bn,
+        "score": blended,
+        "score_percentile": pct,
+        "score_percentile_ref_date": ref_td,
+        "volume_ratio_raw": volume_ratio_raw,
+        "violated": violated,
+        "features": feat_map,
+        "reason_line": reason_line,
+    }
+    return result, conclusion, theme

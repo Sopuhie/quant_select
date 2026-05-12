@@ -47,6 +47,7 @@ from src.kline_chart import (
     get_stock_kline_data,
     lookup_stock_display_name,
 )
+from src.predictor import diagnose_single_stock
 
 # 若设置 QUANT_TRAIN_END_DATE=YYYY-MM-DD，面板训练将仅使用该日及以前的本地 K 线；不设则使用库内全部日期。
 _QUANT_TRAIN_END_DATE_ENV = os.environ.get("QUANT_TRAIN_END_DATE", "").strip()
@@ -385,6 +386,7 @@ def _pattern_range_from_plotly_state(
 # ================= 6. 选项卡定义 =================
 (
     tab_today,
+    tab_advisor,
     tab_hist,
     tab_match,
     tab_backtest,
@@ -395,6 +397,7 @@ def _pattern_range_from_plotly_state(
 ) = st.tabs(
     [
         "🎯 今日推荐",
+        "🔬 智能诊股",
         "📜 历史与股票K线查询",
         "🎨 视觉图形选股",
         "📈 历史回测",
@@ -539,6 +542,84 @@ with tab_today:
                         )
                 else:
                     st.error("绘制K线图失败")
+
+# ----------------- TAB: 智能诊股与持仓决策 -----------------
+with tab_advisor:
+    st.markdown("### 🎯 A-Quant Lite 个股全维度智能诊断")
+    st.caption(
+        "输入 6 位代码或带交易所后缀；基于本地 stock_daily_kline、"
+        "与全市场选股相同的 14 个量价因子及 LGB/XGB 融合打分；"
+        "审计 config.json 中的经验风控阈值。"
+        "单股未做当日全截面 MAD/行业中性化，与训练日截面处理存在差异；"
+        "得分分位依赖最近一次「每日选股」写入的 daily_predictions。"
+    )
+    col_in1, col_in2 = st.columns([3, 1])
+    with col_in1:
+        advisor_code = st.text_input(
+            "股票代码",
+            value="",
+            placeholder="例如 600519 或 600519.SH",
+            key="advisor_stock_code_input",
+        )
+    with col_in2:
+        diag_btn = st.button(
+            "🔍 一键全维诊断",
+            use_container_width=True,
+            key="advisor_run_btn",
+        )
+
+    if diag_btn and str(advisor_code).strip():
+        with st.spinner("正在计算因子、比对风控并执行模型打分..."):
+            res, conclusion, theme = diagnose_single_stock(advisor_code.strip())
+        if res is None:
+            if theme == "error":
+                st.error(conclusion)
+            else:
+                st.warning(conclusion)
+        else:
+            st.markdown("---")
+            title_name = res.get("stock_name") or ""
+            st.subheader(
+                f"📊 {res['stock_code']} {title_name} · 锚定日 {res.get('trade_date', '—')}"
+            )
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("最新收盘价", f"{float(res['price']):.2f} 元")
+            mbn = res.get("mcap_bn")
+            if isinstance(mbn, (int, float)) and pd.notna(mbn) and float(mbn) > 0:
+                c2.metric("总市值(亿元)", f"{float(mbn):.2f}")
+            else:
+                c2.metric("总市值(亿元)", "—")
+            c3.metric("AI 融合得分", f"{float(res['score']):.6f}")
+            pct = res.get("score_percentile")
+            refd = res.get("score_percentile_ref_date")
+            if isinstance(pct, (int, float)) and pd.notna(pct):
+                c4.metric(
+                    "截面相对分位",
+                    f"{float(pct) * 100:.0f}%",
+                    help=f"相对 daily_predictions 中 {refd} 当日全市场得分",
+                )
+            else:
+                c4.metric("截面相对分位", "—", help="请先运行每日选股生成截面数据")
+
+            if theme == "error":
+                st.error(conclusion)
+            elif theme == "success":
+                st.success(conclusion)
+            elif theme == "warning":
+                st.warning(conclusion)
+            else:
+                st.info(conclusion)
+
+            with st.expander("因子贡献解读（与入选理由同款逻辑）", expanded=False):
+                st.write(res.get("reason_line", ""))
+            with st.expander("14 项量价因子当前值", expanded=False):
+                fv = res.get("features") or {}
+                st.json({k: round(float(fv[k]), 6) for k in FEATURE_COLUMNS if k in fv})
+            vio = res.get("violated") or []
+            if vio:
+                with st.expander("已触发的硬过滤项", expanded=True):
+                    for line in vio:
+                        st.markdown(f"- {html.escape(str(line))}")
 
 # ----------------- TAB 2: 历史复盘与个股极速检索 -----------------
 with tab_hist:
