@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from .config import DB_PATH
+from .config import DB_PATH, ensure_eastmoney_no_proxy_if_configured
 from .data_fetcher import fetch_daily_hist
 from .database import upsert_stock_daily_klines
 from .utils import get_kline_incremental_end_trade_date
@@ -400,6 +400,7 @@ def get_realtime_min_data(stock_code: object) -> pd.DataFrame | None:
     """
     import akshare as ak  # 按需加载，避免仅画日 K 时拉起重依赖
 
+    ensure_eastmoney_no_proxy_if_configured()
     stock_code = str(stock_code).strip().zfill(6)
     today_str = datetime.now().strftime("%Y-%m-%d")
     start_s = f"{today_str} 09:25:00"

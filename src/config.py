@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -64,11 +65,17 @@ MAX_STOCKS_UNIVERSE = int(os.environ.get("QUANT_MAX_STOCKS", "400"))
 # AkShare HTTP 超时（秒）；超时或失败则跳过该股票，避免长时间卡死
 AKSHARE_REQUEST_TIMEOUT = float(os.environ.get("QUANT_AK_TIMEOUT", "30"))
 
-# 单次请求失败后的重试次数（网络抖动、接口短暂不可用）
-AKSHARE_FETCH_RETRIES = max(1, int(os.environ.get("QUANT_FETCH_RETRIES", "3")))
+# 单次请求失败后的重试次数（网络抖动、东方财富限流、连接被重置时可调大）
+AKSHARE_FETCH_RETRIES = max(1, int(os.environ.get("QUANT_FETCH_RETRIES", "5")))
 
-# 重试间隔基数（秒），实际休眠约 sleep * (attempt + 1)
+# 重试间隔基数（秒）；AkShare 指数退避时与 2^attempt 相乘，短区间请求时会再封顶
 AKSHARE_FETCH_RETRY_SLEEP = float(os.environ.get("QUANT_FETCH_RETRY_SLEEP", "0.8"))
+
+# 自然日跨度不超过该值时，**优先**用 Baostock 拉日线（增量多为 1～数日，可避免东财限流下 AkShare 多次长退避）。
+# 设为 0 关闭优先逻辑。全量拉多年历史时跨度大，仍走 AkShare 优先。
+BAOSTOCK_FIRST_IF_RANGE_DAYS = max(
+    0, int(os.environ.get("QUANT_BAOSTOCK_FIRST_IF_RANGE_DAYS", "45"))
+)
 
 # 每日选股拉 K 线：只取最近若干自然日的数据即可算满窗口因子，减轻接口压力
 PREDICT_HISTORY_CALENDAR_DAYS = int(os.environ.get("QUANT_PREDICT_LOOKBACK_DAYS", "800"))
@@ -76,12 +83,55 @@ PREDICT_HISTORY_CALENDAR_DAYS = int(os.environ.get("QUANT_PREDICT_LOOKBACK_DAYS"
 # 选股阶段并发线程数（过大易被东方财富/AkShare 限流，导致「零条有效 K 线」）
 PREDICT_FETCH_WORKERS = int(os.environ.get("QUANT_FETCH_WORKERS", "4"))
 
-# AkShare 全部失败时是否用 Baostock 串行兜底（需安装 baostock；非线程安全故全局锁串行）
-USE_BAOSTOCK_FALLBACK = os.environ.get("QUANT_BAOSTOCK_FALLBACK", "0") not in (
+# AkShare 全部失败时是否用 Baostock 串行兜底（需安装 baostock；非线程安全故全局锁串行）。
+# 另：AkShare 若因连接重置/超时等瞬时错误失败，即使本项为 0，``fetch_daily_hist`` 仍会尝试 Baostock 自动兜底。
+USE_BAOSTOCK_FALLBACK = os.environ.get("QUANT_BAOSTOCK_FALLBACK", "1") not in (
     "0",
     "false",
     "False",
 )
+
+# 本机若配置了失效的 HTTP(S)_PROXY，requests 访问东方财富会全部 ProxyError。
+# 默认将 eastmoney 相关域名并入 NO_PROXY / no_proxy，使该主机直连（仍走系统代理访问其他站点）。
+# 若必须通过公司代理访问东方财富，请设 ``QUANT_AKSHARE_BYPASS_PROXY_FOR_EASTMONEY=0``。
+AKSHARE_BYPASS_PROXY_FOR_EASTMONEY = os.environ.get(
+    "QUANT_AKSHARE_BYPASS_PROXY_FOR_EASTMONEY", "1"
+) not in ("0", "false", "False")
+
+_EASTMONEY_NO_PROXY_LOCK = threading.Lock()
+_EASTMONEY_NO_PROXY_APPLIED = False
+
+
+def ensure_eastmoney_no_proxy_if_configured() -> None:
+    """
+    将东方财富相关域名并入 ``NO_PROXY`` / ``no_proxy``，使 requests 访问该域不走系统代理。
+
+    本机若配置了失效的 ``HTTP_PROXY``/``HTTPS_PROXY``，默认会导致 AkShare 访问
+    ``push2his.eastmoney.com`` 等全部 ``ProxyError``。关闭本行为请设环境变量
+    ``QUANT_AKSHARE_BYPASS_PROXY_FOR_EASTMONEY=0``。
+    """
+    global _EASTMONEY_NO_PROXY_APPLIED
+    if not AKSHARE_BYPASS_PROXY_FOR_EASTMONEY:
+        return
+    with _EASTMONEY_NO_PROXY_LOCK:
+        if _EASTMONEY_NO_PROXY_APPLIED:
+            return
+        extra = (
+            "eastmoney.com",
+            ".eastmoney.com",
+            "push2his.eastmoney.com",
+            "push2.eastmoney.com",
+        )
+        for key in ("NO_PROXY", "no_proxy"):
+            raw = os.environ.get(key, "")
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            seen = set(parts)
+            for h in extra:
+                if h not in seen:
+                    seen.add(h)
+                    parts.append(h)
+            os.environ[key] = ",".join(parts)
+        _EASTMONEY_NO_PROXY_APPLIED = True
 
 
 def _env_hhmm(name: str, default: str) -> str:

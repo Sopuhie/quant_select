@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import atexit
+import logging
+import random
 import re
 import threading
 import time
@@ -16,15 +18,55 @@ from .config import (
     AKSHARE_FETCH_RETRIES,
     AKSHARE_FETCH_RETRY_SLEEP,
     AKSHARE_REQUEST_TIMEOUT,
+    BAOSTOCK_FIRST_IF_RANGE_DAYS,
     MIN_HISTORY_BARS,
     PREDICT_HISTORY_CALENDAR_DAYS,
     STOCK_POOL,
     USE_BAOSTOCK_FALLBACK,
+    ensure_eastmoney_no_proxy_if_configured,
 )
 
 _BS_LOCK = threading.Lock()
 _BS_LOGGED_IN = False
 _BS_ATEXIT_REGISTERED = False
+
+_log = logging.getLogger(__name__)
+
+
+def _is_transient_network_failure(exc: BaseException | None) -> bool:
+    """AkShare 常见瞬时失败：连接被重置、代理、超时等，适合重试或换 Baostock。"""
+    if exc is None:
+        return False
+    try:
+        import requests.exceptions as rq_exc
+
+        if isinstance(
+            exc,
+            (
+                rq_exc.ConnectionError,
+                rq_exc.Timeout,
+                rq_exc.ProxyError,
+                rq_exc.ChunkedEncodingError,
+                rq_exc.SSLError,
+            ),
+        ):
+            return True
+    except Exception:
+        pass
+    chain: BaseException | None = exc
+    seen = 0
+    while chain is not None and seen < 12:
+        seen += 1
+        name = type(chain).__name__
+        if name in (
+            "RemoteDisconnected",
+            "ProtocolError",
+            "ConnectionResetError",
+            "BrokenPipeError",
+        ):
+            return True
+        chain = chain.__cause__ or chain.__context__
+    return False
 
 
 def _baostock_logout() -> None:
@@ -47,16 +89,40 @@ def _compact_to_iso_date(compact: str) -> str:
     return compact
 
 
+def _compact_yyyymmdd(raw: str) -> str:
+    """将 start/end 参数规范为 8 位 YYYYMMDD（非法时返回原串去横线的前 8 位）。"""
+    s = str(raw).replace("-", "").strip()
+    return s[:8] if len(s) >= 8 else s.ljust(8, "0")[:8]
+
+
+def _calendar_span_days(start_date: str, end_date: str) -> int:
+    """自然日跨度（含首尾），解析失败返回大数表示「非短区间」。"""
+    try:
+        a = _compact_yyyymmdd(start_date)
+        b = _compact_yyyymmdd(end_date)
+        if not (a.isdigit() and b.isdigit() and len(a) == 8 and len(b) == 8):
+            return 9999
+        da = datetime.strptime(a, "%Y%m%d").date()
+        db = datetime.strptime(b, "%Y%m%d").date()
+        return max(0, (db - da).days)
+    except Exception:
+        return 9999
+
+
 def _fetch_daily_hist_baostock(
     symbol: str,
     start_compact: str,
     end_compact: str,
+    *,
+    force: bool = False,
 ) -> pd.DataFrame:
     """
     Baostock 日线，列与 AkShare 处理后一致。adjustflag=2 为前复权，对齐 AkShare qfq。
     全程在锁内执行 query，避免多线程并发访问 SDK。
+
+    ``force=True`` 时在未设置 ``QUANT_BAOSTOCK_FALLBACK`` 下仍尝试（用于 AkShare 连接类失败后的自动兜底）。
     """
-    if not USE_BAOSTOCK_FALLBACK:
+    if not USE_BAOSTOCK_FALLBACK and not force:
         return pd.DataFrame()
 
     code = str(symbol).strip().zfill(6)
@@ -139,6 +205,7 @@ def get_risk_st_stock_codes() -> frozenset[str]:
         return _ST_BOARD_CACHE[1]
     codes: set[str] = set()
     try:
+        ensure_eastmoney_no_proxy_if_configured()
         df = ak.stock_zh_a_st_em()
         if df is not None and not df.empty:
             col = "代码" if "代码" in df.columns else "code"
@@ -379,42 +446,129 @@ def fetch_daily_hist(
     """
     获取单只股票日线。列：date, open, high, low, close, volume（统一小写）。
     网络失败或超时时返回空表，不向外抛 requests 异常。
-    内置有限次重试与退避，减轻偶发抖动与限流导致的「全池失败」。
+    内置有限次重试与指数退避；短自然日区间内优先 Baostock，减轻东财限流。
+    AkShare 仍失败或最终无数据时写入 ``logging`` 警告（含末次异常）。
+    若 AkShare 因连接/超时等瞬时错误失败，即使未设置 ``QUANT_BAOSTOCK_FALLBACK``，也会尝试 Baostock（已安装时）。
     """
     if end_date is None:
         end_date = datetime_today_compact()
+    ensure_eastmoney_no_proxy_if_configured()
     to = float(timeout if timeout is not None else AKSHARE_REQUEST_TIMEOUT)
     retries = int(max_retries if max_retries is not None else AKSHARE_FETCH_RETRIES)
     retries = max(1, retries)
     sleep_base = AKSHARE_FETCH_RETRY_SLEEP
 
+    start_c = start_date.replace("-", "") if "-" in str(start_date) else str(start_date)
+    end_c = end_date.replace("-", "") if "-" in str(end_date) else str(end_date)
+    span_days = _calendar_span_days(start_c, end_c)
+    short_range = (
+        BAOSTOCK_FIRST_IF_RANGE_DAYS > 0
+        and span_days <= BAOSTOCK_FIRST_IF_RANGE_DAYS
+    )
+    # 短区间：东财常限流，AkShare 少试几次；长区间：保持配置次数
+    ak_attempts = min(retries, 2) if short_range else retries
+    delay_cap = 4.0 if short_range else 20.0
+
     df: pd.DataFrame | None = None
-    for attempt in range(retries):
-        try:
-            df = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", "") if "-" in str(end_date) else end_date,
-                adjust=adjust,
-                timeout=to,
-            )
-        except Exception:
-            df = None
-        if df is not None and not df.empty:
-            break
-        if attempt < retries - 1:
-            time.sleep(sleep_base * (attempt + 1))
+    last_exc: BaseException | None = None
+
+    if short_range:
+        df_bs0 = _fetch_daily_hist_baostock(
+            symbol,
+            start_c,
+            end_c,
+            force=True,
+        )
+        if df_bs0 is not None and not df_bs0.empty:
+            df = df_bs0
+            last_exc = None
 
     if df is None or df.empty:
+        for attempt in range(ak_attempts):
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start_c,
+                    end_date=end_c,
+                    adjust=adjust,
+                    timeout=to,
+                )
+            except Exception as e:
+                df = None
+                last_exc = e
+            if df is not None and not df.empty:
+                last_exc = None
+                break
+            if _is_transient_network_failure(last_exc):
+                df_bs = _fetch_daily_hist_baostock(
+                    symbol,
+                    start_c,
+                    end_c,
+                    force=True,
+                )
+                if df_bs is not None and not df_bs.empty:
+                    df = df_bs
+                    last_exc = None
+                    break
+            if attempt < ak_attempts - 1:
+                mult = 2 ** min(attempt, 3)
+                delay = min(delay_cap, sleep_base * mult) + random.random() * 0.4
+                time.sleep(delay)
+
+    if df is None or df.empty:
+        sym = str(symbol).strip().zfill(6)
+        sd_c = str(start_c).strip()[:8]
+        ed_c = str(end_c).strip()[:8] if end_c else ""
+        if last_exc is not None:
+            _log.warning(
+                "AkShare 日线失败 symbol=%s start=%s end=%s retries=%s 末次异常: %r",
+                sym,
+                sd_c,
+                ed_c,
+                ak_attempts,
+                last_exc,
+            )
+        else:
+            _log.warning(
+                "AkShare 日线无有效数据 symbol=%s start=%s end=%s retries=%s（未抛异常，可能为空表或该区间无行情）",
+                sym,
+                sd_c,
+                ed_c,
+                ak_attempts,
+            )
         df_bs = _fetch_daily_hist_baostock(
             symbol,
-            start_date.replace("-", ""),
-            end_date.replace("-", "") if "-" in str(end_date) else str(end_date),
+            start_c,
+            end_c,
+            force=USE_BAOSTOCK_FALLBACK or _is_transient_network_failure(last_exc),
         )
         if df_bs is not None and not df_bs.empty:
             df = df_bs
+            if not USE_BAOSTOCK_FALLBACK and _is_transient_network_failure(last_exc):
+                _log.info(
+                    "AkShare 失败后已用 Baostock 自动兜底 symbol=%s start=%s end=%s",
+                    sym,
+                    sd_c,
+                    ed_c,
+                )
         else:
+            if USE_BAOSTOCK_FALLBACK or _is_transient_network_failure(last_exc):
+                _log.warning(
+                    "日线最终无数据 symbol=%s start=%s end=%s（AkShare 末次异常=%r，Baostock 兜底亦空）",
+                    sym,
+                    sd_c,
+                    ed_c,
+                    last_exc,
+                )
+            else:
+                _log.warning(
+                    "日线最终无数据 symbol=%s start=%s end=%s（AkShare 末次异常=%r，未启用 Baostock 兜底）",
+                    sym,
+                    sd_c,
+                    ed_c,
+                    last_exc,
+                )
             return pd.DataFrame()
 
     cols_now = set(df.columns)

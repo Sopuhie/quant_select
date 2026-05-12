@@ -2,14 +2,23 @@
 from __future__ import annotations
 
 import os
+import time as time_module
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 import pandas as pd
 
-# 新浪交易日历缓存（进程内），避免频繁请求 AkShare
+# 新浪交易日历缓存（进程内）：成功拉取后按 TTL 刷新，避免「首日失败永久空列表」或日历滞后不含当日
 _SORTED_TRADE_DATES: list[str] | None = None
-_TRADE_DATE_SET: set[str] | None = None
+_SORTED_TRADE_DATES_AT: float = 0.0
+_TRADE_CAL_TTL_SEC = float(os.environ.get("QUANT_TRADE_CAL_TTL_SEC", str(4 * 3600)))
+
+
+def _ensure_eastmoney_no_proxy() -> None:
+    """AkShare 访问东方财富前调用，避免走失效的系统 HTTP(S) 代理。"""
+    from .config import ensure_eastmoney_no_proxy_if_configured
+
+    ensure_eastmoney_no_proxy_if_configured()
 
 
 def to_date_str(d: date | datetime | str) -> str:
@@ -34,27 +43,36 @@ def add_calendar_days(d: str, n: int) -> str:
 
 def get_sorted_a_share_trade_dates() -> list[str]:
     """返回升序 A 股交易日字符串列表 YYYY-MM-DD；失败时为空列表。"""
-    global _SORTED_TRADE_DATES
-    if _SORTED_TRADE_DATES is not None:
+    global _SORTED_TRADE_DATES, _SORTED_TRADE_DATES_AT
+    now = time_module.time()
+    if (
+        _SORTED_TRADE_DATES is not None
+        and (now - _SORTED_TRADE_DATES_AT) < _TRADE_CAL_TTL_SEC
+    ):
         return _SORTED_TRADE_DATES
     try:
+        _ensure_eastmoney_no_proxy()
         from akshare.tool.trade_date_hist import tool_trade_date_hist_sina
 
         df = tool_trade_date_hist_sina()
-        _SORTED_TRADE_DATES = sorted(
-            pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d").tolist()
+        lst = sorted(
+            pd.to_datetime(df["trade_date"], errors="coerce")
+            .dropna()
+            .dt.strftime("%Y-%m-%d")
+            .tolist()
         )
+        _SORTED_TRADE_DATES = lst
+        _SORTED_TRADE_DATES_AT = now
+        return lst
     except Exception:
-        _SORTED_TRADE_DATES = []
-    return _SORTED_TRADE_DATES
+        if _SORTED_TRADE_DATES is not None:
+            return _SORTED_TRADE_DATES
+        return []
 
 
 def get_a_share_trade_date_set() -> set[str]:
-    """交易日集合，便于 O(1) 判断。"""
-    global _TRADE_DATE_SET
-    if _TRADE_DATE_SET is None:
-        _TRADE_DATE_SET = set(get_sorted_a_share_trade_dates())
-    return _TRADE_DATE_SET
+    """交易日集合，便于 O(1) 判断（与日历列表同步，不单独永久缓存空集）。"""
+    return set(get_sorted_a_share_trade_dates())
 
 
 def is_a_share_trading_day(d: str) -> bool:
@@ -130,6 +148,7 @@ def get_last_trading_date(as_of: date | datetime | str | None = None) -> str:
         base = datetime.strptime(str(as_of)[:10], "%Y-%m-%d").date()
 
     try:
+        _ensure_eastmoney_no_proxy()
         from akshare.tool.trade_date_hist import tool_trade_date_hist_sina
 
         df = tool_trade_date_hist_sina()
@@ -195,12 +214,18 @@ def next_trade_day_after(d: str) -> str | None:
         return None
 
     try:
+        _ensure_eastmoney_no_proxy()
         from akshare.tool.trade_date_hist import tool_trade_date_hist_sina
 
         df = tool_trade_date_hist_sina()
-        trade_dates = sorted(df["trade_date"].tolist())
-        for td in trade_dates:
-            if isinstance(td, date) and td > base:
+        norm = (
+            pd.to_datetime(df["trade_date"], errors="coerce")
+            .dropna()
+            .sort_values()
+        )
+        for ts in norm:
+            td = pd.Timestamp(ts).date()
+            if td > base:
                 return td.isoformat()
     except Exception:
         pass

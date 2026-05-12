@@ -37,7 +37,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from src.config import DB_PATH
+from src.config import DB_PATH, ensure_eastmoney_no_proxy_if_configured
 from src.database import (
     bulk_set_stock_daily_industry_by_code,
     fetch_stock_code_max_dates,
@@ -54,7 +54,7 @@ from src.data_fetcher import (
 )
 from src.utils import get_kline_incremental_end_trade_date
 
-DEFAULT_WORKERS = max(1, int(os.environ.get("QUANT_UPDATE_WORKERS", "8")))
+DEFAULT_WORKERS = max(1, int(os.environ.get("QUANT_UPDATE_WORKERS", "4")))
 # 主线程单次 executemany 行数上限（过大易占用内存；过小则事务开销大）
 UPSERT_FLUSH_ROWS = max(1000, int(os.environ.get("QUANT_UPSERT_FLUSH_ROWS", "8000")))
 COMMIT_EVERY_FLUSHES = max(1, int(os.environ.get("QUANT_COMMIT_EVERY_FLUSHES", "3")))
@@ -79,6 +79,7 @@ def sync_stock_industries(
     """
     import akshare as ak
 
+    ensure_eastmoney_no_proxy_if_configured()
     path = db_path or DB_PATH
     init_db(path)
     sleep_s = (
@@ -447,6 +448,7 @@ def sync_fundamental_data(db_path: Path | None = None) -> None:
 
     import akshare as ak
 
+    ensure_eastmoney_no_proxy_if_configured()
     path = db_path or DB_PATH
     init_db(path)
 
