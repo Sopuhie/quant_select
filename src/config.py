@@ -116,4 +116,7 @@ FEATURE_COLUMNS = [
     "factor_close_position",
     "factor_pe_ratio",
     "factor_turnover_rate",
+    "factor_roe",
+    "factor_net_profit_growth",
+    "factor_revenue_growth",
 ]

@@ -74,6 +74,9 @@ def analyze_stock_reasons(
         "factor_close_position": "收盘价几乎砸在全天最高点，主力抢筹极其坚决，多头承接完美",
         "factor_pe_ratio": "估值市盈率分位数极具性价比，具备安全边际防御特征",
         "factor_turnover_rate": "换手率处于高度活跃区间，筹码交换频繁，主力博弈资金关注度极高",
+        "factor_roe": "企业最新季度净资产收益率(ROE)高，展现出极强的资本盈利基因",
+        "factor_net_profit_growth": "扣非净利润同比显著高速增长，公司业务正处于成长爆发主升期",
+        "factor_revenue_growth": "营业收入保持健康同比增长，企业市场空间广阔且产品极具护城河",
     }
 
     contributions: list[tuple[str, float]] = []
@@ -212,10 +215,12 @@ def _industry_from_hist_last_bar(hist: pd.DataFrame) -> str:
     return s if s else ""
 
 
-def latest_feature_row(df: pd.DataFrame) -> Optional[pd.Series]:
+def latest_feature_row(
+    df: pd.DataFrame, *, stock_code: str | None = None
+) -> Optional[pd.Series]:
     if df.empty or len(df) < 30:
         return None
-    fac = compute_factors_for_history(df)
+    fac = compute_factors_for_history(df, stock_code=stock_code)
     if fac.empty:
         return None
     last_idx = len(df) - 1
@@ -245,7 +250,7 @@ def _fetch_one_stock_features(
     if mc is not None and np.isfinite(mc) and mc > 0:
         hist = hist.copy()
         hist["market_cap"] = float(mc)
-    feat = latest_feature_row(hist)
+    feat = latest_feature_row(hist, stock_code=code6)
     if feat is None:
         return None
     row: dict[str, Any] = {

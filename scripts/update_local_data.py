@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import numpy as np
 import pandas as pd
 
 from src.config import DB_PATH
@@ -43,6 +44,7 @@ from src.database import (
     init_db,
     open_sqlite_connection,
     upsert_stock_daily_klines,
+    upsert_stock_financial_rows,
 )
 from src.data_fetcher import (
     fetch_daily_hist,
@@ -435,6 +437,120 @@ def update_database_kline(
             print(f"警告: 行业字段同步未成功（K 线仍已写入）: {exc}", flush=True)
 
 
+def sync_fundamental_data(db_path: Path | None = None) -> None:
+    """
+    使用 AkShare 东方财富业绩报表接口增量同步 ``stock_financial_data``（季报关键字段）。
+    与日线拼接时以 ``pub_date`` 为公告可见日，避免前视偏差。
+    """
+    from datetime import datetime
+
+    import akshare as ak
+
+    path = db_path or DB_PATH
+    init_db(path)
+
+    print("[基本面] 开始增量同步上市公司季度业绩报表（东方财富）...", flush=True)
+    now = datetime.now()
+    cy = now.year
+    quarters = [
+        f"{cy}0331",
+        f"{cy}0630",
+        f"{cy}0930",
+        f"{cy}1231",
+        f"{cy - 1}1231",
+        f"{cy - 1}0930",
+    ]
+
+    def _norm_code(raw: object) -> str:
+        s = str(raw).strip()
+        if "." in s:
+            s = s.split(".")[0]
+        return s.zfill(6)[:6]
+
+    def _first_col(df: pd.DataFrame, names: tuple[str, ...]) -> pd.Series | None:
+        for n in names:
+            if n in df.columns:
+                return df[n]
+        return None
+
+    for report_date in quarters:
+        print(f"[基本面] 拉取报告期 {report_date} ...", flush=True)
+        df_finance = None
+        try:
+            if hasattr(ak, "stock_yjbb_em"):
+                df_finance = ak.stock_yjbb_em(date=report_date)
+            elif hasattr(ak, "stock_em_yjbb"):
+                df_finance = ak.stock_em_yjbb(date=report_date)
+        except Exception as exc:
+            print(f"[基本面] 报告期 {report_date} 接口异常，跳过: {exc}", flush=True)
+            continue
+
+        if df_finance is None or df_finance.empty:
+            print(f"[基本面] 报告期 {report_date} 返回空表，跳过。", flush=True)
+            continue
+
+        code_s = _first_col(df_finance, ("股票代码", "代码"))
+        if code_s is None:
+            print(f"[基本面] 报告期 {report_date} 无股票代码列，跳过。", flush=True)
+            continue
+
+        pub_s = _first_col(df_finance, ("最新公告日期", "公告日期"))
+        roe_s = _first_col(df_finance, ("净资产收益率",))
+        np_s = _first_col(
+            df_finance,
+            ("净利润-同比增长", "净利润同比增长", "净利润同比"),
+        )
+        rev_s = _first_col(
+            df_finance,
+            ("营业收入-同比增长", "营业收入同比增长", "营业收入同比"),
+        )
+
+        rows: list[tuple[object, ...]] = []
+        for i in range(len(df_finance)):
+            code = _norm_code(code_s.iloc[i])
+            if len(code) != 6 or not code.isdigit():
+                continue
+            if pub_s is not None:
+                pd_pub = pd.to_datetime(pub_s.iloc[i], errors="coerce")
+                pub_date = (
+                    pd_pub.strftime("%Y-%m-%d")
+                    if pd.notna(pd_pub)
+                    else now.strftime("%Y-%m-%d")
+                )
+            else:
+                pub_date = now.strftime("%Y-%m-%d")
+            roe = (
+                pd.to_numeric(roe_s.iloc[i], errors="coerce") if roe_s is not None else np.nan
+            )
+            ng = (
+                pd.to_numeric(np_s.iloc[i], errors="coerce") if np_s is not None else np.nan
+            )
+            rg = (
+                pd.to_numeric(rev_s.iloc[i], errors="coerce") if rev_s is not None else np.nan
+            )
+            if pd.isna(roe) and pd.isna(ng):
+                continue
+
+            def _sql_val(x: object) -> float | None:
+                if x is None or (isinstance(x, float) and pd.isna(x)):
+                    return None
+                v = float(x)
+                return v if np.isfinite(v) else None
+
+            rows.append(
+                (code, pub_date, report_date, _sql_val(roe), _sql_val(ng), _sql_val(rg))
+            )
+
+        if not rows:
+            print(f"[基本面] 报告期 {report_date} 无有效行，跳过。", flush=True)
+            continue
+        try:
+            n = upsert_stock_financial_rows(rows, db_path=path)
+            print(f"[基本面] 报告期 {report_date} 已入库 {n} 条。", flush=True)
+        except Exception as exc:
+            print(f"[基本面] 报告期 {report_date} 写入失败: {exc}", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="同步本地 stock_daily_kline")
     parser.add_argument(
@@ -466,9 +582,19 @@ def main() -> int:
         help="不同步 AkShare 行业板块到 stock_daily_kline.industry",
     )
     parser.add_argument(
+        "--skip-fundamental-sync",
+        action="store_true",
+        help="不同步东方财富季度业绩报表到 stock_financial_data",
+    )
+    parser.add_argument(
         "--only-industry-sync",
         action="store_true",
         help="仅执行行业同步（不拉取 K 线）",
+    )
+    parser.add_argument(
+        "--only-fundamental-sync",
+        action="store_true",
+        help="仅执行基本面财报同步（不拉取 K 线）",
     )
     parser.add_argument(
         "--industry-board-limit",
@@ -484,6 +610,11 @@ def main() -> int:
         sync_stock_industries(DB_PATH, verbose=True, max_boards=lim)
         return 0
 
+    if args.only_fundamental_sync:
+        init_db()
+        sync_fundamental_data(DB_PATH)
+        return 0
+
     eff_max = 0 if args.all_stocks else args.max_stocks
 
     update_database_kline(
@@ -493,6 +624,11 @@ def main() -> int:
         run_industry_sync=not args.skip_industry_sync,
         industry_board_limit=args.industry_board_limit,
     )
+    if not args.skip_fundamental_sync:
+        try:
+            sync_fundamental_data(DB_PATH)
+        except Exception as exc:
+            print(f"警告: 基本面财报同步失败（K 线已写入）: {exc}", flush=True)
     return 0
 
 

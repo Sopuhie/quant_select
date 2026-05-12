@@ -79,6 +79,18 @@ CREATE TABLE IF NOT EXISTS stock_daily_kline (
 );
 CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date);
 
+CREATE TABLE IF NOT EXISTS stock_financial_data (
+    stock_code TEXT NOT NULL,
+    pub_date TEXT NOT NULL,
+    report_date TEXT NOT NULL,
+    roe REAL,
+    net_profit_growth REAL,
+    revenue_growth REAL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (stock_code, report_date)
+);
+CREATE INDEX IF NOT EXISTS idx_financial_code_pub ON stock_financial_data(stock_code, pub_date);
+
 CREATE TABLE IF NOT EXISTS system_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_name TEXT NOT NULL,
@@ -158,6 +170,70 @@ def init_db(db_path: Path | None = None) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def fetch_stock_financial_panel(
+    stock_code: str,
+    *,
+    db_path: Path | None = None,
+) -> pd.DataFrame:
+    """
+    读取单只股票在 ``stock_financial_data`` 中的财报行（按公告日、报告期升序）。
+    用于与日线 ``merge_asof``：仅使用 ``pub_date`` 已过的记录，避免前视偏差。
+    """
+    code = str(stock_code).strip().zfill(6)
+    path = db_path or DB_PATH
+    init_db(path)
+    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        cur = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_financial_data'"
+        )
+        if cur.fetchone() is None:
+            return pd.DataFrame(
+                columns=["pub_date", "report_date", "roe", "net_profit_growth", "revenue_growth"]
+            )
+        return pd.read_sql_query(
+            """
+            SELECT pub_date, report_date, roe, net_profit_growth, revenue_growth
+            FROM stock_financial_data
+            WHERE stock_code = ?
+            ORDER BY pub_date ASC, report_date ASC
+            """,
+            conn,
+            params=(code,),
+        )
+    finally:
+        conn.close()
+
+
+def upsert_stock_financial_rows(
+    records: list[tuple[Any, ...]],
+    db_path: Path | None = None,
+) -> int:
+    """批量写入/覆盖 ``stock_financial_data``。每元组：
+    (stock_code, pub_date, report_date, roe, net_profit_growth, revenue_growth)
+    """
+    if not records:
+        return 0
+    path = db_path or DB_PATH
+    init_db(path)
+    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO stock_financial_data
+            (stock_code, pub_date, report_date, roe, net_profit_growth, revenue_growth)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            records,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(records)
 
 
 def fetch_stock_code_max_dates(db_path: Path | None = None) -> dict[str, str]:

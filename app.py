@@ -1101,6 +1101,9 @@ with tab_perf:
                         "factor_close_position": "🎯 日内收盘位置 (主力真买入强度/资金代理)",
                         "factor_pe_ratio": "💎 估值因子 (log PE，列存在时来自行情)",
                         "factor_turnover_rate": "🔁 流动性因子 (换手率或量比代理)",
+                        "factor_roe": "📗 季度 ROE（基本面）",
+                        "factor_net_profit_growth": "📈 净利润同比增速（%）",
+                        "factor_revenue_growth": "📊 营业收入同比增速（%）",
                     }
 
                     raw_features = FEATURE_COLUMNS[:n]

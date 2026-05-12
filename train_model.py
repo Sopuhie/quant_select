@@ -120,7 +120,7 @@ def _load_local_kline_panel(
         if len(g) < min_bars:
             skipped_short += 1
             continue
-        facts = compute_factors_for_history(g)
+        facts = compute_factors_for_history(g, stock_code=str(code))
         meta = g[["date", "stock_code", "stock_name", "industry"]].copy()
         merged = pd.concat(
             [meta.reset_index(drop=True), facts.reset_index(drop=True)],

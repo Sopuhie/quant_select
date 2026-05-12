@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -78,6 +78,57 @@ def _board_allowed(code: str, *, include_300: bool, include_688: bool) -> bool:
     return True
 
 
+def resolve_anchor_trade_date(
+    requested_date: str,
+    pairs: list[tuple[str, str]],
+    *,
+    sample_cap: int = 120,
+) -> tuple[str, str | None]:
+    """
+    若本地 ``stock_daily_kline`` 在 ``requested_date`` 尚无普遍「最后一根=该日」的收盘，
+    则向前回退交易日，直到抽样命中率足够，避免日线未同步时全市场 0 条因子。
+    """
+    td = str(requested_date).strip()[:10]
+    if not pairs:
+        return td, None
+    n = min(int(sample_cap), len(pairs))
+
+    def _count_last_bar_matches(anchor: str) -> int:
+        hits = 0
+        for i in range(n):
+            code = pairs[i][0]
+            df = fetch_stock_daily_bars_until(code, anchor)
+            if df.empty or len(df) < MIN_HISTORY_BARS:
+                continue
+            last = pd.to_datetime(df.iloc[-1]["date"], errors="coerce")
+            if pd.isna(last):
+                continue
+            if last.strftime("%Y-%m-%d") == anchor:
+                hits += 1
+        return hits
+
+    need = max(8, n // 8)
+    cur = td
+    for _ in range(8):
+        if _count_last_bar_matches(cur) >= need:
+            if cur != td:
+                return cur, (
+                    f"提示：本地日线在 {td} 尚未对齐（抽样 {n} 只中不足 {need} 只以该日为最后一根 K 线），"
+                    f"已改用 {cur} 作为因子锚定日并写入 trade_date。若要严格按 {td} 选股，请先运行 "
+                    "scripts/update_local_data.py 补齐当日收盘。"
+                )
+            return td, None
+        try:
+            d0 = datetime.strptime(cur, "%Y-%m-%d").date()
+            nxt = get_last_trading_date(d0 - timedelta(days=1))
+        except Exception:
+            break
+        if nxt >= cur:
+            break
+        cur = nxt
+    return td, None
+
+
 def _fetch_one_predict_row(
     code: str,
     name: str,
@@ -92,7 +143,7 @@ def _fetch_one_predict_row(
     if df_today.empty:
         return None
 
-    factors = compute_factors_for_history(df_today)
+    factors = compute_factors_for_history(df_today, stock_code=str(code).strip().zfill(6))
     if factors.empty:
         return None
 
@@ -104,7 +155,7 @@ def _fetch_one_predict_row(
         return None
     actual_last_str = actual_last.strftime("%Y-%m-%d")
     td = str(trade_date).strip()[:10]
-    # 本地最新一根必须与预测日对齐，避免用停牌前旧 K 线参与截面排序
+    # 本地最后一根必须与锚定交易日一致（锚定日由 resolve_anchor_trade_date 已对齐库内实际）
     if actual_last_str != td:
         return None
 
@@ -183,12 +234,7 @@ def predict_daily(
     skip_dingtalk: bool = False,
 ) -> None:
     print(f"开始执行 {trade_date} 每日预测选股流程...")
-    # 默认覆盖写入；仅当 force=False（命令行 --skip-if-exists）时跳过已存在记录
-    if selection_exists_for_date(trade_date) and not force:
-        print(f"提示: {trade_date} 选股记录已存在，跳过（已使用 --skip-if-exists）。")
-        return
-
-    # 1. 载入模型
+    # 1. 载入模型（提前加载便于尽早失败）
     if not MODEL_PATH.exists():
         print(f"错误: 找不到模型文件 {MODEL_PATH}，请先运行 train_model.py")
         sys.exit(1)
@@ -251,6 +297,18 @@ def predict_daily(
         print("错误: 板块过滤后没有剩余候选股票，请调整 --include-300 / --include-688。")
         sys.exit(1)
 
+    anchor_td, anchor_hint = resolve_anchor_trade_date(trade_date, pairs)
+    if anchor_hint:
+        print(anchor_hint, flush=True)
+    if verbose:
+        print(f"因子与入库锚定日 trade_date = {anchor_td}", flush=True)
+
+    if selection_exists_for_date(anchor_td) and not force:
+        print(
+            f"提示: {anchor_td} 选股记录已存在，跳过（已使用 --skip-if-exists）。"
+        )
+        return
+
     workers = int(max_workers if max_workers is not None else PREDICT_FETCH_WORKERS)
     workers = max(1, min(workers, 32))
     src = "在线成分∩本地" if use_online_pool else "本地库"
@@ -266,7 +324,7 @@ def predict_daily(
     rows_by_code: dict[str, dict[str, float | str]] = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
-            ex.submit(_fetch_one_predict_row, c, n, trade_date): (c, n)
+            ex.submit(_fetch_one_predict_row, c, n, anchor_td): (c, n)
             for c, n in pairs
         }
         for fut in as_completed(futs):
@@ -284,7 +342,12 @@ def predict_daily(
     rows = [rows_by_code[c] for c, _n in pairs if c in rows_by_code]
 
     if not rows:
-        print("错误: 未能获取到任何有效的股票因子特征数据。")
+        print(
+            "错误: 未能获取到任何有效的股票因子特征数据。\n"
+            "常见原因：① 本地日线未同步到锚定日，请先运行 scripts/update_local_data.py；"
+            "② 全部标的在因子列上存在 NaN（检查 MIN_HISTORY_BARS 与数据质量）；"
+            "③ 线程内异常被静默忽略，请在终端查看是否有其它报错。"
+        )
         sys.exit(1)
 
     # 转化为 DataFrame（已按 pairs 顺序，便于与训练/排查对齐）
@@ -329,7 +392,7 @@ def predict_daily(
     filtered_df["rank_in_market"] = range(1, len(filtered_df) + 1)
 
     # 清理当天旧数据，防止重复写入
-    delete_daily_outputs_for_trade_date(trade_date)
+    delete_daily_outputs_for_trade_date(anchor_td)
 
     # 7. 将全市场预测结果写入 daily_predictions 表
     predict_rows = filtered_df[
@@ -362,7 +425,7 @@ def predict_daily(
         )
     insert_daily_selections(selection_rows)
 
-    print(f"今日选股完成！{trade_date} 推荐 Top{TOP_N_SELECTION} 为:")
+    print(f"今日选股完成！{anchor_td} 推荐 Top{TOP_N_SELECTION} 为:")
     for r in selection_rows:
         print(
             f"  Rank {r['rank']}: {r['stock_code']} {r['stock_name']} "
@@ -371,7 +434,7 @@ def predict_daily(
 
     if not skip_dingtalk:
         try:
-            maybe_push_daily_selections(trade_date)
+            maybe_push_daily_selections(anchor_td)
         except Exception as exc:
             print(f"钉钉推送环节异常（选股数据已写入）: {exc}")
     else:
