@@ -50,7 +50,30 @@ from src.config import (
 )
 from src.config_manager import config_manager
 from src.database import get_connection, init_db, insert_system_log, query_df
-from src.pattern_matcher import find_similar_patterns
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_find_similar_patterns(
+    target_code: str,
+    start_date: str,
+    end_date: str,
+    compare_days: int,
+    limit_results: int,
+    algorithm: str,
+) -> list:
+    """形态匹配结果缓存，减轻全市场扫描时的重复计算与页面超时风险。"""
+    from src.pattern_matcher import find_similar_patterns
+
+    return find_similar_patterns(
+        target_code=target_code,
+        start_date=start_date,
+        end_date=end_date,
+        compare_days=compare_days,
+        limit_results=limit_results,
+        algorithm=algorithm,
+    )
+
+
 from src.kline_chart import (
     draw_candlestick,
     get_stock_kline_data,
@@ -985,7 +1008,7 @@ with tab_match:
                             else "正在扫描本地全市场行情，请稍候…"
                         )
                         with st.spinner(_spin):
-                            st.session_state["pm_results"] = find_similar_patterns(
+                            st.session_state["pm_results"] = cached_find_similar_patterns(
                                 target_code=code_z,
                                 start_date=start_str,
                                 end_date=end_str,

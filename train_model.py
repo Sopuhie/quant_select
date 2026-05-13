@@ -11,6 +11,13 @@ LightGBM LambdaRank + 配套 XGBoost XGBRanker（rank:ndcg），落盘 lgb_model
 """
 from __future__ import annotations
 
+import os
+
+# 子进程训练 LightGBM/XGBoost 时降低 OpenMP/MKL 与宿主（如 Streamlit）嵌套冲突概率（尤其 Windows）
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+
 import argparse
 import sys
 from datetime import datetime
@@ -322,4 +329,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    os.environ.setdefault("MKL_NUM_THREADS", "4")
     main()

@@ -40,6 +40,7 @@ from .database import (
     init_db,
     insert_daily_predictions,
     insert_daily_selections,
+    list_predict_universe_from_kline,
     selection_exists_for_date,
 )
 from .factor_calculator import (
@@ -343,6 +344,60 @@ def prune_zero_volume_rows(feat_df: pd.DataFrame) -> pd.DataFrame:
         return feat_df
     v = pd.to_numeric(feat_df["volume"], errors="coerce")
     return feat_df[v > 0].reset_index(drop=True)
+
+
+def _cross_section_features_for_diagnose(
+    code6: str,
+    anchor: str,
+) -> tuple[dict[str, float] | None, str | None, str | None]:
+    """
+    与 ``run_daily`` 同日预测一致：全市场因子行 + 短期涨幅抑制 + ``clean_cross_sectional_features``，
+    取出目标股在锚定交易日的清洗后特征（与 Ranker 训练时的截面变换对齐）。
+
+    返回 ``(特征字典, anchor_trade_date, 失败码)``；成功时第三项为 ``None``。
+    """
+    from run_daily import _fetch_one_predict_row, resolve_anchor_trade_date
+
+    pairs = list_predict_universe_from_kline(
+        anchor, min_bars=MIN_HISTORY_BARS, max_count=None
+    )
+    if not pairs:
+        return None, None, "empty_universe"
+    anchor_td, _ = resolve_anchor_trade_date(anchor, pairs)
+    rows_by_code: dict[str, dict[str, Any]] = {}
+    workers = max(1, min(int(PREDICT_FETCH_WORKERS), 32))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {
+            ex.submit(_fetch_one_predict_row, c, n, anchor_td): (c, n)
+            for c, n in pairs
+        }
+        for fut in as_completed(futs):
+            try:
+                r = fut.result()
+            except Exception:
+                continue
+            if r:
+                rows_by_code[str(r["stock_code"]).strip().zfill(6)] = r
+    rows = [rows_by_code[c] for c, _n in pairs if c in rows_by_code]
+    if not rows:
+        return None, anchor_td, "no_factor_rows"
+    feat_df = pd.DataFrame(rows)
+    feat_df = prune_zero_volume_rows(feat_df)
+    feat_df = feat_df.drop(columns=["volume"], errors="ignore")
+    if feat_df.empty:
+        return None, anchor_td, "empty_after_prune"
+    feat_df["date"] = feat_df["trade_date"]
+    feat_df = suppress_high_recent_gains(feat_df)
+    codes_s = feat_df["stock_code"].astype(str).str.zfill(6)
+    if code6 not in set(codes_s):
+        return None, anchor_td, "suppressed_or_missing"
+    feat_df = clean_cross_sectional_features(feat_df)
+    feat_df = feat_df.drop(columns=["date"], errors="ignore")
+    mask = feat_df["stock_code"].astype(str).str.zfill(6) == code6
+    if not mask.any():
+        return None, anchor_td, "missing_after_clean"
+    row = feat_df.loc[mask].iloc[0]
+    return {c: float(row[c]) for c in FEATURE_COLUMNS}, anchor_td, None
 
 
 def _industry_from_hist_last_bar(hist: pd.DataFrame) -> str:
@@ -737,6 +792,10 @@ def diagnose_single_stock(
     与全市场选股共用 ``QUANT_PREV_GAIN_SUPPRESSION``、``QUANT_MAX_5D_RETURN``、
     ``QUANT_MAX_20D_MOMENTUM`` 做近 5 日/10 日动量硬提示。
 
+    模型输入侧与 ``run_daily`` / ``train_model`` 对齐：在锚定日拉取全市场可预测池，
+    经 ``suppress_high_recent_gains`` 与 ``clean_cross_sectional_features`` 后取该股截面清洗特征；
+    若池化失败则退回单股原始因子并在结论文本中说明。
+
     ``end_date``：诊断截止日 YYYY-MM-DD（含），仅使用 ``date <= end_date`` 的 K 线；
     未传时默认取当前日历日，与 ``fetch_stock_daily_bars_until`` 的截面对齐。
 
@@ -820,7 +879,28 @@ def diagnose_single_stock(
     vma5 = vol_s.rolling(5).mean()
     volume_ratio_raw = float(vol_s.iloc[last_i] / (float(vma5.iloc[last_i]) + 1e-12))
 
-    feat_map = {c: float(last_row[c]) for c in FEATURE_COLUMNS}
+    raw_feat_map = {c: float(last_row[c]) for c in FEATURE_COLUMNS}
+    feat_map = raw_feat_map
+    feature_alignment_note = ""
+    cs_map, cs_td, cs_err = _cross_section_features_for_diagnose(code6, anchor)
+    if cs_map is not None:
+        feat_map = cs_map
+    else:
+        _hints: dict[str, str] = {
+            "empty_universe": "本地可预测股票池为空，融合模型输入暂用单股原始因子（未做全市场截面清洗）。",
+            "no_factor_rows": "未能算出全市场因子行，融合模型输入暂用单股原始因子。",
+            "empty_after_prune": "剔除无量样本后池为空，融合模型输入暂用单股原始因子。",
+            "suppressed_or_missing": "该标的未进入当日全市场因子池（可能因短期涨幅/动量压制），融合模型输入暂用单股原始因子。",
+            "missing_after_clean": "截面清洗后未找到该股行，融合模型输入暂用单股原始因子。",
+        }
+        feature_alignment_note = _hints.get(
+            cs_err or "", "截面因子对齐失败，融合模型输入暂用单股原始因子。"
+        )
+    if cs_td and str(cs_td)[:10] != str(td)[:10]:
+        extra = (
+            f"全市场锚定交易日为 {cs_td}，该股 K 线末日为 {td}；截面计算以 {cs_td} 为准。"
+        )
+        feature_alignment_note = f"{feature_alignment_note} {extra}".strip()
 
     violated: list[str] = []
     min_p, max_p, min_mc, max_mc, min_to, max_to = get_experience_thresholds()
@@ -912,6 +992,9 @@ def diagnose_single_stock(
             )
         theme = "info"
 
+    if feature_alignment_note:
+        conclusion = f"{conclusion}\n\n【因子对齐说明】{feature_alignment_note}"
+
     imp_vec = feature_importances_aligned(lgb_model)
     reason_line = analyze_stock_reasons(
         {**feat_map, "stock_code": code6, "stock_name": stock_name},
@@ -924,6 +1007,9 @@ def diagnose_single_stock(
         "stock_name": stock_name,
         "anchor_date": anchor,
         "trade_date": td,
+        "cs_anchor_trade_date": cs_td,
+        "features_cross_section_aligned": cs_map is not None,
+        "feature_alignment_note": feature_alignment_note or None,
         "price": close_price,
         "mcap_bn": mcap_bn,
         "score": blended,

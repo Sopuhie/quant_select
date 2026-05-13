@@ -36,6 +36,8 @@ def _row_minmax_norm(X: np.ndarray) -> np.ndarray:
 
 # Sakoe-Chiba 带宽（|i−j|≤R）；R 为常数时单条序列约 O(W·R)，全候选合计 O(N·W·R)≈O(N·W)。
 DEFAULT_DTW_SAKOE_CHIBA_RADIUS = 12
+# DTW 精筛前按 Pearson 相关系数保留的候选数量上限（全市场粗筛）
+DTW_PEARSON_COARSE_TOP_K = 100
 
 
 def _dtw_accumulated_sq_cost_full_2row(a: np.ndarray, b: np.ndarray) -> float:
@@ -159,7 +161,7 @@ def find_similar_patterns(
         start_date / end_date: 模板区间（YYYY-MM-DD）
         compare_days: 日历跨度近似控制候选数据加载起点（越大越耗内存，默认覆盖约一季以上交易日）
         limit_results: 返回前几条
-        algorithm: ``pearson`` | ``dtw``；DTW 适合时间轴伸缩的形态比较。
+        algorithm: ``pearson`` | ``dtw``；``dtw`` 时先按 Pearson 在全市场粗筛再对前若干只（见模块常量 ``DTW_PEARSON_COARSE_TOP_K``）做 DTW。
         dtw_sakoe_chiba_radius: DTW 的 Sakoe-Chiba 带宽 R（``|i-j|≤R``）；``None`` 时用模块默认值。
             固定 R 时复杂度约 ``O(N·W·R)``；过紧时会自动回退完整双行 DTW。
     """
@@ -247,17 +249,26 @@ def find_similar_patterns(
     X_norm = _row_minmax_norm(X_raw)
     ref = np.asarray(target_series, dtype=np.float64)
 
+    limit = int(limit_results)
     if algo == "dtw":
+        corr_all = _pearson_rows(ref, X_norm)
+        k_coarse = min(int(DTW_PEARSON_COARSE_TOP_K), len(corr_all))
+        top_idx = np.argsort(-corr_all)[:k_coarse]
+        X_sub = X_norm[top_idx]
         dtw_d = _dtw_distances_ref_to_rows(
             ref,
-            X_norm,
+            X_sub,
             sakoe_chiba_radius=dtw_sakoe_chiba_radius,
         )
-        similarity = np.where(
+        similarity_sub = np.where(
             np.isfinite(dtw_d) & (dtw_d >= 0),
             100.0 / (1.0 + dtw_d),
             0.0,
         )
+        order_sub = np.argsort(-similarity_sub)[:limit]
+        order = top_idx[order_sub.astype(np.int64)]
+        similarity = np.full(len(stock_codes), -1.0, dtype=np.float64)
+        similarity[top_idx] = similarity_sub
     else:
         corr = _pearson_rows(ref, X_norm)
         diff = X_norm - ref
@@ -265,8 +276,8 @@ def find_similar_patterns(
         dist_score = 1.0 / (1.0 + dist)
         similarity = np.maximum(0.0, (corr + 1.0) / 2.0 * 80.0 + dist_score * 20.0)
 
-    limit = int(limit_results)
-    order = np.argsort(-similarity)[:limit]
+    if algo != "dtw":
+        order = np.argsort(-similarity)[:limit]
 
     tgt_list = ref.tolist()
     results: list[dict] = []

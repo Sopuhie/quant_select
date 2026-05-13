@@ -3,18 +3,48 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import sqlite3
+import time
 
 import pandas as pd
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from .config import DB_PATH
 
 # 高并发读写时延长连接等待、WAL、busy_timeout，降低 "database is locked" 概率
 _SQLITE_CONNECT_TIMEOUT = 30.0
+
+
+def _sqlite_write_backoff_sleep(attempt: int) -> None:
+    """指数退避 + 小幅随机抖动，缓解与后台线程并发写库时的锁竞争。"""
+    base = 0.1 * (2 ** max(0, int(attempt)))
+    time.sleep(base + random.uniform(0, 0.05))
+
+
+def _retry_sqlite_locked(
+    op: Callable[[], None],
+    *,
+    attempts: int = 5,
+) -> None:
+    last: sqlite3.OperationalError | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            op()
+            return
+        except sqlite3.OperationalError as e:
+            last = e
+            msg = str(e).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            if attempt >= int(attempts) - 1:
+                raise
+            _sqlite_write_backoff_sleep(attempt)
+    if last is not None:
+        raise last
 
 
 def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
@@ -310,8 +340,14 @@ def insert_daily_selections(
                 r.get("created_at", now),
             )
         )
-    with get_connection(db_path) as conn:
-        conn.executemany(sql, batch)
+    if not batch:
+        return
+
+    def _do() -> None:
+        with get_connection(db_path) as conn:
+            conn.executemany(sql, batch)
+
+    _retry_sqlite_locked(_do, attempts=5)
 
 
 def upsert_stock_daily_klines(
@@ -382,10 +418,13 @@ def upsert_stock_daily_klines(
     else:
         conn = sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
         _apply_sqlite_pragmas(conn)
-    try:
+    def _do() -> None:
         conn.executemany(sql, batch)
         if own:
             conn.commit()
+
+    try:
+        _retry_sqlite_locked(_do, attempts=5)
     finally:
         if own:
             conn.close()
@@ -460,20 +499,25 @@ def insert_system_log(
 ) -> None:
     """写入一条系统任务日志（SUCCESS / FAILED 等）。用于控制台任务与前端联动追溯。"""
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with get_connection(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO system_logs (task_name, status, run_time, parameters, log_output)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                str(task_name).strip(),
-                str(status).strip(),
-                run_time,
-                parameters if parameters is not None else "",
-                log_output if log_output is not None else "",
-            ),
-        )
+    params = (
+        str(task_name).strip(),
+        str(status).strip(),
+        run_time,
+        parameters if parameters is not None else "",
+        log_output if log_output is not None else "",
+    )
+
+    def _do() -> None:
+        with get_connection(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO system_logs (task_name, status, run_time, parameters, log_output)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+
+    _retry_sqlite_locked(_do, attempts=5)
 
 
 def register_model_version(
