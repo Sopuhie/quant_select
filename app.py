@@ -1225,18 +1225,19 @@ with tab_theme:
         "本策略根据实盘复盘K线经验沉淀：融合量能爆发拐点、趋势红柱扩张、非对称KDJ高位减仓以及0轴上死叉清仓信号。"
     )
 
-    # --- 今日热门题材/行业快速看板（名称截面 + 候选词命中）---
+    # --- 新增：今日热门题材/行业快速看板 ---
     st.markdown("##### 🏷️ 今日全市场焦点题材推荐")
 
+    # 动态抓取最新交易日成交活跃或涨幅居前的股票代称/行业片段作为热门备选
     try:
         hot_themes_df = query_df(
             """
             SELECT stock_name FROM stock_daily_kline
             WHERE date = (SELECT MAX(date) FROM stock_daily_kline)
-            ORDER BY volume DESC
-            LIMIT 80
+            ORDER BY volume DESC LIMIT 80
             """
         )
+        # 从中提取高频概念词（如：半导体、科技、人工智能、恒生、生物医药、新能源、中字头等）
         candidate_words = [
             "半导体",
             "科技",
@@ -1249,26 +1250,29 @@ with tab_theme:
             "低空经济",
             "电力",
         ]
-        found_hot_words: list[str] = []
-        if not hot_themes_df.empty and "stock_name" in hot_themes_df.columns:
+        found_hot_words = []
+        if not hot_themes_df.empty:
             merged_names = "".join(hot_themes_df["stock_name"].astype(str).tolist())
             for word in candidate_words:
                 if word in merged_names:
                     found_hot_words.append(word)
 
+        # 兜底确保总有热门题材显示
         if not found_hot_words:
             found_hot_words = ["科技", "半导体", "人工智能", "恒生", "新能源"]
 
+        # 限制最多显示前 6 个热门题材标签
         hot_tags = found_hot_words[:6]
     except Exception:
         hot_tags = ["科技", "半导体", "人工智能", "恒生", "新能源"]
 
+    # 渲染题材标签按钮（横向排列）
+    tag_cols = st.columns(len(hot_tags) + 1)
+
+    # 初始化 session_state 联动变量
     if "clicked_theme_tag" not in st.session_state:
         st.session_state.clicked_theme_tag = ""
-    if "theme_keyword_input_field" not in st.session_state:
-        st.session_state.theme_keyword_input_field = ""
 
-    tag_cols = st.columns(len(hot_tags) + 1)
     with tag_cols[0]:
         st.markdown(
             "<p style='margin-top:5px; font-size:0.85rem; color:#64748b; font-weight:bold;'>点击快筛:</p>",
@@ -1277,12 +1281,14 @@ with tab_theme:
 
     for idx, tag in enumerate(hot_tags):
         with tag_cols[idx + 1]:
+            # 用小按钮模拟标签
             if st.button(
                 f"✨ {tag}",
                 key=f"theme_tag_{tag}",
                 use_container_width=True,
             ):
                 st.session_state.clicked_theme_tag = tag
+                # 与 key 绑定输入框同步，避免仅用 value= 时带 key 的组件不更新
                 st.session_state.theme_keyword_input_field = tag
 
     st.markdown(
@@ -1290,11 +1296,16 @@ with tab_theme:
         unsafe_allow_html=True,
     )
 
+    # 绑定点击值到输入框
+    keyword_default = st.session_state.clicked_theme_tag
     keyword = st.text_input(
         "💡 输入题材核心关键词/板块名称进行实时过滤 (留空代表扫描全市场)",
-        key="theme_keyword_input_field",
+        value=keyword_default,
         placeholder="例如: 恒生、科技、半导体、人工智能...",
+        key="theme_keyword_input_field",
     )
+
+    # 点击重置按钮可以清空选择
     if keyword != st.session_state.clicked_theme_tag:
         st.session_state.clicked_theme_tag = keyword
 
@@ -1308,7 +1319,7 @@ with tab_theme:
     with col_run_right:
         if st.button("🔄 清空条件", use_container_width=True):
             st.session_state.clicked_theme_tag = ""
-            st.session_state.theme_keyword_input_field = ""
+            st.session_state.pop("theme_keyword_input_field", None)
             st.rerun()
 
     if run_theme_btn:
