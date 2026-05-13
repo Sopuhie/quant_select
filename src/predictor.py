@@ -943,8 +943,7 @@ def run_theme_alpha_scan(
     theme_keywords: str | list[str] | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """
-    热门题材高爆策略：输出列与 ``integrate_trader_experience.txt`` Part 1 一致
-    （最新价格/量比为格式化字符串，结论列为三类信号 + 默认不返回横盘行）。
+    热门题材高爆策略 v2.0：趋势 + 双量比 + MACD/KDJ 共振与分级离场；实现见 ``theme_strategy.ThemeAlphaStrategy``。
     """
     from .theme_strategy import ThemeAlphaStrategy
 

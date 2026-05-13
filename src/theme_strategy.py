@@ -1,6 +1,8 @@
 """
-热门题材高爆选股 — 实盘 K 线经验扫描（``integrate_trader_experience.txt`` 逻辑 +
-``theme_speedup_and_align.txt``：SQL 关键词预筛、90 根历史缓冲减轻 KDJ/MACD 冷启动）。
+热门题材高爆选股 — 规则 **v2.0**（见项目 ``upgrade_to_theme_v2.txt``）。
+
+在 SQLite 截面 + 单股历史（倒序取、升序算）上计算 MA/MACD/KDJ/量比；
+保留 SQL 关键词预筛与 ``run_theme_alpha_scan`` 的 ``theme_keywords`` 兼容。
 """
 from __future__ import annotations
 
@@ -11,20 +13,38 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
-MIN_THEME_BARS = 35
+from .config import (
+    THEME_KDJ_J_SLOPE_MIN,
+    THEME_KDJ_LEVEL_1,
+    THEME_KDJ_LEVEL_2,
+    THEME_MA_LONG,
+    THEME_MA_SHORT,
+    THEME_VOL_RATIO_MIN_1D,
+    THEME_VOL_RATIO_MIN_5D,
+)
+
+# 历史根数：至少满足 MA60 + 指标稳定（与 v2 文档 65 根一致，且与 MA_LONG 对齐）
+THEME_MIN_BARS = max(65, THEME_MA_LONG + 5)
 THEME_HIST_LIMIT = 90
 
-STATUS_BUY = "🟢 三大指标金叉共振(买入拐点)"
-STATUS_KDJ_EXIT = "⚠️ KDJ极度超买(实盘经验：先减仓一半)"
-STATUS_MACD_EXIT = "🚨 MACD高位死叉(0轴上死叉：坚决清仓跑路)"
-STATUS_DEFAULT = "🔵 横盘蓄势(静待突破)"
+STATUS_DEFAULT_V2 = "🔵 横盘蓄势(静待突破)"
+STATUS_BUY_V2 = "🟢 三点指标强力共振(v2规则：最佳买入拐点)"
+STATUS_KDJ_100_V2 = "⚠️ KDJ探顶J≥100(v2规则：立即减仓当前1/3)"
+STATUS_KDJ_110_V2 = "⚠️ KDJ高位脉冲J≥110(v2规则：逢高分步派发减仓)"
+STATUS_MACD_EXIT_V2 = "🚨 MACD高位死叉(v2规则：坚决清仓跑路)"
+
+EMPTY_RESULT_COLUMNS = [
+    "股票代码",
+    "股票名称",
+    "最新价格",
+    "实盘决策建议结论",
+]
 
 
 def _effective_keyword(
     keyword: str | None,
     theme_keywords: str | list[str] | None,
 ) -> str | None:
-    """优先 ``keyword``；否则从 ``theme_keywords`` 取第一个非空片段（兼容 ``run_theme_alpha_scan``）。"""
     k = (keyword or "").strip()
     if k:
         return k
@@ -47,14 +67,21 @@ class ThemeAlphaStrategy:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
 
+    def check_market_environment(self, target_date: str) -> bool:
+        """
+        市场环境评估桩：v2.0 预留；数据源未接入指数表时默认放行。
+        """
+        _ = target_date
+        return True
+
     def compute_technical_signals(
         self, df: pd.DataFrame
     ) -> tuple[pd.Series, pd.Series] | None:
         """
-        MACD(12,26,9)、KDJ(9,3,3)、量比=当日量/(5日均量+1e-6)；
-        返回 (当前 bar, 昨日 bar)；不足 ``MIN_THEME_BARS`` 根返回 None。
+        v2.0 指标：MA20/MA60、MACD(12,26,9)、KDJ(9,3,3)、5 日量比、相对昨量、日涨跌幅。
+        返回 (curr, prev)；不足 ``THEME_MIN_BARS`` 根返回 None。
         """
-        if df is None or len(df) < MIN_THEME_BARS:
+        if df is None or len(df) < THEME_MIN_BARS:
             return None
         df = df.sort_values("date").reset_index(drop=True)
         close = pd.to_numeric(df["close"], errors="coerce")
@@ -62,37 +89,50 @@ class ThemeAlphaStrategy:
         low = pd.to_numeric(df["low"], errors="coerce")
         volume = pd.to_numeric(df["volume"], errors="coerce")
 
+        ma20 = close.rolling(int(THEME_MA_SHORT), min_periods=int(THEME_MA_SHORT)).mean()
+        ma60 = close.rolling(int(THEME_MA_LONG), min_periods=int(THEME_MA_LONG)).mean()
+
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         diff = ema12 - ema26
         dea = diff.ewm(span=9, adjust=False).mean()
         macd_bar = (diff - dea) * 2.0
 
-        low_min = low.rolling(9).min()
-        high_max = high.rolling(9).max()
+        low_min = low.rolling(9, min_periods=9).min()
+        high_max = high.rolling(9, min_periods=9).max()
         rsv = (close - low_min) / (high_max - low_min + 1e-6) * 100.0
         k = rsv.ewm(com=2, adjust=False).mean()
         d = k.ewm(com=2, adjust=False).mean()
         j = 3.0 * k - 2.0 * d
 
-        df = df.copy()
-        df["macd_diff"] = diff
-        df["macd_dea"] = dea
-        df["macd_bar"] = macd_bar
-        df["kdj_k"] = k
-        df["kdj_d"] = d
-        df["kdj_j"] = j
-        df["vol_ratio"] = volume / (volume.rolling(5).mean() + 1e-6)
+        out = df.copy()
+        out["ma20"] = ma20
+        out["ma60"] = ma60
+        out["macd_diff"] = diff
+        out["macd_dea"] = dea
+        out["macd_bar"] = macd_bar
+        out["kdj_k"] = k
+        out["kdj_d"] = d
+        out["kdj_j"] = j
+        out["vol_ratio_5d"] = volume / (volume.rolling(5, min_periods=5).mean() + 1e-6)
+        out["vol_ratio_1d"] = volume / (volume.shift(1) + 1e-6)
+        out["change_pct"] = close.pct_change()
 
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
-        for key in ("vol_ratio", "macd_bar", "macd_diff", "macd_dea", "kdj_j", "kdj_k"):
+        curr = out.iloc[-1]
+        prev = out.iloc[-2]
+
+        def _ok(x: object) -> bool:
             try:
-                cv = float(curr[key])
-                pv = float(prev[key])
+                v = float(x)
             except (TypeError, ValueError):
+                return False
+            return np.isfinite(v)
+
+        for col in ("ma20", "ma60", "close", "vol_ratio_5d", "vol_ratio_1d", "change_pct"):
+            if not _ok(curr.get(col)):
                 return None
-            if not np.isfinite(cv) or not np.isfinite(pv):
+        for col in ("macd_diff", "macd_dea", "macd_bar", "kdj_k", "kdj_d", "kdj_j"):
+            if not _ok(curr.get(col)) or not _ok(prev.get(col)):
                 return None
         return curr, prev
 
@@ -103,10 +143,6 @@ class ThemeAlphaStrategy:
         *,
         theme_keywords: str | Iterable[str] | None = None,
     ) -> tuple[pd.DataFrame, str]:
-        """
-        截面扫描；有 ``keyword`` / ``theme_keywords`` 时在 SQLite 层用 ``LIKE`` 预筛名称与代码。
-        单股历史拉取 ``THEME_HIST_LIMIT`` 根（倒序取再升序算指标）。
-        """
         cur = self.conn.cursor()
         if target_date is None:
             res_date = cur.execute(
@@ -117,6 +153,9 @@ class ThemeAlphaStrategy:
             target_date = str(res_date[0]).strip()[:10]
         else:
             target_date = str(target_date).strip()[:10]
+
+        if not self.check_market_environment(target_date):
+            return pd.DataFrame(columns=EMPTY_RESULT_COLUMNS), target_date
 
         eff_kw = _effective_keyword(keyword, theme_keywords)
 
@@ -142,9 +181,6 @@ class ThemeAlphaStrategy:
         df_all["stock_code"] = df_all["stock_code"].astype(str).str.strip().str.zfill(6)
         if "stock_name" not in df_all.columns:
             df_all["stock_name"] = ""
-        df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce").dt.strftime(
-            "%Y-%m-%d"
-        )
 
         hist_sql = """
             SELECT * FROM stock_daily_kline
@@ -173,57 +209,83 @@ class ThemeAlphaStrategy:
                 self.conn,
                 params=[code, target_date, THEME_HIST_LIMIT],
             )
-            if df_hist.empty or len(df_hist) < MIN_THEME_BARS:
+            if df_hist.empty or len(df_hist) < THEME_MIN_BARS:
                 continue
             df_hist["date"] = pd.to_datetime(
                 df_hist["date"], errors="coerce"
             ).dt.strftime("%Y-%m-%d")
             df_hist = df_hist.sort_values("date").reset_index(drop=True)
 
-            signals = self.compute_technical_signals(df_hist)
-            if signals is None:
+            sig = self.compute_technical_signals(df_hist)
+            if sig is None:
                 continue
-            curr, prev = signals
+            curr, prev = sig
 
-            cond_volume = float(curr["vol_ratio"]) >= 1.3
-            cond_macd_buy = float(curr["macd_bar"]) > 0 and float(curr["macd_bar"]) > float(
-                prev["macd_bar"]
+            c_close = float(curr["close"])
+            c_ma20 = float(curr["ma20"])
+            c_ma60 = float(curr["ma60"])
+            cond_trend = c_close > c_ma20 and c_close > c_ma60 and c_ma20 > c_ma60
+
+            vr5 = float(curr["vol_ratio_5d"])
+            vr1 = float(curr["vol_ratio_1d"])
+            chg = float(curr["change_pct"])
+            cond_volume = vr5 >= float(THEME_VOL_RATIO_MIN_5D) and vr1 >= float(
+                THEME_VOL_RATIO_MIN_1D
             )
+            if chg < 0.02 and vr5 >= 2.0:
+                cond_volume = False
+
+            cd, ca = float(curr["macd_diff"]), float(curr["macd_dea"])
+            pdiff, pdea = float(prev["macd_diff"]), float(prev["macd_dea"])
+            cbar, pbar = float(curr["macd_bar"]), float(prev["macd_bar"])
+            cond_macd_buy = (cd > ca) and (
+                (pdiff <= pdea and cd >= -0.1)
+                or (cbar > 0 and cbar > pbar)
+            )
+
+            j_now = float(curr["kdj_j"])
+            j_prev = float(prev["kdj_j"])
+            j_slope = j_now - j_prev
+            k_now, d_now = float(curr["kdj_k"]), float(curr["kdj_d"])
+            k_prev, d_prev = float(prev["kdj_k"]), float(prev["kdj_d"])
+            k_cross_d = (k_prev <= d_prev) and (k_now > d_now)
             cond_kdj_buy = (
-                float(curr["kdj_j"]) > float(curr["kdj_k"])
-                and float(curr["kdj_j"]) < 95.0
-                and float(prev["kdj_j"]) <= float(curr["kdj_j"])
+                k_cross_d
+                and j_now > 40.0
+                and j_slope > float(THEME_KDJ_J_SLOPE_MIN)
             )
 
-            is_kdj_overbought = float(curr["kdj_j"]) >= 98.0
-            is_macd_dead_cross = (
-                float(curr["macd_diff"]) < float(curr["macd_dea"])
-                and float(prev["macd_diff"]) >= float(prev["macd_dea"])
-                and float(curr["macd_diff"]) > 0.0
+            j110 = float(THEME_KDJ_LEVEL_2)
+            j100 = float(THEME_KDJ_LEVEL_1)
+            is_kdj_t2 = j_now >= j110
+            is_kdj_t1 = j_now >= j100 and j_now < j110
+            is_macd_dead = (
+                cd < ca and pdiff >= pdea and cd > 0.0
             )
 
-            status = STATUS_DEFAULT
-            if cond_volume and cond_macd_buy and cond_kdj_buy:
-                status = STATUS_BUY
-            elif is_kdj_overbought:
-                status = STATUS_KDJ_EXIT
-            elif is_macd_dead_cross:
-                status = STATUS_MACD_EXIT
+            status = STATUS_DEFAULT_V2
+            if is_macd_dead:
+                status = STATUS_MACD_EXIT_V2
+            elif is_kdj_t2:
+                status = STATUS_KDJ_110_V2
+            elif is_kdj_t1:
+                status = STATUS_KDJ_100_V2
+            elif cond_trend and cond_volume and cond_macd_buy and cond_kdj_buy:
+                status = STATUS_BUY_V2
 
-            if status == STATUS_DEFAULT:
+            if status == STATUS_DEFAULT_V2:
                 continue
 
-            vr = float(curr["vol_ratio"])
             scored.append(
                 (
-                    vr,
+                    vr5,
                     {
                         "股票代码": code,
                         "股票名称": name,
-                        "最新价格": f"{float(curr['close']):.2f} 元",
-                        "最新量比": f"{vr:.2f} 倍",
-                        "KDJ_J值": round(float(curr["kdj_j"]), 2),
-                        "MACD红柱": round(float(curr["macd_bar"]), 4),
+                        "最新价格": f"{c_close:.2f} 元",
+                        "当前量比": f"{vr5:.2f} 倍",
+                        "KDJ_J值": round(j_now, 2),
+                        "MACD红柱": round(cbar, 4),
                         "实盘决策建议结论": status,
                     },
                 )

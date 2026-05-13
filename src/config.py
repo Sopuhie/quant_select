@@ -267,3 +267,12 @@ def get_experience_thresholds() -> tuple[
         )
     except Exception:
         return (mp, Mxp, mm, Mxm, mt, Mxt)
+
+# --- 热门题材交易系统规则 v2.0 核心参数 ---
+THEME_MA_SHORT = 20
+THEME_MA_LONG = 60
+THEME_VOL_RATIO_MIN_5D = 1.5
+THEME_VOL_RATIO_MIN_1D = 1.3
+THEME_KDJ_J_SLOPE_MIN = 5.0
+THEME_KDJ_LEVEL_1 = 100.0
+THEME_KDJ_LEVEL_2 = 110.0
