@@ -6,7 +6,7 @@ Streamlit 复盘与全功能控制台（浅色清晰主题）。
   3. 每日选股预测
   4. 历史收益回填
   5. 2024 滚动回测
-  6. 🔥 热门题材高爆规则选股（量价+MACD+KDJ）
+  6. 🔥 热门题材高爆规则选股 v2.1（买入/卖出分表，MACD+KDJ）
   7. 🎨 视觉图形选股（本地 K 线形态相似度扫描）
 
 审计：`run_command_interactive` 结束后写入 ``system_logs``；「📋 系统运行日志」Tab 可追溯控制台输出。
@@ -464,25 +464,25 @@ def _pattern_range_from_plotly_state(
 # ================= 6. 选项卡定义 =================
 (
     tab_today,
-    tab_advisor,
-    tab_hist,
-    tab_match,
-    tab_backtest,
-    tab_theme,
-    tab_perf,
     tab_data,
+    tab_theme,
+    tab_match,
+    tab_hist,
+    tab_advisor,
+    tab_perf,
+    tab_backtest,
     tab_logs,
     tab_settings,
 ) = st.tabs(
     [
         "🎯 今日推荐",
-        "🔬 智能诊股",
-        "📜 历史与股票K线查询",
-        "🎨 视觉图形选股",
-        "📈 历史回测",
-        "🔥 热门题材高爆选股",
-        "⚡ 模型表现",
         "⚙️ 系统控制台",
+        "🔥 热门题材高爆选股",
+        "🎨 视觉图形选股",
+        "📜 历史与股票K线查询",
+        "🔬 智能诊股",
+        "⚡ 模型表现",
+        "📈 历史回测",
         "📋 系统运行日志",
         "🔧 环境设置",
     ]
@@ -1245,8 +1245,8 @@ with tab_theme:
         "### 🔥 热门题材 + 量能突变 + MACD/KDJ 三位一体共振选股舱"
     )
     st.caption(
-        "规则 v2.0：趋势过滤（价>MA20/MA60 且 MA20>MA60）+ 双量比与放量滞涨剔除 + MACD 金叉/红柱扩张 + "
-        "K 上穿 D 且 J 斜率；分级离场：MACD 0 轴上死叉、J≥110、J≥100 与强力共振买点。"
+        "规则 v2.1：趋势 + 双量比（含滞涨剔除）+ MACD/KDJ 共振生成「买入表」；「卖出表」含 KDJ 分层、MACD 零轴上死叉、顶背离等。"
+        "阈值与均线周期见 ``config.py`` 中 ``THEME_*``、``MIN_HISTORY_BARS``；大盘环境分低于 60 时本日买入/卖出表均为空。"
     )
 
     # --- 状态机安全初始化 ---
@@ -1361,7 +1361,7 @@ with tab_theme:
             try:
                 with get_connection(DB_PATH) as conn:
                     scanner = ThemeAlphaStrategy(conn)
-                    df_res, scanned_date = scanner.scan_hot_themes(
+                    buy_df, sell_df, scanned_date = scanner.scan_hot_themes(
                         keyword=keyword.strip() or None
                     )
             except Exception as exc:
@@ -1369,24 +1369,35 @@ with tab_theme:
             else:
                 if not scanned_date:
                     st.warning("本地 stock_daily_kline 无可用日期，请先同步行情。")
-                elif df_res.empty:
+                elif buy_df.empty and sell_df.empty:
                     if keyword.strip():
                         st.info(
-                            f"📅 交易日 {scanned_date} 在名称/代码匹配「{keyword.strip()}」的截面下暂无经验拐点标的。"
+                            f"📅 交易日 {scanned_date} 在名称/代码匹配「{keyword.strip()}」下暂无买入/卖出信号（或大盘环境分未过线）。"
                         )
                     else:
                         st.info(
-                            f"📅 交易日 {scanned_date} 全市场暂无股票触动经验拐点。"
+                            f"📅 交易日 {scanned_date} 全市场暂无买入/卖出信号（或大盘环境分未过线）。"
                         )
                 else:
-                    st.success(
-                        f"🎯 成功在 {scanned_date} 捕获到 {len(df_res)} 个交易员经验状态拐点股："
-                    )
-                    st.dataframe(
-                        df_res,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                    st.success(f"🎯 扫描完成：交易日 {scanned_date}")
+                    if not buy_df.empty:
+                        st.markdown(f"**买入共振（{len(buy_df)}）**")
+                        st.dataframe(
+                            buy_df,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.info("本日无买入共振信号。")
+                    if not sell_df.empty:
+                        st.markdown(f"**卖出 / 减仓提示（{len(sell_df)}）**")
+                        st.dataframe(
+                            sell_df,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.info("本日无分层卖出信号。")
 
 # ----------------- TAB 4: 模型表现 -----------------
 with tab_perf:

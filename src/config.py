@@ -153,7 +153,7 @@ def _env_hhmm(name: str, default: str) -> str:
 
 
 # Streamlit 内置后台调度触发时刻（本机时间）；自测可设环境变量 QUANT_SCHEDULER_TIME=09:05
-SCHEDULER_RUN_AT = _env_hhmm("QUANT_SCHEDULER_TIME", "20:00")
+SCHEDULER_RUN_AT = _env_hhmm("QUANT_SCHEDULER_TIME", "19:00")
 
 # LightGBM 训练参数（可按机器性能调整）
 LGB_PARAMS = {

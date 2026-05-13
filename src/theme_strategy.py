@@ -1,5 +1,5 @@
 """
-热门题材高爆选股 — 规则 **v2.0**（见项目 ``upgrade_to_theme_v2.txt``）。
+热门题材高爆选股 — 规则 **v2.1**（买入/卖出分表；阈值来自 ``config``）。
 
 在 SQLite 截面 + 单股历史（倒序取、升序算）上计算 MA/MACD/KDJ/量比；
 保留 SQL 关键词预筛与 ``run_theme_alpha_scan`` 的 ``theme_keywords`` 兼容。
@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (
+    MIN_HISTORY_BARS,
     THEME_KDJ_J_SLOPE_MIN,
     THEME_KDJ_LEVEL_1,
     THEME_KDJ_LEVEL_2,
@@ -23,64 +24,73 @@ from .config import (
     THEME_VOL_RATIO_MIN_5D,
 )
 
-# 历史根数：至少满足 MA60 + 指标稳定（与 v2 文档 65 根一致，且与 MA_LONG 对齐）
-THEME_MIN_BARS = max(65, THEME_MA_LONG + 5)
-THEME_HIST_LIMIT = 90
+THEME_HIST_LIMIT = 250
+THEME_MIN_BARS = MIN_HISTORY_BARS
 
-STATUS_DEFAULT_V2 = "🔵 横盘蓄势(静待突破)"
-STATUS_BUY_V2 = "🟢 三点指标强力共振(v2规则：最佳买入拐点)"
-STATUS_KDJ_100_V2 = "⚠️ KDJ探顶J≥100(v2规则：立即减仓当前1/3)"
-STATUS_KDJ_110_V2 = "⚠️ KDJ高位脉冲J≥110(v2规则：逢高分步派发减仓)"
-STATUS_MACD_EXIT_V2 = "🚨 MACD高位死叉(v2规则：坚决清仓跑路)"
-
-EMPTY_RESULT_COLUMNS = [
+BUY_RESULT_COLUMNS = [
     "股票代码",
     "股票名称",
     "最新价格",
-    "实盘决策建议结论",
+    "当前量比",
+    "KDJ_J值",
+    "MACD红柱",
+    "信号类型",
+    "建议",
 ]
-
-
-def _effective_keyword(
-    keyword: str | None,
-    theme_keywords: str | list[str] | None,
-) -> str | None:
-    k = (keyword or "").strip()
-    if k:
-        return k
-    if theme_keywords is None:
-        return None
-    if isinstance(theme_keywords, (list, tuple)):
-        for x in theme_keywords:
-            s = str(x).strip()
-            if s:
-                return s
-        return None
-    s = str(theme_keywords).strip()
-    if not s:
-        return None
-    parts = re.split(r"[,，;；\s]+", s)
-    return (parts[0].strip() if parts else None) or None
+SELL_RESULT_COLUMNS = [
+    "股票代码",
+    "股票名称",
+    "最新价格",
+    "KDJ_J值",
+    "MACD红柱",
+    "信号类型",
+    "建议",
+    "详情",
+]
 
 
 class ThemeAlphaStrategy:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
+        self.market_score_cache: dict[str, int] = {}
+
+    def get_market_score(self, target_date: str) -> int:
+        """
+        返回 0~100 的大盘环境分。
+        数据缺失或表不存在时默认 60 分（允许交易），不阻断策略。
+        """
+        td = str(target_date).strip()[:10]
+        if td in self.market_score_cache:
+            return int(self.market_score_cache[td])
+        score_out = 60
+        try:
+            df_idx = pd.read_sql_query(
+                """
+                SELECT date, close FROM index_daily
+                WHERE index_code = '000300' AND date <= ?
+                ORDER BY date DESC
+                LIMIT 200
+                """,
+                self.conn,
+                params=[td],
+            )
+            if len(df_idx) >= 20:
+                df_idx = df_idx.sort_values("date")
+                ma20 = df_idx["close"].rolling(20).mean().iloc[-1]
+                cond = float(df_idx["close"].iloc[-1]) > float(ma20)
+                score = 20 if cond else 0
+                score_out = int(score + 40)
+        except Exception:
+            score_out = 60
+        self.market_score_cache[td] = score_out
+        return score_out
 
     def check_market_environment(self, target_date: str) -> bool:
-        """
-        市场环境评估桩：v2.0 预留；数据源未接入指数表时默认放行。
-        """
-        _ = target_date
-        return True
+        return self.get_market_score(target_date) >= 60
 
     def compute_technical_signals(
         self, df: pd.DataFrame
     ) -> tuple[pd.Series, pd.Series] | None:
-        """
-        v2.0 指标：MA20/MA60、MACD(12,26,9)、KDJ(9,3,3)、5 日量比、相对昨量、日涨跌幅。
-        返回 (curr, prev)；不足 ``THEME_MIN_BARS`` 根返回 None。
-        """
         if df is None or len(df) < THEME_MIN_BARS:
             return None
         df = df.sort_values("date").reset_index(drop=True)
@@ -89,8 +99,10 @@ class ThemeAlphaStrategy:
         low = pd.to_numeric(df["low"], errors="coerce")
         volume = pd.to_numeric(df["volume"], errors="coerce")
 
-        ma20 = close.rolling(int(THEME_MA_SHORT), min_periods=int(THEME_MA_SHORT)).mean()
-        ma60 = close.rolling(int(THEME_MA_LONG), min_periods=int(THEME_MA_LONG)).mean()
+        ma_s = int(THEME_MA_SHORT)
+        ma_l = int(THEME_MA_LONG)
+        ma20 = close.rolling(ma_s, min_periods=ma_s).mean()
+        ma60 = close.rolling(ma_l, min_periods=ma_l).mean()
 
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -126,7 +138,7 @@ class ThemeAlphaStrategy:
                 v = float(x)
             except (TypeError, ValueError):
                 return False
-            return np.isfinite(v)
+            return bool(np.isfinite(v))
 
         for col in ("ma20", "ma60", "close", "vol_ratio_5d", "vol_ratio_1d", "change_pct"):
             if not _ok(curr.get(col)):
@@ -136,28 +148,66 @@ class ThemeAlphaStrategy:
                 return None
         return curr, prev
 
+    def detect_macd_divergence(self, df_hist: pd.DataFrame) -> bool:
+        """近 20 日：价格新高而 DIF 不创新高（简化顶背离）。"""
+        if len(df_hist) < 20:
+            return False
+        close = pd.to_numeric(df_hist["close"], errors="coerce")
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        diff = ema12 - ema26
+        prices = close.to_numpy(dtype=float)[-20:]
+        difs = diff.to_numpy(dtype=float)[-20:]
+        price_peaks: list[tuple[int, float]] = []
+        dif_peaks: list[tuple[int, float]] = []
+        n = len(prices)
+        for i in range(5, n - 5):
+            window = prices[i - 5 : i + 6]
+            if prices[i] == float(np.max(window)):
+                price_peaks.append((i, float(prices[i])))
+                dif_peaks.append((i, float(difs[i])))
+        if len(price_peaks) < 2:
+            return False
+        last_price = price_peaks[-1][1]
+        prev_price = price_peaks[-2][1]
+        last_dif = dif_peaks[-1][1]
+        prev_dif = dif_peaks[-2][1]
+        return last_price > prev_price and last_dif < prev_dif
+
     def scan_hot_themes(
         self,
         target_date: str | None = None,
         keyword: str | None = None,
         *,
         theme_keywords: str | Iterable[str] | None = None,
-    ) -> tuple[pd.DataFrame, str]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+        """
+        返回: ``(buy_signals, sell_signals, target_date)``。
+
+        buy_signals 列: 股票代码, 股票名称, 最新价格, 当前量比, KDJ_J值, MACD红柱, 信号类型, 建议
+        sell_signals 列: 股票代码, 股票名称, 最新价格, KDJ_J值, MACD红柱, 信号类型, 建议, 详情
+        """
         cur = self.conn.cursor()
         if target_date is None:
-            res_date = cur.execute(
-                "SELECT MAX(date) FROM stock_daily_kline"
-            ).fetchone()
+            res_date = cur.execute("SELECT MAX(date) FROM stock_daily_kline").fetchone()
             if res_date is None or res_date[0] is None:
-                return pd.DataFrame(), ""
+                return (
+                    pd.DataFrame(columns=BUY_RESULT_COLUMNS),
+                    pd.DataFrame(columns=SELL_RESULT_COLUMNS),
+                    "",
+                )
             target_date = str(res_date[0]).strip()[:10]
         else:
             target_date = str(target_date).strip()[:10]
 
         if not self.check_market_environment(target_date):
-            return pd.DataFrame(columns=EMPTY_RESULT_COLUMNS), target_date
+            return (
+                pd.DataFrame(columns=BUY_RESULT_COLUMNS),
+                pd.DataFrame(columns=SELL_RESULT_COLUMNS),
+                target_date,
+            )
 
-        eff_kw = _effective_keyword(keyword, theme_keywords)
+        eff_kw = self._effective_keyword(keyword, theme_keywords)
 
         if eff_kw:
             like_term = f"%{eff_kw}%"
@@ -176,7 +226,11 @@ class ThemeAlphaStrategy:
                 params=[target_date],
             )
         if df_all.empty:
-            return pd.DataFrame(), target_date
+            return (
+                pd.DataFrame(columns=BUY_RESULT_COLUMNS),
+                pd.DataFrame(columns=SELL_RESULT_COLUMNS),
+                target_date,
+            )
 
         df_all["stock_code"] = df_all["stock_code"].astype(str).str.strip().str.zfill(6)
         if "stock_name" not in df_all.columns:
@@ -190,7 +244,14 @@ class ThemeAlphaStrategy:
         """
 
         seen: set[str] = set()
-        scored: list[tuple[float, dict[str, Any]]] = []
+        buy_rows: list[dict[str, Any]] = []
+        sell_rows: list[dict[str, Any]] = []
+
+        vr5_min = float(THEME_VOL_RATIO_MIN_5D)
+        vr1_min = float(THEME_VOL_RATIO_MIN_1D)
+        j_slope_min = float(THEME_KDJ_J_SLOPE_MIN)
+        j_lv1 = float(THEME_KDJ_LEVEL_1)
+        j_lv2 = float(THEME_KDJ_LEVEL_2)
 
         for _, row in df_all.iterrows():
             code = str(row["stock_code"]).strip().zfill(6)
@@ -229,9 +290,7 @@ class ThemeAlphaStrategy:
             vr5 = float(curr["vol_ratio_5d"])
             vr1 = float(curr["vol_ratio_1d"])
             chg = float(curr["change_pct"])
-            cond_volume = vr5 >= float(THEME_VOL_RATIO_MIN_5D) and vr1 >= float(
-                THEME_VOL_RATIO_MIN_1D
-            )
+            cond_volume = vr5 >= vr5_min and vr1 >= vr1_min
             if chg < 0.02 and vr5 >= 2.0:
                 cond_volume = False
 
@@ -239,8 +298,7 @@ class ThemeAlphaStrategy:
             pdiff, pdea = float(prev["macd_diff"]), float(prev["macd_dea"])
             cbar, pbar = float(curr["macd_bar"]), float(prev["macd_bar"])
             cond_macd_buy = (cd > ca) and (
-                (pdiff <= pdea and cd >= -0.1)
-                or (cbar > 0 and cbar > pbar)
+                cbar > pbar or (pdiff <= pdea and cbar > 0)
             )
 
             j_now = float(curr["kdj_j"])
@@ -252,33 +310,11 @@ class ThemeAlphaStrategy:
             cond_kdj_buy = (
                 k_cross_d
                 and j_now > 40.0
-                and j_slope > float(THEME_KDJ_J_SLOPE_MIN)
+                and j_slope > j_slope_min
             )
 
-            j110 = float(THEME_KDJ_LEVEL_2)
-            j100 = float(THEME_KDJ_LEVEL_1)
-            is_kdj_t2 = j_now >= j110
-            is_kdj_t1 = j_now >= j100 and j_now < j110
-            is_macd_dead = (
-                cd < ca and pdiff >= pdea and cd > 0.0
-            )
-
-            status = STATUS_DEFAULT_V2
-            if is_macd_dead:
-                status = STATUS_MACD_EXIT_V2
-            elif is_kdj_t2:
-                status = STATUS_KDJ_110_V2
-            elif is_kdj_t1:
-                status = STATUS_KDJ_100_V2
-            elif cond_trend and cond_volume and cond_macd_buy and cond_kdj_buy:
-                status = STATUS_BUY_V2
-
-            if status == STATUS_DEFAULT_V2:
-                continue
-
-            scored.append(
-                (
-                    vr5,
+            if cond_trend and cond_volume and cond_macd_buy and cond_kdj_buy:
+                buy_rows.append(
                     {
                         "股票代码": code,
                         "股票名称": name,
@@ -286,11 +322,124 @@ class ThemeAlphaStrategy:
                         "当前量比": f"{vr5:.2f} 倍",
                         "KDJ_J值": round(j_now, 2),
                         "MACD红柱": round(cbar, 4),
-                        "实盘决策建议结论": status,
-                    },
+                        "信号类型": "BUY",
+                        "建议": "买入共振成立，建议建仓30%",
+                    }
                 )
+
+            sells_here: list[dict[str, Any]] = []
+            if j_now < 80.0 and j_prev >= 80.0:
+                sells_here.append(
+                    {
+                        "股票代码": code,
+                        "股票名称": name,
+                        "最新价格": f"{c_close:.2f} 元",
+                        "KDJ_J值": round(j_now, 2),
+                        "MACD红柱": round(cbar, 4),
+                        "信号类型": "SELL_ALL",
+                        "建议": "KDJ 跌破 80，短线强势结束，建议清仓",
+                        "详情": f"J值从 {j_prev:.1f} 下穿 80",
+                    }
+                )
+            elif j_now >= j_lv1 and j_now < j_lv2:
+                if not any(x.get("信号类型") == "SELL_ALL" for x in sells_here):
+                    sells_here.append(
+                        {
+                            "股票代码": code,
+                            "股票名称": name,
+                            "最新价格": f"{c_close:.2f} 元",
+                            "KDJ_J值": round(j_now, 2),
+                            "MACD红柱": round(cbar, 4),
+                            "信号类型": "SELL_HALF",
+                            "建议": f"J值≥{j_lv1:.0f}，短线超买，建议卖出50%仓位",
+                            "详情": f"J值={j_now:.1f}",
+                        }
+                    )
+            elif j_now >= j_lv2:
+                sells_here.append(
+                    {
+                        "股票代码": code,
+                        "股票名称": name,
+                        "最新价格": f"{c_close:.2f} 元",
+                        "KDJ_J值": round(j_now, 2),
+                        "MACD红柱": round(cbar, 4),
+                        "信号类型": "SELL_ALL",
+                        "建议": f"J值≥{j_lv2:.0f}，极度超买，建议清仓",
+                        "详情": f"J值={j_now:.1f}",
+                    }
+                )
+
+            if cd < ca and pdiff >= pdea and cd > 0.0:
+                sells_here.append(
+                    {
+                        "股票代码": code,
+                        "股票名称": name,
+                        "最新价格": f"{c_close:.2f} 元",
+                        "KDJ_J值": round(j_now, 2),
+                        "MACD红柱": round(cbar, 4),
+                        "信号类型": "SELL_ALL",
+                        "建议": "MACD 零轴上死叉，主升浪结束，建议立即清仓",
+                        "详情": f"DIF={cd:.3f} DEA={ca:.3f}",
+                    }
+                )
+            if self.detect_macd_divergence(df_hist):
+                sells_here.append(
+                    {
+                        "股票代码": code,
+                        "股票名称": name,
+                        "最新价格": f"{c_close:.2f} 元",
+                        "KDJ_J值": round(j_now, 2),
+                        "MACD红柱": round(cbar, 4),
+                        "信号类型": "SELL_HALF",
+                        "建议": "MACD 顶背离，价格新高但动能不足，建议减仓50%",
+                        "详情": "顶背离信号",
+                    }
+                )
+            sell_rows.extend(sells_here)
+
+        buy_df = (
+            pd.DataFrame(buy_rows)
+            if buy_rows
+            else pd.DataFrame(columns=BUY_RESULT_COLUMNS)
+        )
+        if not buy_df.empty and "当前量比" in buy_df.columns:
+            def _vr5_key(s: object) -> float:
+                try:
+                    t = str(s).replace("倍", "").strip()
+                    return float(t)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            buy_df = buy_df.copy()
+            buy_df["_sort_vr5"] = buy_df["当前量比"].map(_vr5_key)
+            buy_df = buy_df.sort_values("_sort_vr5", ascending=False).drop(
+                columns=["_sort_vr5"]
             )
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        rows = [t[1] for t in scored]
-        return pd.DataFrame(rows), target_date
+        sell_df = (
+            pd.DataFrame(sell_rows)
+            if sell_rows
+            else pd.DataFrame(columns=SELL_RESULT_COLUMNS)
+        )
+        return buy_df, sell_df, target_date
+
+    def _effective_keyword(
+        self,
+        keyword: str | None,
+        theme_keywords: str | Iterable[str] | None,
+    ) -> str | None:
+        if keyword is not None and str(keyword).strip():
+            return str(keyword).strip()
+        if theme_keywords is None:
+            return None
+        if isinstance(theme_keywords, (list, tuple)):
+            for x in theme_keywords:
+                s = str(x).strip()
+                if s:
+                    return s
+            return None
+        s = str(theme_keywords).strip()
+        if not s:
+            return None
+        parts = re.split(r"[,，;；\s]+", s)
+        return parts[0].strip() if parts else None

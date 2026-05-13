@@ -1027,9 +1027,9 @@ def run_theme_alpha_scan(
     connection: Any,
     target_date: str | None = None,
     theme_keywords: str | list[str] | None = None,
-) -> tuple[pd.DataFrame, str]:
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """
-    热门题材高爆策略 v2.0：趋势 + 双量比 + MACD/KDJ 共振与分级离场；实现见 ``theme_strategy.ThemeAlphaStrategy``。
+    热门题材高爆策略 v2.1：买入共振表 + 分层卖出表；实现见 ``theme_strategy.ThemeAlphaStrategy``。
     """
     from .theme_strategy import ThemeAlphaStrategy
 
