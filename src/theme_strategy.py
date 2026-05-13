@@ -1,8 +1,6 @@
 """
-热门题材高爆选股 — 实盘 K 线经验扫描（严格按 ``integrate_trader_experience.txt`` Part 1）。
-
-四类状态（仅非默认状态会出现在结果表中）：
-  🟢 买入共振 | ⚠️ KDJ 超买减仓 | 🚨 MACD 0 轴上死叉清仓 | 🔵 横盘蓄势（默认，不输出）
+热门题材高爆选股 — 实盘 K 线经验扫描（``integrate_trader_experience.txt`` 逻辑 +
+``theme_speedup_and_align.txt``：SQL 关键词预筛、90 根历史缓冲减轻 KDJ/MACD 冷启动）。
 """
 from __future__ import annotations
 
@@ -14,21 +12,35 @@ import numpy as np
 import pandas as pd
 
 MIN_THEME_BARS = 35
+THEME_HIST_LIMIT = 90
 
 STATUS_BUY = "🟢 三大指标金叉共振(买入拐点)"
 STATUS_KDJ_EXIT = "⚠️ KDJ极度超买(实盘经验：先减仓一半)"
 STATUS_MACD_EXIT = "🚨 MACD高位死叉(0轴上死叉：坚决清仓跑路)"
-# Part 1 代码块 lines 117–128：与 ``if status != ...`` 比较用的默认文案
 STATUS_DEFAULT = "🔵 横盘蓄势(静待突破)"
 
 
-def _normalize_keywords(theme_keywords: str | Iterable[str] | None) -> list[str]:
+def _effective_keyword(
+    keyword: str | None,
+    theme_keywords: str | list[str] | None,
+) -> str | None:
+    """优先 ``keyword``；否则从 ``theme_keywords`` 取第一个非空片段（兼容 ``run_theme_alpha_scan``）。"""
+    k = (keyword or "").strip()
+    if k:
+        return k
     if theme_keywords is None:
-        return []
-    if isinstance(theme_keywords, str):
-        raw = re.split(r"[,，;；\s]+", theme_keywords.strip())
-        return [x.strip() for x in raw if x.strip()]
-    return [str(x).strip() for x in theme_keywords if str(x).strip()]
+        return None
+    if isinstance(theme_keywords, (list, tuple)):
+        for x in theme_keywords:
+            s = str(x).strip()
+            if s:
+                return s
+        return None
+    s = str(theme_keywords).strip()
+    if not s:
+        return None
+    parts = re.split(r"[,，;；\s]+", s)
+    return (parts[0].strip() if parts else None) or None
 
 
 class ThemeAlphaStrategy:
@@ -39,8 +51,8 @@ class ThemeAlphaStrategy:
         self, df: pd.DataFrame
     ) -> tuple[pd.Series, pd.Series] | None:
         """
-        与文档一致：MACD(12,26,9)、KDJ(9,3,3)、量比=当日量/(5日均量+1e-6)；
-        返回 (当前 bar, 昨日 bar)；不足 35 根返回 None。
+        MACD(12,26,9)、KDJ(9,3,3)、量比=当日量/(5日均量+1e-6)；
+        返回 (当前 bar, 昨日 bar)；不足 ``MIN_THEME_BARS`` 根返回 None。
         """
         if df is None or len(df) < MIN_THEME_BARS:
             return None
@@ -87,11 +99,13 @@ class ThemeAlphaStrategy:
     def scan_hot_themes(
         self,
         target_date: str | None = None,
-        theme_keywords: str | list[str] | None = None,
+        keyword: str | None = None,
+        *,
+        theme_keywords: str | Iterable[str] | None = None,
     ) -> tuple[pd.DataFrame, str]:
         """
-        全市场截面扫描（``WHERE date = ?`` 与文档一致）；仅输出触发买入/减仓/清仓的标的。
-        ``theme_keywords`` 可选：在扫描前按名称/行业子串预筛（非文档必选，供 ``run_theme_alpha_scan``）。
+        截面扫描；有 ``keyword`` / ``theme_keywords`` 时在 SQLite 层用 ``LIKE`` 预筛名称与代码。
+        单股历史拉取 ``THEME_HIST_LIMIT`` 根（倒序取再升序算指标）。
         """
         cur = self.conn.cursor()
         if target_date is None:
@@ -104,30 +118,39 @@ class ThemeAlphaStrategy:
         else:
             target_date = str(target_date).strip()[:10]
 
-        df_all = pd.read_sql_query(
-            "SELECT * FROM stock_daily_kline WHERE date = ?",
-            self.conn,
-            params=[target_date],
-        )
+        eff_kw = _effective_keyword(keyword, theme_keywords)
+
+        if eff_kw:
+            like_term = f"%{eff_kw}%"
+            df_all = pd.read_sql_query(
+                """
+                SELECT * FROM stock_daily_kline
+                WHERE date = ? AND (stock_name LIKE ? OR stock_code LIKE ?)
+                """,
+                self.conn,
+                params=[target_date, like_term, like_term],
+            )
+        else:
+            df_all = pd.read_sql_query(
+                "SELECT * FROM stock_daily_kline WHERE date = ?",
+                self.conn,
+                params=[target_date],
+            )
         if df_all.empty:
             return pd.DataFrame(), target_date
 
         df_all["stock_code"] = df_all["stock_code"].astype(str).str.strip().str.zfill(6)
         if "stock_name" not in df_all.columns:
             df_all["stock_name"] = ""
-        if "industry" not in df_all.columns:
-            df_all["industry"] = ""
         df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce").dt.strftime(
             "%Y-%m-%d"
         )
-
-        kws = _normalize_keywords(theme_keywords)
 
         hist_sql = """
             SELECT * FROM stock_daily_kline
             WHERE stock_code = ? AND date <= ?
             ORDER BY date DESC
-            LIMIT 45
+            LIMIT ?
         """
 
         seen: set[str] = set()
@@ -144,16 +167,11 @@ class ThemeAlphaStrategy:
                 name = "未知"
             else:
                 name = str(raw_name)
-            ind = row.get("industry", "") or ""
-            ind = "" if ind is None or (isinstance(ind, float) and pd.isna(ind)) else str(ind)
-
-            if kws:
-                blob = name + ind
-                if not any(k in blob for k in kws):
-                    continue
 
             df_hist = pd.read_sql_query(
-                hist_sql, self.conn, params=[code, target_date]
+                hist_sql,
+                self.conn,
+                params=[code, target_date, THEME_HIST_LIMIT],
             )
             if df_hist.empty or len(df_hist) < MIN_THEME_BARS:
                 continue

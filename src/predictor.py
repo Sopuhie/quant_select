@@ -949,4 +949,23 @@ def run_theme_alpha_scan(
     from .theme_strategy import ThemeAlphaStrategy
 
     engine = ThemeAlphaStrategy(connection)
-    return engine.scan_hot_themes(target_date=target_date, theme_keywords=theme_keywords)
+    kw = _theme_scan_keyword_from_arg(theme_keywords)
+    return engine.scan_hot_themes(target_date=target_date, keyword=kw)
+
+
+def _theme_scan_keyword_from_arg(
+    theme_keywords: str | list[str] | None,
+) -> str | None:
+    if theme_keywords is None:
+        return None
+    if isinstance(theme_keywords, (list, tuple)):
+        for x in theme_keywords:
+            s = str(x).strip()
+            if s:
+                return s
+        return None
+    s = str(theme_keywords).strip()
+    if not s:
+        return None
+    parts = re.split(r"[,，;；\s]+", s)
+    return (parts[0].strip() if parts else None) or None

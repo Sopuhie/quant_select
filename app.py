@@ -1240,45 +1240,32 @@ with tab_theme:
             try:
                 with get_connection(DB_PATH) as conn:
                     scanner = ThemeAlphaStrategy(conn)
-                    df_res, scanned_date = scanner.scan_hot_themes()
+                    df_res, scanned_date = scanner.scan_hot_themes(
+                        keyword=keyword.strip() or None
+                    )
             except Exception as exc:
                 st.error(f"扫描失败：{exc}")
             else:
                 if not scanned_date:
                     st.warning("本地 stock_daily_kline 无可用日期，请先同步行情。")
                 elif df_res.empty:
-                    st.info(
-                        f"📅 交易日 {scanned_date} 全市场暂无股票触动经验拐点。"
-                    )
-                else:
                     if keyword.strip():
-                        kw = keyword.strip()
-                        df_res = df_res[
-                            df_res["股票名称"].str.contains(
-                                kw, na=False, regex=False
-                            )
-                            | df_res["股票代码"].str.contains(
-                                kw, na=False, regex=False
-                            )
-                        ]
-                    if df_res.empty:
-                        if keyword.strip():
-                            st.info(
-                                f"📅 交易日 {scanned_date} 暂无符合关键词「{keyword.strip()}」的标的。"
-                            )
-                        else:
-                            st.info(
-                                f"📅 交易日 {scanned_date} 全市场暂无股票触动经验拐点。"
-                            )
+                        st.info(
+                            f"📅 交易日 {scanned_date} 在名称/代码匹配「{keyword.strip()}」的截面下暂无经验拐点标的。"
+                        )
                     else:
-                        st.success(
-                            f"🎯 成功在 {scanned_date} 捕获到 {len(df_res)} 个交易员经验状态拐点股："
+                        st.info(
+                            f"📅 交易日 {scanned_date} 全市场暂无股票触动经验拐点。"
                         )
-                        st.dataframe(
-                            df_res,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+                else:
+                    st.success(
+                        f"🎯 成功在 {scanned_date} 捕获到 {len(df_res)} 个交易员经验状态拐点股："
+                    )
+                    st.dataframe(
+                        df_res,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
 # ----------------- TAB 4: 模型表现 -----------------
 with tab_perf:
