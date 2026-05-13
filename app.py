@@ -6,7 +6,8 @@ Streamlit 复盘与全功能控制台（浅色清晰主题）。
   3. 每日选股预测
   4. 历史收益回填
   5. 2024 滚动回测
-  6. 🎨 视觉图形选股（本地 K 线形态相似度扫描）
+  6. 🔥 热门题材高爆规则选股（量价+MACD+KDJ）
+  7. 🎨 视觉图形选股（本地 K 线形态相似度扫描）
 
 审计：`run_command_interactive` 结束后写入 ``system_logs``；「📋 系统运行日志」Tab 可追溯控制台输出。
 """
@@ -45,9 +46,10 @@ from src.config import (
     MODEL_PATH,
     SCHEDULER_RUN_AT,
     TOP_N_SELECTION,
+    get_experience_thresholds,
 )
 from src.config_manager import config_manager
-from src.database import init_db, insert_system_log, query_df
+from src.database import get_connection, init_db, insert_system_log, query_df
 from src.pattern_matcher import find_similar_patterns
 from src.kline_chart import (
     draw_candlestick,
@@ -75,6 +77,46 @@ def _parse_experience_filter_text(s: object) -> float | None:
     if not t:
         return None
     return float(t)
+
+
+def _persist_experience_filters_from_ui() -> tuple[bool, str | None]:
+    """
+    将任务 C 展开栏中的经验风控写入 config.json。
+    ``run_daily`` / ``scripts/backtest`` 子进程通过 ``get_experience_thresholds()`` 读取。
+    返回 (是否成功, 失败时的简短说明)。
+    """
+    try:
+        config_manager.config.setdefault(
+            "notification",
+            {"send_on_success": True, "send_on_error": True},
+        )
+        config_manager.config["experience_filters"] = {
+            "min_price": _parse_experience_filter_text(
+                st.session_state.get("task_c_ef_min_price", "")
+            ),
+            "max_price": _parse_experience_filter_text(
+                st.session_state.get("task_c_ef_max_price", "")
+            ),
+            "min_mcap": _parse_experience_filter_text(
+                st.session_state.get("task_c_ef_min_mcap", "")
+            ),
+            "max_mcap": _parse_experience_filter_text(
+                st.session_state.get("task_c_ef_max_mcap", "")
+            ),
+            "min_turnover": _parse_experience_filter_text(
+                st.session_state.get("task_c_ef_min_turnover", "")
+            ),
+            "max_turnover": _parse_experience_filter_text(
+                st.session_state.get("task_c_ef_max_turnover", "")
+            ),
+        }
+    except ValueError as exc:
+        return False, f"经验风控参数须为数字或留空：{exc}"
+    if not config_manager.save_config():
+        return False, "保存经验风控配置到 config.json 失败"
+    config_manager.reload()
+    return True, None
+
 
 # ================= 1. 全局页面配置 =================
 st.set_page_config(
@@ -403,6 +445,7 @@ def _pattern_range_from_plotly_state(
     tab_hist,
     tab_match,
     tab_backtest,
+    tab_theme,
     tab_perf,
     tab_data,
     tab_logs,
@@ -414,6 +457,7 @@ def _pattern_range_from_plotly_state(
         "📜 历史与股票K线查询",
         "🎨 视觉图形选股",
         "📈 历史回测",
+        "🔥 热门题材高爆选股",
         "⚡ 模型表现",
         "⚙️ 系统控制台",
         "📋 系统运行日志",
@@ -1096,7 +1140,7 @@ with tab_match:
                                     fig_i, use_container_width=True
                                 )
 
-# ----------------- TAB 4: 📈 历史回测 -----------------
+# ----------------- TAB 5: 📈 历史回测 -----------------
 with tab_backtest:
     st.subheader("📈 策略历史回测分析")
     st.caption("基于 LightGBM 历史滚动预测与周期换仓策略（2024 样本外滚动）。")
@@ -1171,6 +1215,70 @@ with tab_backtest:
 
         except Exception as err:
             st.error(f"解析回测数据出错: {err}")
+
+# ----------------- TAB 6: 🔥 热门题材高爆选股（integrate_trader_experience.txt）-----------------
+with tab_theme:
+    st.markdown(
+        "### 🔥 热门题材 + 量能突变 + MACD/KDJ 三位一体共振选股舱"
+    )
+    st.caption(
+        "本策略根据实盘复盘K线经验沉淀：融合量能爆发拐点、趋势红柱扩张、非对称KDJ高位减仓以及0轴上死叉清仓信号。"
+    )
+    keyword = st.text_input(
+        "💡 输入题材核心关键词/板块名称进行实时过滤 (留空代表扫描全市场)",
+        value="",
+        placeholder="例如: 恒生、科技、半导体、人工智能...",
+    )
+    if st.button(
+        "🚀 启动全两市经验指标交叉盘点扫描",
+        use_container_width=True,
+        key="run_theme_alpha",
+    ):
+        with st.spinner("正在抽取两市时序信号矩阵流并比对状态交叉节点..."):
+            from src.theme_strategy import ThemeAlphaStrategy
+
+            try:
+                with get_connection(DB_PATH) as conn:
+                    scanner = ThemeAlphaStrategy(conn)
+                    df_res, scanned_date = scanner.scan_hot_themes()
+            except Exception as exc:
+                st.error(f"扫描失败：{exc}")
+            else:
+                if not scanned_date:
+                    st.warning("本地 stock_daily_kline 无可用日期，请先同步行情。")
+                elif df_res.empty:
+                    st.info(
+                        f"📅 交易日 {scanned_date} 全市场暂无股票触动经验拐点。"
+                    )
+                else:
+                    if keyword.strip():
+                        kw = keyword.strip()
+                        df_res = df_res[
+                            df_res["股票名称"].str.contains(
+                                kw, na=False, regex=False
+                            )
+                            | df_res["股票代码"].str.contains(
+                                kw, na=False, regex=False
+                            )
+                        ]
+                    if df_res.empty:
+                        if keyword.strip():
+                            st.info(
+                                f"📅 交易日 {scanned_date} 暂无符合关键词「{keyword.strip()}」的标的。"
+                            )
+                        else:
+                            st.info(
+                                f"📅 交易日 {scanned_date} 全市场暂无股票触动经验拐点。"
+                            )
+                    else:
+                        st.success(
+                            f"🎯 成功在 {scanned_date} 捕获到 {len(df_res)} 个交易员经验状态拐点股："
+                        )
+                        st.dataframe(
+                            df_res,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
 # ----------------- TAB 4: 模型表现 -----------------
 with tab_perf:
@@ -1507,18 +1615,42 @@ with tab_data:
         with col_cb1:
             include_300 = st.checkbox(
                 "🟢 包含创业板 (300 / 301)",
-                value=True,
+                value=False,
                 help="未勾选时，选股池将排除代码以 300、301 开头的股票",
             )
         with col_cb2:
             include_688 = st.checkbox(
                 "🔵 包含科创板 (688)",
-                value=True,
+                value=False,
                 help="未勾选时，选股池将排除代码以 688 开头的股票",
             )
 
         config_manager.reload()
-        _ef_ui = dict(config_manager.config.get("experience_filters") or {})
+        try:
+            _ef_cfg_mtime = float(config_manager.config_path.stat().st_mtime)
+        except OSError:
+            _ef_cfg_mtime = 0.0
+        if st.session_state.get("_quant_ef_cfg_mtime") != _ef_cfg_mtime:
+            st.session_state["_quant_ef_cfg_mtime"] = _ef_cfg_mtime
+            for _k in (
+                "task_c_ef_min_price",
+                "task_c_ef_max_price",
+                "task_c_ef_min_mcap",
+                "task_c_ef_max_mcap",
+                "task_c_ef_min_turnover",
+                "task_c_ef_max_turnover",
+            ):
+                st.session_state.pop(_k, None)
+
+        _mp, _Mxp, _mm, _Mxm, _mt, _Mxt = get_experience_thresholds()
+        _ef_ui = {
+            "min_price": _mp,
+            "max_price": _Mxp,
+            "min_mcap": _mm,
+            "max_mcap": _Mxm,
+            "min_turnover": _mt,
+            "max_turnover": _Mxt,
+        }
         with st.expander(
             "⚙️ 经验风控阈值（打分后、取 Top 前硬过滤；留空表示不限制）",
             expanded=False,
@@ -1526,7 +1658,9 @@ with tab_data:
             st.caption(
                 "单位：价格为元，市值为亿元，换手为百分比（%）。"
                 "无日线换手率列时用量比代理，与控制台日志说明一致。"
-                "点击「运行每日预测」时会先写入项目根目录 config.json，再启动子进程。"
+                "下方展示为**当前实际生效**阈值（`config.json` 与 `src/config.py` 合并；"
+                "若曾保存过全空 JSON，会回退到代码默认）。"
+                "点击「运行每日预测」或「启动历史滚动回测」时会先写入项目根目录 config.json，再启动子进程。"
             )
             _ec1, _ec2, _ec3 = st.columns(3)
             with _ec1:
@@ -1565,7 +1699,7 @@ with tab_data:
                 st.markdown(
                     "<p style='font-size:0.82rem;color:#475569;margin-top:0.2rem;'>"
                     "也可直接编辑 <code>config.json</code> 中 <code>experience_filters</code>；"
-                    "代码级默认见 <code>src/config.py</code> 中 MIN_PRICE 等（仅当 JSON 未写该键时生效）。"
+                    "仅改 <code>src/config.py</code> 时保存 JSON 或刷新页面后即可与界面同步。"
                     "</p>",
                     unsafe_allow_html=True,
                 )
@@ -1575,41 +1709,9 @@ with tab_data:
         )
         if predict_btn:
             with st.spinner("提取全市场实时因子，进行 LightGBM 测算中..."):
-                save_ok = False
-                try:
-                    config_manager.config.setdefault(
-                        "notification",
-                        {"send_on_success": True, "send_on_error": True},
-                    )
-                    config_manager.config["experience_filters"] = {
-                        "min_price": _parse_experience_filter_text(
-                            st.session_state.get("task_c_ef_min_price", "")
-                        ),
-                        "max_price": _parse_experience_filter_text(
-                            st.session_state.get("task_c_ef_max_price", "")
-                        ),
-                        "min_mcap": _parse_experience_filter_text(
-                            st.session_state.get("task_c_ef_min_mcap", "")
-                        ),
-                        "max_mcap": _parse_experience_filter_text(
-                            st.session_state.get("task_c_ef_max_mcap", "")
-                        ),
-                        "min_turnover": _parse_experience_filter_text(
-                            st.session_state.get("task_c_ef_min_turnover", "")
-                        ),
-                        "max_turnover": _parse_experience_filter_text(
-                            st.session_state.get("task_c_ef_max_turnover", "")
-                        ),
-                    }
-                    save_ok = bool(config_manager.save_config())
-                    if save_ok:
-                        config_manager.reload()
-                    else:
-                        st.error("❌ 保存经验风控配置到 config.json 失败，未启动选股。")
-                except ValueError as exc:
-                    st.error(f"❌ 经验风控参数须为数字或留空：{exc}")
-
+                save_ok, err_ef = _persist_experience_filters_from_ui()
                 if not save_ok:
+                    st.error(f"❌ {err_ef}" if err_ef else "❌ 未启动选股。")
                     st.stop()
 
                 cmd = [sys.executable, str(ROOT / "run_daily.py")]
@@ -1632,7 +1734,7 @@ with tab_data:
             """
             <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
                 <h4 style="color: #0f766e; margin-top:0;">📈 任务 D：运行策略历史滚动回测</h4>
-                <p style="font-size: 0.85rem; color: #475569;">基于本地 stock_daily_kline；不传日期时默认回测区间为库内最早日至最晚日。基准 000300 优先读库。不足可加 --online-fallback。</p>
+                <p style="font-size: 0.85rem; color: #475569;">基于本地 stock_daily_kline；不传日期时默认回测区间为库内最早日至最晚日。基准 000300 优先读库。不足可加 --online-fallback。板块（创业板/科创板）与左侧勾选一致。点击启动时会先将左侧「经验风控阈值」写入 config.json，再运行回测（与「运行每日预测」一致）。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1644,8 +1746,17 @@ with tab_data:
         )
         if backtest_btn:
             with st.spinner("滚动回测执行中，请耐心等待..."):
+                save_bt, err_bt = _persist_experience_filters_from_ui()
+                if not save_bt:
+                    st.error(f"❌ {err_bt}" if err_bt else "❌ 未启动回测。")
+                    st.stop()
+                _bt_cmd = [sys.executable, str(ROOT / "scripts" / "backtest.py")]
+                if include_300:
+                    _bt_cmd.append("--include-300")
+                if include_688:
+                    _bt_cmd.append("--include-688")
                 ret_code, _log = run_command_interactive(
-                    [sys.executable, str(ROOT / "scripts" / "backtest.py")],
+                    _bt_cmd,
                     task_name="历史滚动回测",
                 )
                 if ret_code == 0:

@@ -10,6 +10,7 @@
     # 不传日期时，开始/结束日默认取 stock_daily_kline 库内 MIN(date)、MAX(date)
   python scripts/backtest.py --start-date 2024-01-01 --end-date 2024-12-31
   python scripts/backtest.py --holding-days 5 --buy-price open --sell-price open
+  python scripts/backtest.py --include-300 --include-688   # 与 run_daily 一致：默认剔除 300/301/688
 
 说明:
   - 行情默认仅从 SQLite 表 ``stock_daily_kline`` 读取（与本地行情同步脚本一致）；可加 ``--online-fallback`` 在网络可用时补拉。
@@ -57,6 +58,7 @@ from src.factor_calculator import (  # noqa: E402
 )
 from src.model_trainer import load_model  # noqa: E402
 from src.predictor import (  # noqa: E402
+    apply_experience_trading_filters,
     filter_predictions,
     prune_zero_volume_rows,
     suppress_high_recent_gains,
@@ -68,6 +70,20 @@ TRADING_DAYS_PER_YEAR = 242
 
 def _normalize_date(s: str) -> str:
     return str(s).strip()[:10]
+
+
+def _normalize_stock_code(code: str) -> str:
+    return str(code).strip().zfill(6)
+
+
+def _board_allowed(code: str, *, include_300: bool, include_688: bool) -> bool:
+    """与 run_daily 一致：未勾选 include 时剔除 300/301 与 688 开头代码。"""
+    c = _normalize_stock_code(code)
+    if not include_300 and (c.startswith("300") or c.startswith("301")):
+        return False
+    if not include_688 and c.startswith("688"):
+        return False
+    return True
 
 
 def load_active_model() -> Any:
@@ -361,6 +377,20 @@ def _feature_dict_as_of(
     if not np.isfinite(lv) or lv <= 0:
         return None
     out["volume"] = lv
+    vol_s = sub["volume"].astype(float)
+    vma5 = vol_s.rolling(5).mean()
+    out["volume_ratio_raw"] = float(
+        vol_s.iloc[last_i] / (float(vma5.iloc[last_i]) + 1e-12)
+    )
+    if "market_cap" in sub.columns:
+        mc_raw = sub.iloc[last_i].get("market_cap")
+        try:
+            mc_f = float(mc_raw) if mc_raw is not None else float("nan")
+        except (TypeError, ValueError):
+            mc_f = float("nan")
+        out["mcap"] = mc_f if np.isfinite(mc_f) and mc_f > 0 else float("nan")
+    else:
+        out["mcap"] = float("nan")
     if len(sub) >= 2:
         c0 = float(sub.iloc[-2]["close"])
         c1 = float(sub.iloc[-1]["close"])
@@ -375,6 +405,9 @@ def _score_universe_for_date(
     by_code: dict[str, pd.DataFrame],
     universe: list[tuple[str, str]],
     model: Any,
+    *,
+    include_300: bool = False,
+    include_688: bool = False,
 ) -> list[str]:
     rows: list[dict[str, Any]] = []
     for code, name in universe:
@@ -396,6 +429,15 @@ def _score_universe_for_date(
     feat_df = filter_predictions(feat_df)
     if feat_df.empty:
         return []
+    sc = feat_df["stock_code"].map(_normalize_stock_code)
+    bmask = pd.Series(True, index=feat_df.index)
+    if not include_300:
+        bmask &= ~(sc.str.startswith("300") | sc.str.startswith("301"))
+    if not include_688:
+        bmask &= ~sc.str.startswith("688")
+    feat_df = feat_df.loc[bmask].copy()
+    if feat_df.empty:
+        return []
     feat_df = feat_df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLUMNS)
     if feat_df.empty:
         return []
@@ -403,7 +445,12 @@ def _score_universe_for_date(
     scores = model.predict(X.values)
     feat_df = feat_df.copy()
     feat_df["score"] = scores.astype(float)
-    feat_df = feat_df.sort_values("score", ascending=False).reset_index(drop=True)
+    feat_df = feat_df.sort_values(
+        ["score", "stock_code"], ascending=[False, True]
+    ).reset_index(drop=True)
+    feat_df = apply_experience_trading_filters(feat_df)
+    if feat_df.empty:
+        return []
     return feat_df.head(TOP_N_SELECTION)["stock_code"].astype(str).tolist()
 
 
@@ -532,6 +579,8 @@ class BacktestEngine:
     """买卖冲击成本：买入成交价 = 市价×(1+rate)，卖出 = 市价×(1−rate)。"""
     slippage_rate: float
     get_universe: Callable[[str], list[tuple[str, str]]]
+    include_300: bool = False
+    include_688: bool = False
 
     cash: float = field(init=False)
     date_pos: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -568,7 +617,12 @@ class BacktestEngine:
                 self._sell_all_open(d)
                 univ = self.get_universe(sig_date)
                 codes = _score_universe_for_date(
-                    sig_date, self.by_code, univ, self.model
+                    sig_date,
+                    self.by_code,
+                    univ,
+                    self.model,
+                    include_300=self.include_300,
+                    include_688=self.include_688,
                 )
                 self._buy_equal_open(d, codes)
 
@@ -818,6 +872,18 @@ def main() -> None:
         help="本地 K 线不足时允许在线拉取行情（默认关闭，纯本地回测）",
     )
     parser.add_argument(
+        "--include-300",
+        dest="include_300",
+        action="store_true",
+        help="包含创业板（300、301 开头）；不传则从池中剔除（与 run_daily 一致）",
+    )
+    parser.add_argument(
+        "--include-688",
+        dest="include_688",
+        action="store_true",
+        help="包含科创板（688 开头）；不传则从池中剔除（与 run_daily 一致）",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=str(DATA_DIR / "backtest_results.csv"),
@@ -887,6 +953,23 @@ def main() -> None:
             )
         print(f"使用数据库内股票共 {len(pairs)} 只参与回测。", flush=True)
 
+    n_pool = len(pairs)
+    pairs = [
+        (c, n)
+        for c, n in pairs
+        if _board_allowed(c, include_300=args.include_300, include_688=args.include_688)
+    ]
+    if n_pool and len(pairs) < n_pool:
+        print(
+            f"板块过滤：{n_pool} → {len(pairs)} "
+            f"（含创业板300/301={args.include_300}, 含科创板688={args.include_688}）。",
+            flush=True,
+        )
+    if not pairs:
+        raise SystemExit(
+            "板块过滤后股票池为空。可尝试加 --include-300 / --include-688，或放宽股票池。"
+        )
+
     bars = fetch_backtest_data(
         start_date,
         end_date,
@@ -917,9 +1000,16 @@ def main() -> None:
         transaction_fee_rate=tx_fee,
         slippage_rate=slip,
         get_universe=universe_fn,
+        include_300=args.include_300,
+        include_688=args.include_688,
     )
     print(
         f"摩擦假设: transaction_fee_rate={tx_fee:.6g}, slippage_rate={slip:.6g}",
+        flush=True,
+    )
+    print(
+        f"选股与任务 C 对齐：板块（300/301/688）与 config 经验硬过滤；"
+        f"含300/301={args.include_300}, 含688={args.include_688}。",
         flush=True,
     )
     engine.run()

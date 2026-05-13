@@ -935,3 +935,18 @@ def diagnose_single_stock(
         "reason_line": reason_line,
     }
     return result, conclusion, theme
+
+
+def run_theme_alpha_scan(
+    connection: Any,
+    target_date: str | None = None,
+    theme_keywords: str | list[str] | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """
+    热门题材高爆策略：输出列与 ``integrate_trader_experience.txt`` Part 1 一致
+    （最新价格/量比为格式化字符串，结论列为三类信号 + 默认不返回横盘行）。
+    """
+    from .theme_strategy import ThemeAlphaStrategy
+
+    engine = ThemeAlphaStrategy(connection)
+    return engine.scan_hot_themes(target_date=target_date, theme_keywords=theme_keywords)

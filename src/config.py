@@ -236,12 +236,13 @@ def get_experience_thresholds() -> tuple[
         MAX_TURNOVER,
     )
     try:
-        from .config_manager import config_manager
+        from .config_manager import _normalize_experience_filters_merged, config_manager
 
         config_manager.reload()
         raw = config_manager.config.get("experience_filters")
         if not isinstance(raw, dict):
             return (mp, Mxp, mm, Mxm, mt, Mxt)
+        raw = _normalize_experience_filters_merged(dict(raw))
 
         def _pick(key: str, cur: float | None) -> float | None:
             if key not in raw:

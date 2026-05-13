@@ -11,6 +11,30 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
+_EXPERIENCE_FILTER_KEYS = (
+    "min_price",
+    "max_price",
+    "min_mcap",
+    "max_mcap",
+    "min_turnover",
+    "max_turnover",
+)
+
+
+def _normalize_experience_filters_merged(merged: dict[str, Any]) -> dict[str, Any]:
+    """
+    旧版默认在 ``config.json`` 里写满六个 ``null``，合并后键始终「存在」，
+    导致 ``get_experience_thresholds`` 永远用 JSON 的 None 而不再回退 ``src/config.py``。
+    若六项均为空，则视为未配置，等价于 ``{}``。
+    """
+    if not merged:
+        return {}
+    if not set(merged.keys()).issuperset(set(_EXPERIENCE_FILTER_KEYS)):
+        return merged
+    if all(merged.get(x) in (None, "") for x in _EXPERIENCE_FILTER_KEYS):
+        return {}
+    return merged
+
 
 class ConfigManager:
     def __init__(self, config_path: Path | None = None):
@@ -43,6 +67,8 @@ class ConfigManager:
                     # 用户只写了 Webhook、未写 enabled 时，默认视为启用（避免合并层仍保留默认 false）
                     if "enabled" not in v:
                         merged["enabled"] = True
+                if k == "experience_filters":
+                    merged = _normalize_experience_filters_merged(merged)
                 out[k] = merged
             else:
                 out[k] = v
@@ -60,14 +86,7 @@ class ConfigManager:
                 "send_on_success": True,
                 "send_on_error": True,
             },
-            "experience_filters": {
-                "min_price": None,
-                "max_price": None,
-                "min_mcap": None,
-                "max_mcap": None,
-                "min_turnover": None,
-                "max_turnover": None,
-            },
+            "experience_filters": {},
         }
 
     def save_config(self) -> bool:
