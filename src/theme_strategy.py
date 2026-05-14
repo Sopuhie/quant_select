@@ -36,7 +36,16 @@ BUY_RESULT_COLUMNS = [
     "MACD红柱",
     "信号类型",
     "建议",
+    "触发信号",
 ]
+
+# 热门题材打分权重
+THEME_SCORE_TREND = 30
+THEME_SCORE_VOLUME = 25
+THEME_SCORE_MACD = 25
+THEME_SCORE_KDJ = 20
+THEME_SCORE_BUY_THRESHOLD = 50  # 总分超过此阈值即推荐买入
+
 SELL_RESULT_COLUMNS = [
     "股票代码",
     "股票名称",
@@ -313,7 +322,33 @@ class ThemeAlphaStrategy:
                 and j_slope > j_slope_min
             )
 
-            if cond_trend and cond_volume and cond_macd_buy and cond_kdj_buy:
+            # 涨跌停过滤：涨停/跌停日无法交易，跳过
+            if abs(chg) >= 0.095:
+                continue
+
+            # 打分制买入评估（替代原 AND 逻辑）
+            score = 0
+            signals = []
+            if cond_trend:
+                score += THEME_SCORE_TREND
+                signals.append("趋势多头")
+            if cond_volume:
+                score += THEME_SCORE_VOLUME
+                signals.append("放量启动")
+            if cond_macd_buy:
+                score += THEME_SCORE_MACD
+                signals.append("MACD多头")
+            if cond_kdj_buy:
+                score += THEME_SCORE_KDJ
+                signals.append("KDJ金叉")
+
+            if score >= THEME_SCORE_BUY_THRESHOLD:
+                if score >= 80:
+                    suggestion = "买入共振成立，建议建仓30%"
+                elif score >= 65:
+                    suggestion = "强信号，建议建仓20%"
+                else:
+                    suggestion = "偏多信号，建议轻仓试探15%"
                 buy_rows.append(
                     {
                         "股票代码": code,
@@ -323,7 +358,8 @@ class ThemeAlphaStrategy:
                         "KDJ_J值": round(j_now, 2),
                         "MACD红柱": round(cbar, 4),
                         "信号类型": "BUY",
-                        "建议": "买入共振成立，建议建仓30%",
+                        "建议": suggestion,
+                        "触发信号": " + ".join(signals),
                     }
                 )
 

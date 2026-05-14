@@ -408,11 +408,26 @@ def get_stock_pool(
     return out
 
 
-def list_a_stock_codes(max_count: int | None = None) -> list[tuple[str, str]]:
-    """
-    返回 (code6, name) 列表。code6 为 6 位数字，不含市场前缀。
-    """
-    df = ak.stock_info_a_code_name()
+def _bs_code_is_listed_a_share(bs_code: str) -> bool:
+    """Baostock 证券代码（如 sh.600000）是否为沪深北 A 股普通股票（排除指数等）。"""
+    s = str(bs_code).strip().lower()
+    if "." not in s:
+        return False
+    mkt, num = s.split(".", 1)
+    if len(num) != 6 or not num.isdigit():
+        return False
+    if mkt == "sh":
+        return num.startswith(("60", "688", "689"))
+    if mkt == "sz":
+        return num.startswith(("000", "001", "002", "003", "300", "301"))
+    if mkt == "bj":
+        return num.startswith(("43", "82", "83", "87", "88", "92"))
+    return False
+
+
+def _pairs_from_akshare_stock_info_df(
+    df: pd.DataFrame, max_count: int | None
+) -> list[tuple[str, str]]:
     if df is None or df.empty:
         return []
     cols = list(df.columns)
@@ -430,9 +445,112 @@ def list_a_stock_codes(max_count: int | None = None) -> list[tuple[str, str]]:
         n = str(row[name_col]).strip()
         if len(c) == 6 and c.isdigit():
             pairs.append((c, n))
-        if max_count is not None and len(pairs) >= max_count:
+        if max_count is not None and len(pairs) >= int(max_count):
             break
     return pairs
+
+
+def _list_a_stock_codes_via_baostock(max_count: int | None) -> list[tuple[str, str]]:
+    """
+    AkShare ``stock_info_a_code_name`` 依赖证交所页面，易被断开；用 Baostock 全量证券表兜底。
+    """
+    try:
+        import baostock as bs
+    except ImportError:
+        return []
+
+    pairs_map: dict[str, str] = {}
+    with _BS_LOCK:
+        global _BS_LOGGED_IN, _BS_ATEXIT_REGISTERED
+        if not _BS_LOGGED_IN:
+            lg = bs.login()
+            if lg.error_code != "0":
+                return []
+            _BS_LOGGED_IN = True
+            if not _BS_ATEXIT_REGISTERED:
+                atexit.register(_baostock_logout)
+                _BS_ATEXIT_REGISTERED = True
+        try:
+            for day_offset in range(0, 28):
+                d = (datetime.now().date() - timedelta(days=day_offset)).strftime(
+                    "%Y-%m-%d"
+                )
+                rs = bs.query_all_stock(day=d)
+                if rs.error_code != "0":
+                    continue
+                while rs.error_code == "0" and rs.next():
+                    row = rs.get_row_data()
+                    if len(row) < 3:
+                        continue
+                    code_raw, trade_status, name = row[0], row[1], row[2]
+                    if str(trade_status).strip() != "1":
+                        continue
+                    code_raw_s = str(code_raw).strip()
+                    if not _bs_code_is_listed_a_share(code_raw_s):
+                        continue
+                    _, num = code_raw_s.lower().split(".", 1)
+                    code6 = num.zfill(6)
+                    name_s = str(name).strip() if name else ""
+                    if len(code6) == 6 and code6.isdigit():
+                        pairs_map.setdefault(code6, name_s)
+                if pairs_map:
+                    break
+        except Exception:
+            return []
+
+    out = sorted(pairs_map.items(), key=lambda x: x[0])
+    if max_count is not None:
+        out = out[: int(max_count)]
+    return list(out)
+
+
+def list_a_stock_codes(max_count: int | None = None) -> list[tuple[str, str]]:
+    """
+    返回 (code6, name) 列表。code6 为 6 位数字，不含市场前缀。
+
+    优先 AkShare ``stock_info_a_code_name``（带重试）；连接被重置等失败时改用 Baostock
+    ``query_all_stock``，减轻对深交所列表页的依赖。
+    """
+    ensure_eastmoney_no_proxy_if_configured()
+    retries = max(1, int(AKSHARE_FETCH_RETRIES))
+    sleep_base = float(AKSHARE_FETCH_RETRY_SLEEP)
+    last_exc: BaseException | None = None
+    for attempt in range(retries):
+        try:
+            df = ak.stock_info_a_code_name()
+            pairs = _pairs_from_akshare_stock_info_df(df, max_count)
+            if pairs:
+                return pairs
+        except Exception as exc:
+            last_exc = exc
+            transient = _is_transient_network_failure(exc)
+            if attempt + 1 < retries and transient:
+                delay = sleep_base * (2**attempt) + random.uniform(0, 0.6)
+                _log.warning(
+                    "stock_info_a_code_name 失败 (%s)，%s 后重试 (%s/%s)",
+                    type(exc).__name__,
+                    f"{delay:.1f}s",
+                    attempt + 1,
+                    retries,
+                )
+                time.sleep(delay)
+                continue
+            if attempt + 1 < retries:
+                delay = sleep_base * (2**attempt) + random.uniform(0, 0.6)
+                time.sleep(delay)
+                continue
+
+    fallback = _list_a_stock_codes_via_baostock(max_count=max_count)
+    if fallback:
+        if last_exc is not None:
+            _log.warning(
+                "已改用 Baostock 证券列表作为 A 股代码表（AkShare 末次错误: %s）",
+                last_exc,
+            )
+        return fallback
+    if last_exc is not None:
+        _log.error("list_a_stock_codes 失败且无 Baostock 兜底: %s", last_exc)
+    return []
 
 
 def fetch_daily_hist(
