@@ -17,7 +17,7 @@
   - 股票池优先 AkShare 成分；失败则自动改为「库内出现的代码」。
   - 沪深300 基准：优先读库内代码 000300；若无则再尝试 AkShare。
   - 净值序列默认写入 data/backtest_results.csv。
-  - 换仓时计入 **单边佣金**（默认万三）与 **卖出印花税**（默认千一），以及 ``--slippage-rate`` 冲击成本。
+  - 换仓时计入 **单边佣金**（默认万三）与 **卖出印花税**（默认千一），以及 **滑点**（默认见 ``config.py`` 的 ``BACKTEST_DEFAULT_SLIPPAGE_RATE`` / ``quant.backtest.slippage_rate``，可用 ``--slippage-rate`` 覆盖）。
 """
 from __future__ import annotations
 
@@ -40,6 +40,9 @@ if str(ROOT) not in sys.path:
 warnings.filterwarnings("ignore", category=UserWarning)
 
 from src.config import (  # noqa: E402
+    BACKTEST_DEFAULT_SLIPPAGE_RATE,
+    BACKTEST_LIMIT_PRICE_EPS_YUAN,
+    BACKTEST_MAX_CALENDAR_GAP_DAYS,
     DATA_DIR,
     DB_PATH,
     FEATURE_COLUMNS,
@@ -90,54 +93,91 @@ def _is_suspended_row(row: pd.Series) -> bool:
     return not (np.isfinite(fv) and fv > 1e-8)
 
 
-def _is_one_word_limit_up(row: pd.Series, code: str, prev_close: float) -> bool:
-    """选股次日开盘近似一字涨停：难以按开盘价成交。"""
+def _theoretical_limit_prices(prev_close: float, code: str) -> tuple[float, float]:
+    """理论涨停价、跌停价（按板块涨跌幅四舍五入到分）。"""
+    pct = _board_limit_pct(code)
+    up = float(round(prev_close * (1.0 + pct), 2))
+    dn = float(round(prev_close * (1.0 - pct), 2))
+    return up, dn
+
+
+def _price_matches_limit(px: float, limit_px: float, *, eps: float) -> bool:
+    return np.isfinite(px) and np.isfinite(limit_px) and abs(px - limit_px) <= eps
+
+
+def _is_strict_one_word_limit_up(
+    row: pd.Series, code: str, prev_close: float, *, eps: float
+) -> bool:
+    """一字涨停：Open≈High≈Low≈理论涨停价，按开盘价无法成交（工业对齐）。"""
     if not np.isfinite(prev_close) or prev_close <= 1e-8:
         return False
-    pct = _board_limit_pct(code)
-    lim = prev_close * (1.0 + pct - 1e-4)
+    lim_up, _ = _theoretical_limit_prices(prev_close, code)
     try:
         o = float(row["open"])
         h = float(row["high"])
         l_ = float(row["low"])
-        cl = float(row["close"])
     except (TypeError, ValueError, KeyError):
         return True
-    if not all(np.isfinite(x) for x in (o, h, l_, cl)):
+    if not all(np.isfinite(x) for x in (o, h, l_)):
         return True
-    if o < lim * 0.997:
-        return False
-    if cl < lim * 0.992:
-        return False
-    intraday_range = (h - l_) / max(prev_close, 1e-9)
-    if intraday_range > 0.02:
-        return False
-    return True
+    return (
+        _price_matches_limit(h, lim_up, eps=eps)
+        and _price_matches_limit(l_, lim_up, eps=eps)
+        and _price_matches_limit(o, lim_up, eps=eps)
+    )
 
 
-def _is_one_word_limit_down(row: pd.Series, code: str, prev_close: float) -> bool:
-    """一字跌停：难以按开盘价卖出。"""
+def _is_strict_one_word_limit_down(
+    row: pd.Series, code: str, prev_close: float, *, eps: float
+) -> bool:
+    """一字跌停：Open≈High≈Low≈理论跌停价，当日无法卖出，持仓顺延至可卖日。"""
     if not np.isfinite(prev_close) or prev_close <= 1e-8:
         return False
-    pct = _board_limit_pct(code)
-    lim = prev_close * (1.0 - pct + 1e-4)
+    _, lim_dn = _theoretical_limit_prices(prev_close, code)
     try:
         o = float(row["open"])
         h = float(row["high"])
         l_ = float(row["low"])
-        cl = float(row["close"])
     except (TypeError, ValueError, KeyError):
         return True
-    if not all(np.isfinite(x) for x in (o, h, l_, cl)):
+    if not all(np.isfinite(x) for x in (o, h, l_)):
         return True
-    if o > lim * 1.003:
+    return (
+        _price_matches_limit(h, lim_dn, eps=eps)
+        and _price_matches_limit(l_, lim_dn, eps=eps)
+        and _price_matches_limit(o, lim_dn, eps=eps)
+    )
+
+
+def _prev_trading_date(trade_dates: list[str], d: str) -> str | None:
+    try:
+        i = trade_dates.index(d)
+    except ValueError:
+        return None
+    return trade_dates[i - 1] if i > 0 else None
+
+
+def _is_buy_bar_disqualified(
+    row: pd.Series,
+    prev_row: pd.Series | None,
+    buy_date: str,
+    expected_prev_td: str | None,
+    *,
+    max_calendar_gap_days: int,
+) -> bool:
+    """停牌或 K 线缺口：成交量为 0 / 上一根非上一交易日 / 自然日间隔过大 → 禁止买入。"""
+    if _is_suspended_row(row):
+        return True
+    if prev_row is None or expected_prev_td is None:
         return False
-    if cl > lim * 1.008:
-        return False
-    intraday_range = (h - l_) / max(prev_close, 1e-9)
-    if intraday_range > 0.02:
-        return False
-    return True
+    pdate = _normalize_date(str(prev_row.get("date", "")))
+    if pdate != expected_prev_td:
+        return True
+    d_row = _normalize_date(str(row.get("date", "")))
+    gap = (pd.Timestamp(d_row) - pd.Timestamp(pdate)).days
+    if gap > int(max_calendar_gap_days):
+        return True
+    return False
 
 
 def _normalize_date(s: str) -> str:
@@ -670,6 +710,10 @@ class BacktestEngine:
     stamp_duty_sell_rate: float
     """买卖冲击成本：买入成交价 = 市价×(1+rate)，卖出 = 市价×(1−rate)。"""
     slippage_rate: float
+    """涨跌停价与 OHLC 对齐容差（元）。"""
+    limit_price_eps_yuan: float = BACKTEST_LIMIT_PRICE_EPS_YUAN
+    """相邻日 K 自然日间隔超过该值视为缺口/长期停牌，禁止买入。"""
+    max_calendar_gap_days: int = BACKTEST_MAX_CALENDAR_GAP_DAYS
     get_universe: Callable[[str], list[tuple[str, str]]]
     include_300: bool = False
     include_688: bool = False
@@ -740,14 +784,27 @@ class BacktestEngine:
         proceeds_sum = 0.0
         sold_cost = 0.0
         remaining: list[HeldShare] = []
+        eps = float(self.limit_price_eps_yuan)
         for pos in self.positions:
             row = self._row(d, pos.code)
             if row is None or _is_suspended_row(row):
+                if row is not None and _is_suspended_row(row):
+                    print(
+                        f"[回测] {d} {pos.code} 跳过卖出: 当日停牌/零成交量，持仓顺延",
+                        flush=True,
+                    )
                 remaining.append(pos)
                 continue
             prev = self._prev_row(pos.code, d)
             prev_c = float(prev["close"]) if prev is not None else float("nan")
-            if np.isfinite(prev_c) and _is_one_word_limit_down(row, pos.code, prev_c):
+            if np.isfinite(prev_c) and _is_strict_one_word_limit_down(
+                row, pos.code, prev_c, eps=eps
+            ):
+                _, lim_dn = _theoretical_limit_prices(prev_c, pos.code)
+                print(
+                    f"[回测] {d} {pos.code} 跳过卖出: 一字跌停 O≈H≈L≈跌停价 {lim_dn:.2f}，持仓顺延至可卖日",
+                    flush=True,
+                )
                 remaining.append(pos)
                 continue
             px = _price_on(row, self.sell_price)
@@ -776,13 +833,39 @@ class BacktestEngine:
         new_holdings: list[HeldShare] = []
         slip = max(0.0, float(self.slippage_rate))
         comm_r = max(0.0, float(self.commission_rate))
+        eps = float(self.limit_price_eps_yuan)
+        exp_prev = _prev_trading_date(self.trade_dates, d)
         for code in codes:
             row = self._row(d, code)
             if row is None or _is_suspended_row(row):
+                if row is not None:
+                    print(
+                        f"[回测] {d} {code} 跳过买入: 当日停牌或零成交量",
+                        flush=True,
+                    )
                 continue
             prev = self._prev_row(code, d)
             prev_c = float(prev["close"]) if prev is not None else float("nan")
-            if np.isfinite(prev_c) and _is_one_word_limit_up(row, code, prev_c):
+            if _is_buy_bar_disqualified(
+                row,
+                prev,
+                d,
+                exp_prev,
+                max_calendar_gap_days=int(self.max_calendar_gap_days),
+            ):
+                print(
+                    f"[回测] {d} {code} 跳过买入: K 线不连续或相对上一交易日缺口（停牌/数据缺失）",
+                    flush=True,
+                )
+                continue
+            if np.isfinite(prev_c) and _is_strict_one_word_limit_up(
+                row, code, prev_c, eps=eps
+            ):
+                lim_up, _ = _theoretical_limit_prices(prev_c, code)
+                print(
+                    f"[回测] {d} {code} 跳过买入: 一字涨停 O≈H≈L≈涨停价 {lim_up:.2f}，本笔视为无法成交",
+                    flush=True,
+                )
                 continue
             px = _price_on(row, self.buy_price)
             if not np.isfinite(px) or px <= 0:
@@ -976,8 +1059,8 @@ def main() -> None:
     parser.add_argument(
         "--slippage-rate",
         type=float,
-        default=1e-3,
-        help="冲击成本：买价×(1+rate)、卖价×(1−rate)；默认 0.001",
+        default=None,
+        help="冲击成本：买价×(1+rate)、卖价×(1−rate)；默认取 config quant.backtest.slippage_rate",
     )
     parser.add_argument(
         "--buy-fee-rate",
@@ -1022,7 +1105,11 @@ def main() -> None:
     args = parser.parse_args()
 
     qbt = get_quant_config_merged().get("backtest", {})
-    slip = float(args.slippage_rate)
+    slip = (
+        float(args.slippage_rate)
+        if args.slippage_rate is not None
+        else float(qbt.get("slippage_rate", BACKTEST_DEFAULT_SLIPPAGE_RATE))
+    )
     if args.buy_fee_rate is not None or args.sell_fee_rate is not None:
         print(
             "提示: --buy-fee-rate / --sell-fee-rate 已弃用；请使用 --commission-rate / --stamp-duty-sell-rate。",
@@ -1151,6 +1238,8 @@ def main() -> None:
         commission_rate=comm,
         stamp_duty_sell_rate=stamp,
         slippage_rate=slip,
+        limit_price_eps_yuan=float(BACKTEST_LIMIT_PRICE_EPS_YUAN),
+        max_calendar_gap_days=int(BACKTEST_MAX_CALENDAR_GAP_DAYS),
         get_universe=universe_fn,
         include_300=args.include_300,
         include_688=args.include_688,

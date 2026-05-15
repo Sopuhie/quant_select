@@ -5,18 +5,30 @@ from __future__ import annotations
 
 import logging
 import os
+import random
+import time
+from collections import deque
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from .config import TOP_N_SELECTION
+from .config import (
+    REALTIME_MONITOR_MAX_REQUESTS_PER_MINUTE,
+    REALTIME_MONITOR_PAUSE_AFTER_FAILS,
+    REALTIME_MONITOR_PAUSE_SECONDS,
+    REALTIME_MONITOR_SLEEP_SEC_MAX,
+    REALTIME_MONITOR_SLEEP_SEC_MIN,
+    REALTIME_SIGNAL_DEDUP_WINDOW_MINUTES,
+    TOP_N_SELECTION,
+)
 from .database import (
     fetch_signal_history_for_stock_on_date,
     fetch_top3_selections_for_monitor,
     init_db,
     insert_signal_record,
     signal_exists_in_minute,
+    signal_exists_within_minutes,
 )
 from .kline_chart import get_realtime_min_data
 from .utils import is_a_share_intraday_session
@@ -30,6 +42,67 @@ SIGNAL_VOL_PRICE = "Volume_Price_Resonance"
 _COLOR_BUY = "#16a34a"
 _COLOR_VOL_UP = "rgba(220, 38, 38, 0.72)"  # 上涨红
 _COLOR_VOL_DN = "rgba(22, 163, 74, 0.72)"  # 下跌绿
+
+# 分钟级请求时间戳（monotonic），用于 RPM 限流
+_request_ts_mono: deque[float] = deque()
+_consecutive_api_fails = 0
+_pause_until_wall: float = 0.0
+
+
+def _sleep_inter_request_jitter() -> None:
+    lo = float(REALTIME_MONITOR_SLEEP_SEC_MIN)
+    hi = float(REALTIME_MONITOR_SLEEP_SEC_MAX)
+    if hi < lo:
+        lo, hi = hi, lo
+    if hi <= 0:
+        return
+    time.sleep(random.uniform(max(0.0, lo), hi))
+
+
+def _rpm_guard_before_request() -> None:
+    cap = int(REALTIME_MONITOR_MAX_REQUESTS_PER_MINUTE)
+    if cap <= 0:
+        return
+    now = time.monotonic()
+    while _request_ts_mono and (now - _request_ts_mono[0]) > 60.0:
+        _request_ts_mono.popleft()
+    if len(_request_ts_mono) >= cap:
+        wait = 60.0 - (now - _request_ts_mono[0]) + 0.05
+        if wait > 0:
+            logger.info(
+                "实时监控 RPM 达上限 %s，休眠 %.2fs",
+                cap,
+                wait,
+            )
+            time.sleep(wait)
+        now = time.monotonic()
+        while _request_ts_mono and (now - _request_ts_mono[0]) > 60.0:
+            _request_ts_mono.popleft()
+    _request_ts_mono.append(time.monotonic())
+
+
+def _monitor_cooling() -> bool:
+    return time.time() < float(_pause_until_wall)
+
+
+def _register_api_failure() -> None:
+    global _consecutive_api_fails, _pause_until_wall
+    _consecutive_api_fails += 1
+    n = int(REALTIME_MONITOR_PAUSE_AFTER_FAILS)
+    if n > 0 and _consecutive_api_fails >= n:
+        pause_sec = float(REALTIME_MONITOR_PAUSE_SECONDS)
+        _pause_until_wall = time.time() + pause_sec
+        logger.error(
+            "实时监控连续失败 %s 次，暂停 %.0f 秒（数据源不稳定冷却）",
+            _consecutive_api_fails,
+            pause_sec,
+        )
+        _consecutive_api_fails = 0
+
+
+def _register_api_success() -> None:
+    global _consecutive_api_fails
+    _consecutive_api_fails = 0
 
 
 def compute_td_sequential_labels(close: np.ndarray | pd.Series) -> tuple[list[str | None], list[str | None]]:
@@ -257,9 +330,20 @@ def persist_signals_for_stock(
     """去重入库；返回新写入条数。"""
     code = str(stock_code).strip().zfill(6)
     written = 0
+    win = int(REALTIME_SIGNAL_DEDUP_WINDOW_MINUTES)
     for sig in signals:
         sig_type = str(sig["signal_type"])
         sig_time = str(sig["signal_time"])
+        if win > 0 and signal_exists_within_minutes(
+            code, sig_time, sig_type, win, db_path=None
+        ):
+            logger.info(
+                "跳过重复信号入库 %s %s（%s 分钟内已有同类型）",
+                code,
+                sig_type,
+                win,
+            )
+            continue
         bucket = _signal_time_to_minute_bucket(sig_time)
         if signal_exists_in_minute(code, bucket, sig_type):
             continue
@@ -292,8 +376,16 @@ def run_monitor_cycle_for_targets(
     if not in_session:
         persist = False
     init_db()
+    if _monitor_cooling():
+        logger.warning(
+            "实时监控处于冷却期（至 %.0f），本轮不拉取行情",
+            _pause_until_wall,
+        )
+        return []
     panels: list[dict[str, Any]] = []
-    for t in targets[:TOP_N_SELECTION]:
+    for ti, t in enumerate(targets[:TOP_N_SELECTION]):
+        if ti > 0:
+            _sleep_inter_request_jitter()
         code = str(t.get("stock_code", "")).strip().zfill(6)
         name = str(t.get("stock_name") or "").strip()
         score_raw = t.get("score")
@@ -302,9 +394,12 @@ def run_monitor_cycle_for_targets(
         except (TypeError, ValueError):
             rt_score = None
         try:
+            _rpm_guard_before_request()
             df = fetch_today_minute_bars(code)
+            _register_api_success()
         except Exception as exc:
             logger.warning("分钟线拉取失败 %s: %s", code, exc)
+            _register_api_failure()
             df = None
         if df is None or df.empty:
             panels.append(

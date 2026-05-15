@@ -249,6 +249,39 @@ BACKTEST_DEFAULT_COMMISSION_RATE = float(
 BACKTEST_DEFAULT_STAMP_DUTY_SELL = float(
     os.environ.get("QUANT_BACKTEST_STAMP_SELL", "0.001")
 )
+# 回测冲击成本（单边）；与 scripts/backtest.py 默认及 quant.backtest.slippage_rate 对齐
+BACKTEST_DEFAULT_SLIPPAGE_RATE = float(
+    os.environ.get("QUANT_BACKTEST_SLIPPAGE", "0.001")
+)
+# 涨跌停价与 OHLC 对齐容差（元）
+BACKTEST_LIMIT_PRICE_EPS_YUAN = float(
+    os.environ.get("QUANT_BACKTEST_LIMIT_EPS", "0.02")
+)
+# 相邻两根日 K 自然日间隔超过该值视为长期停牌/缺口，禁止买入
+BACKTEST_MAX_CALENDAR_GAP_DAYS = int(
+    os.environ.get("QUANT_BACKTEST_MAX_CAL_GAP", "6")
+)
+
+# 实时监控：请求间隔抖动（秒）、每分钟请求上限、同股同类型信号去重窗口（分钟）
+REALTIME_MONITOR_SLEEP_SEC_MIN = float(
+    os.environ.get("QUANT_REALTIME_SLEEP_MIN", "1.0")
+)
+REALTIME_MONITOR_SLEEP_SEC_MAX = float(
+    os.environ.get("QUANT_REALTIME_SLEEP_MAX", "3.0")
+)
+REALTIME_MONITOR_MAX_REQUESTS_PER_MINUTE = int(
+    os.environ.get("QUANT_REALTIME_MAX_RPM", "40")
+)
+REALTIME_SIGNAL_DEDUP_WINDOW_MINUTES = int(
+    os.environ.get("QUANT_SIGNAL_DEDUP_MIN", "5")
+)
+# 连续 API 失败达到该次数后暂停监控（秒）
+REALTIME_MONITOR_PAUSE_AFTER_FAILS = int(
+    os.environ.get("QUANT_REALTIME_PAUSE_FAILS", "3")
+)
+REALTIME_MONITOR_PAUSE_SECONDS = float(
+    os.environ.get("QUANT_REALTIME_PAUSE_SEC", "300.0")
+)
 
 # 形态匹配：DTW 前粗筛数量、量价 DTW 中成交量权重
 PATTERN_COARSE_TOP_K = max(20, int(os.environ.get("QUANT_PATTERN_COARSE_TOP_K", "100")))
@@ -340,6 +373,7 @@ def get_quant_config_merged() -> dict[str, Any]:
         "backtest": {
             "commission_rate": BACKTEST_DEFAULT_COMMISSION_RATE,
             "stamp_duty_sell_rate": BACKTEST_DEFAULT_STAMP_DUTY_SELL,
+            "slippage_rate": BACKTEST_DEFAULT_SLIPPAGE_RATE,
         },
         "pattern": {
             "coarse_top_k": PATTERN_COARSE_TOP_K,

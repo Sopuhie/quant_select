@@ -1166,6 +1166,36 @@ def signal_exists_in_minute(
         return cur.fetchone() is not None
 
 
+def signal_exists_within_minutes(
+    stock_code: str,
+    signal_time: str,
+    signal_type: str,
+    window_minutes: int,
+    *,
+    db_path: Path | None = None,
+) -> bool:
+    """同股、同 signal_type 在 ``signal_time`` 之前 ``window_minutes`` 分钟内是否已有记录（防震荡重复入库）。"""
+    if window_minutes <= 0:
+        return False
+    code = str(stock_code).strip().zfill(6)
+    st = str(signal_time).strip()[:19]
+    w = max(1, int(window_minutes))
+    mod = f"-{w} minutes"
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT 1 FROM signal_history
+            WHERE stock_code = ?
+              AND signal_type = ?
+              AND datetime(signal_time) > datetime(?, ?)
+              AND datetime(signal_time) <= datetime(?)
+            LIMIT 1
+            """,
+            (code, str(signal_type).strip(), st, mod, st),
+        )
+        return cur.fetchone() is not None
+
+
 def fetch_signal_history_for_stock_on_date(
     stock_code: str,
     trade_date: str | None = None,
