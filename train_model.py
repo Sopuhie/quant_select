@@ -7,17 +7,30 @@ LightGBM LambdaRank + XGBoost XGBRanker（rank:pairwise）+ 可选 CatBoost Yeti
 用法（在 quant_select 目录下）:
   python train_model.py
   python train_model.py --train-end-date 2024-12-31
+  # 仅沪市主板约 600/601/603/605，不含创业板 300、科创板 688；再加快可叠加 --fast-train --no-catboost
+  python train_model.py --sh-main-board --fast-train
   python train_model.py --tune                    # Optuna 调参并写入 models/best_params.json
   python train_model.py --tune --tune-trials 30
+未设置 ``CATBOOST_NUM_THREADS`` 时，脚本会按 ``OMP_NUM_THREADS``（默认 4）限制 CatBoost 线程，减轻 Windows 上多库超订导致的极慢或假死。
 """
 from __future__ import annotations
 
+import gc
+import io
 import os
 
 # 子进程训练 LightGBM/XGBoost 时降低 OpenMP/MKL 与宿主（如 Streamlit）嵌套冲突概率（尤其 Windows）
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("MKL_NUM_THREADS", "4")
+# CatBoost 默认会占满逻辑核；与 LGBM/XGB 串行衔接时易在 Windows 上超订导致极慢或长时间无新日志
+if "CATBOOST_NUM_THREADS" not in os.environ:
+    _omp_raw = (os.environ.get("OMP_NUM_THREADS") or "4").strip() or "4"
+    try:
+        _omp_n = max(1, int(_omp_raw))
+    except ValueError:
+        _omp_n = 4
+    os.environ["CATBOOST_NUM_THREADS"] = str(_omp_n)
 
 import argparse
 import sys
@@ -68,10 +81,47 @@ from src.model_trainer import (
 from src.utils import permutation_importance_rank_ic_delta
 
 
+# 沪市主板 A 常见代码段（不含 300/301 创业板、688 科创板、8 北交所等）
+_SH_MAIN_BOARD_PREFIXES: tuple[str, ...] = ("600", "601", "603", "605")
+
+
+def _parse_train_stock_prefixes(arg: str) -> list[str]:
+    """逗号分隔的前缀列表，用于 6 位 stock_code 左匹配。"""
+    parts = [p.strip() for p in arg.split(",") if p.strip()]
+    if not parts:
+        raise SystemExit("--train-stock-prefixes 不能为空。")
+    out: list[str] = []
+    for p in parts:
+        if not p.isdigit() or not (1 <= len(p) <= 6):
+            raise SystemExit(
+                f"--train-stock-prefixes 每项须为 1～6 位数字，无效项: {p!r}"
+            )
+        out.append(p)
+    return out
+
+
+def _codes_allowed_by_prefixes(codes: list[str], prefixes: list[str]) -> list[str]:
+    return [c for c in codes if any(c.startswith(pref) for pref in prefixes)]
+
+
+def _line_buffer_stdio_if_supported() -> None:
+    for stream in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+        if stream is None:
+            continue
+        reconf = getattr(stream, "reconfigure", None)
+        if not callable(reconf):
+            continue
+        try:
+            reconf(line_buffering=True)
+        except (OSError, ValueError, io.UnsupportedOperation):
+            pass
+
+
 def _load_local_kline_panel(
     *,
     train_end_date: str | None,
     max_stocks: int | None,
+    code_prefixes: list[str] | None,
     verbose: bool,
 ) -> pd.DataFrame:
     """从 stock_daily_kline 构建训练面板（含 label_ret）。"""
@@ -117,6 +167,23 @@ def _load_local_kline_panel(
             raw_df = filtered
 
     codes = sorted(raw_df["stock_code"].astype(str).str.zfill(6).unique())
+    if code_prefixes:
+        before_n = len(codes)
+        codes = _codes_allowed_by_prefixes(codes, code_prefixes)
+        if not codes:
+            raise SystemExit(
+                "按 --train-stock-prefixes / --sh-main-board 筛选后没有剩余股票代码，"
+                "请检查本地库是否含对应板块数据。"
+            )
+        if verbose:
+            print(
+                f"[股票范围] 代码前缀 {list(code_prefixes)}："
+                f"{before_n} → {len(codes)} 只",
+                flush=True,
+            )
+        raw_df = raw_df[
+            raw_df["stock_code"].astype(str).str.zfill(6).isin(set(codes))
+        ]
     if max_stocks is not None and max_stocks > 0:
         codes = codes[: int(max_stocks)]
         raw_df = raw_df[
@@ -176,7 +243,29 @@ def main() -> None:
         "--max-stocks",
         type=int,
         default=None,
-        help="参与训练的股票数量上限（按代码排序截取）；默认不限制，使用库内全部股票",
+        help="参与训练的股票数量上限（按代码排序截取）；默认不限制；建议排在 --sh-main-board 之后",
+    )
+    parser.add_argument(
+        "--train-stock-prefixes",
+        type=str,
+        default=None,
+        metavar="PREFIXES",
+        help="仅保留代码 6 位左匹配此前缀的股票，逗号分隔，如 600,601,603,605 或仅 600",
+    )
+    parser.add_argument(
+        "--sh-main-board",
+        action="store_true",
+        help="仅沪市主板常见段（600/601/603/605），不含 300/301 创业板、688 科创板、北交所等",
+    )
+    parser.add_argument(
+        "--fast-train",
+        action="store_true",
+        help="降低 LGBM/XGB/CatBoost 迭代上限以缩短耗时（效果可能下降）",
+    )
+    parser.add_argument(
+        "--no-catboost",
+        action="store_true",
+        help="跳过 CatBoost 训练与落盘，仅 LightGBM+XGBoost+Ridge 元模型",
     )
     parser.add_argument("--version", type=str, default=None, help="写入 model_versions 的版本号")
     parser.add_argument(
@@ -197,10 +286,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    code_prefixes: list[str] | None = None
+    if args.train_stock_prefixes:
+        code_prefixes = _parse_train_stock_prefixes(args.train_stock_prefixes)
+    elif args.sh_main_board:
+        code_prefixes = list(_SH_MAIN_BOARD_PREFIXES)
+
+    _line_buffer_stdio_if_supported()
     verbose = not args.quiet
+    if verbose and sys.platform == "win32":
+        print(
+            "[提示] 若在终端里拖选文字，Windows 可能暂停前台训练；卡住时按 Enter 或 Esc 取消选择。",
+            flush=True,
+        )
     panel = _load_local_kline_panel(
         train_end_date=args.train_end_date,
         max_stocks=args.max_stocks,
+        code_prefixes=code_prefixes,
         verbose=verbose,
     )
 
@@ -272,15 +374,25 @@ def main() -> None:
             flush=True,
         )
 
+    if args.fast_train:
+        n_lgb, es_lgb = 360, 40
+        n_xgb, es_xgb = 120, 35
+        n_cat, es_cat = 90, 30
+    else:
+        n_lgb, es_lgb = 800, 50
+        n_xgb, es_xgb = 200, 50
+        n_cat, es_cat = 180, 40
+
     model, rank_metrics = train_lgbm_ranker(
         train_df,
         val_df,
         params=best_full,
         feature_cols=list(FEATURE_COLUMNS),
-        n_estimators=800,
-        early_stopping_rounds=50,
+        n_estimators=n_lgb,
+        early_stopping_rounds=es_lgb,
         verbose=verbose,
     )
+    gc.collect()
 
     if verbose:
         print("[XGBRanker] rank:pairwise，与 LightGBM 相同分组与 relevance …", flush=True)
@@ -289,20 +401,26 @@ def main() -> None:
         val_df,
         best_params=best_full,
         feature_cols=list(FEATURE_COLUMNS),
-        n_estimators=200,
-        early_stopping_rounds=50,
+        n_estimators=n_xgb,
+        early_stopping_rounds=es_xgb,
         verbose=verbose,
     )
+    gc.collect()
 
-    cat_model, cat_metrics = train_catboost_ranker_optional(
-        train_df,
-        val_df,
-        best_params=best_full,
-        feature_cols=list(FEATURE_COLUMNS),
-        n_estimators=180,
-        early_stopping_rounds=40,
-        verbose=verbose,
-    )
+    if args.no_catboost:
+        cat_model, cat_metrics = None, {"catboost_skip": "disabled_by_cli"}
+        if verbose:
+            print("[CatBoost] 已跳过（--no-catboost）", flush=True)
+    else:
+        cat_model, cat_metrics = train_catboost_ranker_optional(
+            train_df,
+            val_df,
+            best_params=best_full,
+            feature_cols=list(FEATURE_COLUMNS),
+            n_estimators=n_cat,
+            early_stopping_rounds=es_cat,
+            verbose=verbose,
+        )
 
     train_end_register = (
         args.train_end_date
@@ -318,6 +436,12 @@ def main() -> None:
         "source": "sqlite_stock_daily_kline_lambdarank",
         "last_panel_date": str(unique_dates[-1]),
     }
+    if code_prefixes is not None:
+        metrics_register["train_stock_prefixes"] = list(code_prefixes)
+    if args.fast_train:
+        metrics_register["fast_train"] = True
+    if args.no_catboost:
+        metrics_register["no_catboost"] = True
     for k, v in rank_metrics.items():
         if k not in metrics_register and str(k).startswith("val_ndcg"):
             metrics_register[k] = v
@@ -382,6 +506,17 @@ def main() -> None:
             metrics_register["cat_model_path"] = str(CATBOOST_MODEL_PATH)
         except Exception as exc:
             metrics_register["cat_model_save_error"] = str(exc)
+    elif args.no_catboost and CATBOOST_MODEL_PATH.exists():
+        try:
+            CATBOOST_MODEL_PATH.unlink()
+            metrics_register["cat_model_removed_stale"] = str(CATBOOST_MODEL_PATH)
+        except OSError as exc:
+            metrics_register["cat_model_remove_error"] = str(exc)
+        if verbose:
+            print(
+                f"[CatBoost] 已删除旧 {CATBOOST_MODEL_PATH.name}，避免预测侧仍加载过期模型。",
+                flush=True,
+            )
     register_model_version(
         version=version,
         train_end_date=str(train_end_register)[:10],

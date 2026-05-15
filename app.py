@@ -25,6 +25,7 @@ import sys
 import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -263,9 +264,23 @@ st.markdown(
     [data-testid="stMetric"] {
         background: #ffffff;
         border: 1px solid #e2e8f0;
-        border-radius: 10px;
+        border-radius: 12px;
         padding: 12px 20px;
-        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.08);
+    }
+
+    .quant-section-heading {
+        border-left: 5px solid #0d9488;
+        padding-left: 14px;
+        font-weight: 800;
+        color: #0f172a;
+        margin: 0.6rem 0 0.85rem 0;
+        font-size: 1.2rem;
+        line-height: 1.35;
+    }
+
+    [data-testid="stDataFrame"] > div {
+        max-height: 320px;
     }
 
     .stTabs [data-baseweb="tab-list"] {
@@ -435,6 +450,155 @@ def _sanitize_latest_selection(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str
     return out, msgs
 
 
+def render_static_summary_card(row: pd.Series, *, col_index: int = 0) -> None:
+    """
+    场景 A：最近交易日静态复盘卡片（仅 HTML + 查看详情；与实盘监控物理隔离）。
+    """
+    code = str(row["stock_code"]).strip().zfill(6)
+    name = str(row.get("stock_name") or "").strip()
+    try:
+        rk = int(row["rank"])
+    except (TypeError, ValueError):
+        rk = row.get("rank", "")
+    try:
+        sc_f = float(row["score"])
+        sc_s = f"{sc_f:.4f}"
+    except (TypeError, ValueError):
+        sc_s = "—"
+    try:
+        px = float(row["close_price"])
+        px_s = f"{px:.2f}"
+    except (TypeError, ValueError):
+        px_s = "—"
+
+    reason_raw = row.get("selection_reason")
+    reason_html = ""
+    if reason_raw is not None and pd.notna(reason_raw) and str(reason_raw).strip():
+        rtxt = str(reason_raw).strip()
+        reason_html = (
+            '<div style="border-top:1px solid #f1f5f9;margin-top:12px;padding-top:10px;'
+            "text-align:left;font-size:0.74rem;color:#475569;line-height:1.55;"
+            'word-break:break-word;">'
+            + html.escape(rtxt).replace("\n", "<br/>")
+            + "</div>"
+        )
+
+    st.markdown(
+        f"""
+<div style="
+  background:#ffffff;
+  border:1px solid #0d9488;
+  border-radius:12px;
+  box-shadow:0 4px 6px -1px rgba(0,0,0,0.08),0 2px 4px -2px rgba(0,0,0,0.06);
+  padding:16px 14px 12px 14px;
+  text-align:center;
+  margin-bottom:6px;
+">
+  <div style="margin-bottom:10px;">
+    <span style="background:#0d9488;color:#fff;font-weight:700;padding:4px 12px;border-radius:999px;font-size:0.8rem;">RANK #{rk}</span>
+  </div>
+  <div style="font-family:Georgia,'Noto Serif SC','Times New Roman',serif;font-size:1.85rem;font-weight:800;color:#0f172a;letter-spacing:0.04em;">{code}</div>
+  <div style="color:#64748b;font-size:0.88rem;margin:6px 0 14px 0;">{html.escape(name)}</div>
+  <div style="display:flex;justify-content:space-around;border-top:1px solid #f1f5f9;padding-top:12px;font-size:0.82rem;color:#64748b;">
+    <div><div style="color:#94a3b8;margin-bottom:2px;">得分</div><div style="font-family:monospace;font-weight:700;color:#0d9488;font-size:1.05rem;">{sc_s}</div></div>
+    <div><div style="color:#94a3b8;margin-bottom:2px;">收盘价</div><div style="font-family:monospace;font-weight:700;color:#0f172a;font-size:1.05rem;">{px_s}</div></div>
+  </div>
+  {reason_html}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    if st.button(
+        "查看详情",
+        key=f"quant_static_detail_{code}_{col_index}",
+        use_container_width=True,
+    ):
+        st.session_state.selected_stock = {"code": code, "name": name}
+
+
+def render_realtime_monitor_panel(panel: dict[str, Any], *, in_session: bool) -> None:
+    """
+    场景 B：单标的实盘纵向大图 + 买点表（panel 为 ``run_top3_monitor_cycle`` 返回元素）。
+    组合图逻辑在 ``src.realtime_monitor``；本函数只做容器与表格，避免与静态卡混写。
+    """
+    from src.realtime_monitor import (
+        build_intraday_dashboard_figure,
+        signals_to_display_dataframe,
+    )
+
+    with st.container():
+        code = str(panel.get("stock_code", "")).zfill(6)
+        name = str(panel.get("stock_name") or "")
+        name_esc = html.escape(name)
+        rk = panel.get("rank")
+        rs = panel.get("realtime_score")
+        score_s = f"{float(rs):.4f}" if rs is not None else "—"
+        last_px = panel.get("latest_price")
+        pct = panel.get("pct_chg")
+        if panel.get("error") == "empty" or last_px is None:
+            last_s = "—"
+            pct_s = "—"
+            pct_color = "#0f172a"
+        else:
+            last_s = f"{float(last_px):.2f}"
+            pv = float(pct or 0.0)
+            pct_s = f"{pv:+.2f}%"
+            pct_color = "#dc2626" if pv > 0 else "#16a34a" if pv < 0 else "#0f172a"
+
+        st.markdown(
+            f"""
+<div style="
+  background: linear-gradient(90deg, #ecfdf5 0%, #ffffff 45%, #fff7ed 100%);
+  border: 1px solid #0d9488;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin: 0 0 12px 0;
+  box-shadow: 0 2px 8px rgba(15,23,42,0.06);
+">
+  <span style="font-weight:800;color:#0f766e;font-size:1.05rem;">[排名 {rk}]</span>
+  <span style="font-family:ui-monospace,monospace;font-weight:800;color:#0f172a;font-size:1.15rem;margin-left:10px;">{code}</span>
+  <span style="color:#475569;font-weight:600;margin-left:8px;">{name_esc}</span>
+  <span style="margin-left:18px;color:#64748b;font-size:0.9rem;">最新价</span>
+  <span style="font-family:monospace;font-weight:700;color:#0f172a;margin-left:4px;">{last_s}</span>
+  <span style="margin-left:18px;color:#64748b;font-size:0.9rem;">涨跌幅</span>
+  <span style="font-family:monospace;font-weight:700;margin-left:4px;color:{pct_color};">{pct_s}</span>
+  <span style="margin-left:18px;color:#64748b;font-size:0.9rem;">实时模型分</span>
+  <span style="font-family:monospace;font-weight:700;color:#0d9488;margin-left:4px;">{score_s}</span>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+        sig_df = signals_to_display_dataframe(panel.get("signals_today"))
+
+        if panel.get("error") == "empty":
+            st.caption("分钟线暂不可用（网络或接口为空），稍后自动重试。")
+            st.markdown("##### 今日买点记录")
+            st.dataframe(
+                sig_df,
+                use_container_width=True,
+                hide_index=True,
+                height=220,
+            )
+            return
+
+        fig = build_intraday_dashboard_figure(panel, height=560)
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
+
+        new_s = panel.get("new_signals") or []
+        if new_s and in_session:
+            st.success("本轮回检：" + "、".join(str(s.get("signal_type")) for s in new_s))
+
+        st.markdown("##### 今日买点记录")
+        st.dataframe(
+            sig_df,
+            use_container_width=True,
+            hide_index=True,
+            height=240,
+        )
+
+
 def _pattern_range_from_plotly_state(
     state: object,
     allowed_dates: set[str],
@@ -510,71 +674,74 @@ with tab_today:
             st.session_state.selected_stock = None
 
         if not today_df.empty:
-            if "quant_enable_live_monitor" not in st.session_state:
-                st.session_state.quant_enable_live_monitor = False
+            if "realtime_mode" not in st.session_state:
+                st.session_state.realtime_mode = False
 
             ctl_l, ctl_r = st.columns([3, 2])
             with ctl_l:
                 st.caption(
-                    "默认：**最近交易日复盘**（daily_selections，已收盘快照）。"
-                    "仅当打开右侧「临场实盘监控」时进入分时盯盘大图，两场景互斥。"
+                    "关闭右侧开关：**静态复盘**三列卡片；开启后切换为 **实盘信号** 纵向大图，两模块互斥。"
                 )
             with ctl_r:
                 st.toggle(
                     "⚡ 临场实盘监控",
-                    key="quant_enable_live_monitor",
-                    help="开启后本页仅显示纵向分时+成交量+KDJ+买点表；关闭后恢复三列复盘卡片。",
+                    key="realtime_mode",
+                    help="开启后进入实盘大图模式；关闭后仅显示最近交易日三列静态卡。",
                 )
 
-            is_realtime_mode = bool(st.session_state.get("quant_enable_live_monitor", False))
-
-            if not is_realtime_mode:
-                # ---------- 场景 A：历史复盘（严禁分时 / KDJ / 纵向大图）----------
-                st.markdown("##### 📋 最近交易日复盘（Top 3）")
+            if not st.session_state.get("realtime_mode", False):
+                st.markdown(
+                    '<div class="quant-section-heading">📅 最近交易日推荐</div>',
+                    unsafe_allow_html=True,
+                )
                 hist_cols = st.columns(3)
                 for i in range(3):
                     with hist_cols[i]:
-                        if i >= len(today_df):
-                            continue
-                        row = today_df.iloc[i]
-                        code = str(row["stock_code"]).strip().zfill(6)
-                        name = str(row.get("stock_name") or "").strip()
-                        st.markdown(f"### RANK #{int(row['rank'])}")
-                        st.markdown(
-                            f"**`{code}`** · {html.escape(name)}",
-                            unsafe_allow_html=True,
-                        )
-                        try:
-                            sc_f = float(row["score"])
-                        except (TypeError, ValueError):
-                            sc_f = float("nan")
-                        try:
-                            px = float(row["close_price"])
-                        except (TypeError, ValueError):
-                            px = float("nan")
-                        m1, m2 = st.columns(2)
-                        with m1:
-                            st.metric(
-                                "得分",
-                                f"{sc_f:.4f}" if pd.notna(sc_f) else "—",
-                            )
-                        with m2:
-                            st.metric(
-                                "收盘价",
-                                f"{px:.2f}" if pd.notna(px) else "—",
-                            )
-                        btn_key = f"kline_hist_{code}_{i}"
-                        if st.button(
-                            "📊 查看K线",
-                            key=btn_key,
-                            use_container_width=True,
-                        ):
-                            st.session_state.selected_stock = {"code": code, "name": name}
+                        if i < len(today_df):
+                            render_static_summary_card(today_df.iloc[i], col_index=i)
             else:
-                # ---------- 场景 B：临场实盘（纵向大图，仅此时加载）----------
-                from src.realtime_monitor import render_today_recommend_live_monitor_section
+                st.markdown(
+                    '<div class="quant-section-heading">⚡ 实盘信号动态监控</div>',
+                    unsafe_allow_html=True,
+                )
+                from src.realtime_monitor import run_top3_monitor_cycle
+                from src.utils import is_a_share_intraday_session
 
-                render_today_recommend_live_monitor_section()
+                in_session = is_a_share_intraday_session()
+                if in_session:
+                    try:
+                        from streamlit_autorefresh import st_autorefresh
+
+                        refresh_ms = 45_000
+                        try:
+                            refresh_ms = int(
+                                str(os.environ.get("QUANT_MONITOR_REFRESH_MS", "45000")).strip()
+                            )
+                        except ValueError:
+                            pass
+                        refresh_ms = max(30_000, min(60_000, refresh_ms))
+                        st_autorefresh(
+                            interval=refresh_ms, key="top3_realtime_monitor_refresh"
+                        )
+                    except ImportError:
+                        st.caption(
+                            "未安装 streamlit-autorefresh，请执行 "
+                            "`pip install streamlit-autorefresh` 启用自动刷新。"
+                        )
+                else:
+                    st.info(
+                        "当前非连续竞价时段：暂停写入新信号；仍可查看分时与已入库买点（若有数据）。"
+                    )
+
+                panels = run_top3_monitor_cycle(
+                    persist=in_session,
+                    allow_off_session_display=not in_session,
+                )
+                if not panels:
+                    st.warning("暂无 Top3 选股数据，无法渲染监控面板。")
+                else:
+                    for panel in panels:
+                        render_realtime_monitor_panel(panel, in_session=in_session)
 
         if not t3.empty and st.session_state.selected_stock:
             st.markdown("---")

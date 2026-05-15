@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -259,6 +260,20 @@ def _tail_date_split(
     return tr, va
 
 
+def _catboost_thread_count_from_env() -> int | None:
+    """与 OMP/CatBoost 环境变量对齐，减轻 Windows 上多库 OpenMP 超订导致的极慢或假死。"""
+    raw = (
+        os.environ.get("CATBOOST_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS") or ""
+    ).strip()
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
 def train_catboost_ranker_optional(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -272,7 +287,11 @@ def train_catboost_ranker_optional(
     random_state: int = 42,
     verbose: bool = False,
 ) -> tuple[Any | None, dict[str, Any]]:
-    """可选 CatBoost YetiRank；未安装库或失败时返回 (None, skip 信息)。"""
+    """可选 CatBoost YetiRank；未安装库或失败时返回 (None, skip 信息)。
+
+    训练加速（默认开启）：``QUANT_CATBOOST_SPEEDOPT=1`` 时使用 ``boosting_type=Plain``、
+    ``rsm``、较低 ``border_count``；设为 ``0`` / ``false`` / ``off`` 则恢复库默认行为。
+    """
     cols = feature_cols or list(FEATURE_COLUMNS)
     try:
         from catboost import CatBoostRanker, Pool  # type: ignore[import-untyped]
@@ -308,7 +327,14 @@ def train_catboost_ranker_optional(
     bp = dict(best_params)
     lr = float(bp.get("learning_rate", 0.05))
     depth = int(np.clip(int(bp.get("num_leaves", 31)) // 8, 4, 8))
-
+    # YetiRank 按日分组 + 全市场行数时，单轮迭代比 LGBM/XGB 的 histogram 排序慢很多；
+    # Plain + 特征子采样 + 略降分箱数，通常明显加速（可用 QUANT_CATBOOST_SPEEDOPT=0 关闭）。
+    _speed = (os.environ.get("QUANT_CATBOOST_SPEEDOPT", "1") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
     train_pool = Pool(
         data=X_tr,
         label=y_fit_tr,
@@ -319,16 +345,25 @@ def train_catboost_ranker_optional(
         label=y_fit_va,
         group_id=g_va,
     )
-    model = CatBoostRanker(
-        loss_function="YetiRank",
-        iterations=int(n_estimators),
-        learning_rate=lr,
-        depth=depth,
-        random_seed=int(random_state),
-        verbose=bool(verbose),
-        early_stopping_rounds=int(early_stopping_rounds),
-        allow_writing_files=False,
-    )
+    cb_kw: dict[str, Any] = {
+        "loss_function": "YetiRank",
+        "iterations": int(n_estimators),
+        "learning_rate": lr,
+        "depth": depth,
+        "random_seed": int(random_state),
+        "verbose": bool(verbose),
+        "early_stopping_rounds": int(early_stopping_rounds),
+        "allow_writing_files": False,
+        "task_type": "CPU",
+    }
+    if _speed:
+        cb_kw["boosting_type"] = "Plain"
+        cb_kw["rsm"] = 0.85
+        cb_kw["border_count"] = 128
+    _tc = _catboost_thread_count_from_env()
+    if _tc is not None:
+        cb_kw["thread_count"] = _tc
+    model = CatBoostRanker(**cb_kw)
     try:
         model.fit(train_pool, eval_set=eval_pool, use_best_model=True)
     except Exception as exc:
