@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor, LGBMRanker, early_stopping
 from xgboost import XGBRanker
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
 
@@ -20,12 +21,17 @@ from .config import (
     FEATURE_COLUMNS,
     LGB_PARAMS,
     LGB_RANKER_DEFAULT_PARAMS,
+    META_STACKER_PATH,
     MODEL_PATH,
+    RANK_SAMPLE_WEIGHT_EXTREME_RET,
+    RANK_SAMPLE_WEIGHT_NEG_THRESH,
     XGB_MODEL_PATH,
+    get_quant_config_merged,
 )
 from .data_fetcher import fetch_daily_hist, has_enough_history
 from .database import fetch_latest_industry_by_codes, init_db, register_model_version
 from .factor_calculator import (
+    attach_hsgt_flow_interact,
     build_stock_panel_features,
     clean_cross_sectional_features,
     normalize_industry_label,
@@ -133,6 +139,112 @@ def mean_cross_sectional_rank_ic(
     return float(np.mean(ics))
 
 
+def ranking_sample_weights_extreme_loss(
+    sorted_df: pd.DataFrame,
+    label_col: str,
+) -> np.ndarray:
+    """
+    对标签收益率显著低于阈值的样本提高权重，使 LambdaRank 更重视「避雷」尾部。
+    权重来自 ``config.json`` → ``quant.ranking``（缺省见 ``get_quant_config_merged``）。
+    """
+    y = pd.to_numeric(sorted_df[label_col], errors="coerce").to_numpy(dtype=np.float64)
+    q = get_quant_config_merged().get("ranking", {})
+    alpha = float(q.get("extreme_loss_weight", RANK_SAMPLE_WEIGHT_EXTREME_RET))
+    thr = float(q.get("extreme_loss_thresh", RANK_SAMPLE_WEIGHT_NEG_THRESH))
+    w = np.ones(len(y), dtype=np.float64)
+    for i in range(len(y)):
+        if np.isfinite(y[i]) and y[i] < thr:
+            depth = float(thr - y[i])
+            w[i] = 1.0 + alpha * min(depth / max(abs(thr), 1e-6), 5.0)
+    return w
+
+
+def population_stability_index(
+    expected: np.ndarray,
+    actual: np.ndarray,
+    *,
+    n_bins: int = 10,
+) -> float:
+    """PSI：衡量两组标量（如训练集 vs 验证集模型打分）分布漂移。"""
+    e = np.asarray(expected, dtype=float).ravel()
+    a = np.asarray(actual, dtype=float).ravel()
+    e = e[np.isfinite(e)]
+    a = a[np.isfinite(a)]
+    nb = max(3, int(n_bins))
+    if len(e) < nb * 5 or len(a) < nb * 5:
+        return float("nan")
+    qs = np.unique(np.quantile(e, np.linspace(0.0, 1.0, nb + 1)))
+    if len(qs) < 3:
+        return float("nan")
+    exp_c, _ = np.histogram(e, bins=qs)
+    act_c, _ = np.histogram(a, bins=qs)
+    exp_p = exp_c.astype(float) / max(float(exp_c.sum()), 1.0)
+    act_p = act_c.astype(float) / max(float(act_c.sum()), 1.0)
+    exp_p = np.where(exp_p <= 0, 1e-6, exp_p)
+    act_p = np.where(act_p <= 0, 1e-6, act_p)
+    return float(np.sum((act_p - exp_p) * np.log(act_p / exp_p)))
+
+
+def fit_meta_stacker_ridge(
+    lgb_model: Any,
+    xgb_model: Any,
+    X_tr: pd.DataFrame,
+    X_va: pd.DataFrame,
+    y_tr: pd.Series,
+    y_va: pd.Series,
+    dates_va: np.ndarray,
+) -> tuple[Ridge | None, dict[str, Any]]:
+    """
+    Stacking：以 LightGBM / XGBoost 一级得分为特征，Ridge 回归 ``label_ret``，
+    预测侧再对元模型输出做截面分位秩以与旧融合尺度对齐。
+    """
+    try:
+        z_tr = np.column_stack(
+            [
+                np.asarray(lgb_model.predict(X_tr), dtype=float).ravel(),
+                np.asarray(xgb_model.predict(X_tr), dtype=float).ravel(),
+            ]
+        )
+        z_va = np.column_stack(
+            [
+                np.asarray(lgb_model.predict(X_va), dtype=float).ravel(),
+                np.asarray(xgb_model.predict(X_va), dtype=float).ravel(),
+            ]
+        )
+    except Exception:
+        return None, {}
+    yt = pd.to_numeric(y_tr, errors="coerce").to_numpy(dtype=float)
+    yv = pd.to_numeric(y_va, errors="coerce").to_numpy(dtype=float)
+    m = np.isfinite(z_tr).all(axis=1) & np.isfinite(yt)
+    if int(m.sum()) < 200:
+        return None, {}
+    ridge = Ridge(alpha=10.0, random_state=42)
+    ridge.fit(z_tr[m], yt[m])
+    pred_va = ridge.predict(z_va)
+    ic_meta = mean_cross_sectional_rank_ic(pred_va, dates_va, yv)
+    return ridge, {"meta_mean_rank_ic_val": ic_meta}
+
+
+def save_meta_stacker(model: Ridge | None, path: Path | None = None) -> Path | None:
+    p = path or META_STACKER_PATH
+    if model is None:
+        return None
+    p.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"kind": "ridge_return", "model": model}, p)
+    return p
+
+
+def load_meta_stacker_optional(path: Path | None = None) -> dict[str, Any] | None:
+    p = path or META_STACKER_PATH
+    if not p.exists():
+        return None
+    try:
+        raw = joblib.load(p)
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
 def merge_ranker_params(overrides: dict[str, Any] | None) -> dict[str, Any]:
     """以 ``LGB_RANKER_DEFAULT_PARAMS`` 为底合并 Optuna / JSON 超参。
 
@@ -215,6 +327,8 @@ def train_lgbm_ranker(
     y_fit_tr = np.ascontiguousarray(y_tr_rel, dtype=np.int32)
     y_fit_va = np.ascontiguousarray(y_va_rel, dtype=np.int32)
 
+    sw_tr = ranking_sample_weights_extreme_loss(tr, label_col)
+
     # eval_at 只出现一次：写入展开参数，勿再传 ``eval_at=`` 关键字（否则会与内部 params 重复告警）
     ranker_params = {k: v for k, v in dict(params).items() if v is not None}
     ranker_params.pop("n_estimators", None)
@@ -229,6 +343,7 @@ def train_lgbm_ranker(
         group=g_tr,
         eval_set=[(X_va, y_fit_va)],
         eval_group=[g_va],
+        sample_weight=sw_tr,
         callbacks=[early_stopping(early_stopping_rounds, verbose=verbose)],
     )
 
@@ -564,6 +679,24 @@ def load_xgb_ranker_optional(path: Path | None = None) -> Any | None:
         return None
 
 
+def _prepare_rank_xy(
+    df: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    feature_cols: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    """与 ``train_lgbm_ranker`` 相同的排序与有限值过滤，供 PSI / Stacking 复用。"""
+    cols = feature_cols or list(FEATURE_COLUMNS)
+    tr = prepare_ranking_frame(df, date_col)
+    X = tr[cols].apply(pd.to_numeric, errors="coerce")
+    y = pd.to_numeric(tr["label_ret"], errors="coerce")
+    m = np.isfinite(X.to_numpy()).all(axis=1) & np.isfinite(y.to_numpy())
+    tr = tr.loc[m].reset_index(drop=True)
+    X = X.loc[m].reset_index(drop=True)
+    y = y.loc[m].reset_index(drop=True)
+    return tr, X, y
+
+
 def train_panel_and_register(
     panel_df: pd.DataFrame,
     train_end_date: str,
@@ -607,6 +740,34 @@ def train_panel_and_register(
     )
     save_model(xgb_model, XGB_MODEL_PATH)
     metrics = {**metrics, **xgb_metrics}
+
+    tr_r, X_tr_m, y_tr_m = _prepare_rank_xy(train_df, date_col="date")
+    va_r, X_va_m, y_va_m = _prepare_rank_xy(val_df, date_col="date")
+    pred_tr_lgb = np.asarray(model.predict(X_tr_m), dtype=float).ravel()
+    pred_va_lgb = np.asarray(model.predict(X_va_m), dtype=float).ravel()
+    qconf = get_quant_config_merged()
+    psi_cfg = qconf.get("psi", {})
+    psi_bins = int(psi_cfg.get("bins", 12))
+    psi_val = population_stability_index(
+        pred_tr_lgb, pred_va_lgb, n_bins=psi_bins
+    )
+    metrics["psi_lgb_pred_train_vs_val"] = psi_val
+    psi_thr = float(psi_cfg.get("alert_threshold", 0.25))
+    if np.isfinite(psi_val) and psi_val > psi_thr:
+        metrics["psi_alert"] = f"PSI={psi_val:.4f} 超过阈值 {psi_thr}"
+
+    meta_model, meta_m = fit_meta_stacker_ridge(
+        model,
+        xgb_model,
+        X_tr_m,
+        X_va_m,
+        y_tr_m,
+        y_va_m,
+        va_r["date"].to_numpy(),
+    )
+    metrics.update(meta_m)
+    save_meta_stacker(meta_model)
+
     register_model_version(
         version=version,
         train_end_date=train_end_date,
@@ -633,6 +794,7 @@ def train_and_register(
     )
     if all_features.empty:
         raise RuntimeError("训练样本为空，请检查网络、股票池与日期区间。")
+    all_features = attach_hsgt_flow_interact(all_features, date_col="date")
     all_features = clean_cross_sectional_features(all_features)
     return train_panel_and_register(
         all_features,

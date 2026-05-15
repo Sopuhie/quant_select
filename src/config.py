@@ -15,6 +15,7 @@ DB_PATH = DATA_DIR / "stocks.db"
 MODEL_PATH = MODELS_DIR / "lgb_model.pkl"
 XGB_MODEL_PATH = MODELS_DIR / "xgb_model.pkl"
 BEST_LGB_PARAMS_JSON = MODELS_DIR / "best_params.json"
+META_STACKER_PATH = MODELS_DIR / "meta_rank_stacker.pkl"
 
 # 确保目录存在
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -183,7 +184,7 @@ LGB_RANKER_DEFAULT_PARAMS: dict[str, Any] = {
     "seed": 42,
 }
 
-# 特征列：稳定量价框架（14 个纯技术/量价因子；不含 MACD 与基本面）
+# 特征列：量价框架（在 14 项基础因子上扩展流动性/量价协同/分布类因子）
 FEATURE_COLUMNS = [
     "factor_bias_5",  # 5日均线乖离
     "factor_bias_10",  # 10日均线乖离
@@ -199,7 +200,44 @@ FEATURE_COLUMNS = [
     "factor_volatility_5d",  # 5日波动
     "factor_volatility_20d",  # 20日波动
     "factor_close_position",  # 收盘位置（资金承接代理）
+    # --- 扩展：筹码/流动性/量价结构代理（仍仅依赖 OHLCV；可叠加 config 资金流映射）---
+    "factor_amihud_20d",  # Amihud 非流动性（|收益|/成交额代理）
+    "factor_pv_corr_10d",  # 价量变化 10 日滚动相关（背离为负）
+    "factor_vwap_bias_20d",  # 相对 20 日 VWAP 的偏离（成本带代理）
+    "factor_bb_width_20d",  # 布林带宽（波动 regime）
+    "factor_drawdown_60d",  # 60 日高点回撤深度（套牢/获利结构代理）
+    "factor_shrink_pullback_5d",  # 近 5 日下跌中缩量程度（缩量回调为正）
+    # 北向净流入强度（按日全市场相同标量）与 5 日收益交互；无数据时为 0
+    "factor_hsgt_flow_interact",
 ]
+
+# 因子时间序列：EWM 与简单 rolling 的混合权重（越大越偏重近期）
+FACTOR_EWM_BLEND = float(os.environ.get("QUANT_FACTOR_EWM_BLEND", "0.35"))
+FACTOR_EWM_HALFLIFE_DAYS = max(2.0, float(os.environ.get("QUANT_FACTOR_EWM_HALFLIFE", "10")))
+
+# LambdaRank：对极端负收益样本加权（主动避雷；近似自定义损失）
+RANK_SAMPLE_WEIGHT_EXTREME_RET = float(
+    os.environ.get("QUANT_RANK_WEIGHT_EXTREME_RET", "2.5")
+)
+RANK_SAMPLE_WEIGHT_NEG_THRESH = float(
+    os.environ.get("QUANT_RANK_WEIGHT_NEG_THRESH", "-0.05")
+)
+
+# PSI：验证集 vs 训练集预测分分布稳定性（仅记录告警，不阻断训练）
+PSI_SCORE_BINS = max(5, int(os.environ.get("QUANT_PSI_BINS", "12")))
+PSI_ALERT_THRESHOLD = float(os.environ.get("QUANT_PSI_ALERT", "0.25"))
+
+# 回测默认摩擦（可被 CLI 覆盖；亦写入 config.json quant.backtest）
+BACKTEST_DEFAULT_COMMISSION_RATE = float(
+    os.environ.get("QUANT_BACKTEST_COMMISSION", "0.0003")
+)
+BACKTEST_DEFAULT_STAMP_DUTY_SELL = float(
+    os.environ.get("QUANT_BACKTEST_STAMP_SELL", "0.001")
+)
+
+# 形态匹配：DTW 前粗筛数量、量价 DTW 中成交量权重
+PATTERN_COARSE_TOP_K = max(20, int(os.environ.get("QUANT_PATTERN_COARSE_TOP_K", "100")))
+PATTERN_DTW_VOLUME_WEIGHT = float(os.environ.get("QUANT_PATTERN_VOL_WEIGHT", "1.0"))
 
 # --- 交易员经验硬过滤参数 (留空或为 None 时代表不限制) ---
 # 1. 价格范围 (单位: 元)
@@ -276,3 +314,50 @@ THEME_VOL_RATIO_MIN_1D = 1.3
 THEME_KDJ_J_SLOPE_MIN = 5.0
 THEME_KDJ_LEVEL_1 = 100.0
 THEME_KDJ_LEVEL_2 = 110.0
+
+
+def get_quant_config_merged() -> dict[str, Any]:
+    """
+    读取 ``config.json`` 中 ``quant`` 段并与代码默认值合并（缺省键不回退为 0）。
+    避免顶层循环依赖：仅在调用时 import ``config_manager``。
+    """
+    defaults: dict[str, Any] = {
+        "backtest": {
+            "commission_rate": BACKTEST_DEFAULT_COMMISSION_RATE,
+            "stamp_duty_sell_rate": BACKTEST_DEFAULT_STAMP_DUTY_SELL,
+        },
+        "pattern": {
+            "coarse_top_k": PATTERN_COARSE_TOP_K,
+            "dtw_volume_weight": PATTERN_DTW_VOLUME_WEIGHT,
+        },
+        "psi": {
+            "bins": PSI_SCORE_BINS,
+            "alert_threshold": PSI_ALERT_THRESHOLD,
+        },
+        "ranking": {
+            "extreme_loss_weight": RANK_SAMPLE_WEIGHT_EXTREME_RET,
+            "extreme_loss_thresh": RANK_SAMPLE_WEIGHT_NEG_THRESH,
+        },
+    }
+    try:
+        from .config_manager import config_manager
+
+        config_manager.reload()
+        raw = config_manager.config.get("quant")
+        if not isinstance(raw, dict):
+            return defaults
+        out: dict[str, Any] = {}
+        for sec, d0 in defaults.items():
+            rsec = raw.get(sec)
+            if isinstance(rsec, dict) and isinstance(d0, dict):
+                merged = dict(d0)
+                merged.update({k: v for k, v in rsec.items() if v is not None})
+                out[sec] = merged
+            else:
+                out[sec] = d0
+        for sec, v in raw.items():
+            if sec not in out:
+                out[sec] = v
+        return out
+    except Exception:
+        return defaults

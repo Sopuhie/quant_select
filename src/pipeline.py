@@ -217,4 +217,18 @@ def run_complete_pipeline(
     except Exception as ex:
         _emit(f"写入 system_logs 失败: {ex}\n")
 
+    if not success:
+        try:
+            from src.dingtalk_notifier import maybe_push_pipeline_failure_alert
+
+            excerpt = "".join(full_log_accumulator)
+            maybe_push_pipeline_failure_alert(task_name, excerpt)
+        except Exception:
+            pass
+
     return success
+
+
+if __name__ == "__main__":
+    ok = run_complete_pipeline(task_name="CLI pipeline")
+    raise SystemExit(0 if ok else 1)

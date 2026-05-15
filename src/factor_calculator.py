@@ -10,7 +10,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .config import FEATURE_COLUMNS, LABEL_HORIZON_DAYS
+from .config import (
+    FACTOR_EWM_BLEND,
+    FACTOR_EWM_HALFLIFE_DAYS,
+    FEATURE_COLUMNS,
+    LABEL_HORIZON_DAYS,
+)
 
 # 行业内样本过少时退回当日全截面 MAD+Z，避免行业组统计不稳
 MIN_INDUSTRY_GROUP_SIZE = 5
@@ -51,6 +56,10 @@ PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
     "factor_volume_ratio",
     "factor_volatility_5d",
     "factor_volatility_20d",
+    "factor_amihud_20d",
+    "factor_bb_width_20d",
+    "factor_drawdown_60d",
+    "factor_hsgt_flow_interact",
 )
 
 
@@ -117,6 +126,107 @@ def _apply_size_residual_regression(sub_df: pd.DataFrame) -> pd.DataFrame:
     return sub_df
 
 
+def _roll_ewm_blend(s: pd.Series, window: int) -> pd.Series:
+    """rolling 与 EWM 线性混合，近期权重更高（因子衰减）。"""
+    w = max(2, int(window))
+    roll = s.rolling(w, min_periods=min(3, w)).mean()
+    hl = float(FACTOR_EWM_HALFLIFE_DAYS)
+    ewm = s.ewm(halflife=hl, adjust=False).mean()
+    b = float(FACTOR_EWM_BLEND)
+    b = max(0.0, min(1.0, b))
+    return (1.0 - b) * roll + b * ewm
+
+
+def build_hsgt_net_zscore_by_trade_date(
+    dates: list[str],
+) -> dict[str, float]:
+    """
+    北向资金净流入（全市场日频）按日期映射为 Z-score；用于 ``factor_hsgt_flow_interact``。
+    接口失败或列结构变化时返回空字典（调用方填 0）。
+    """
+    if not dates:
+        return {}
+    ds = sorted({str(d).strip()[:10] for d in dates if d})
+    if not ds:
+        return {}
+    start = ds[0].replace("-", "")
+    end = ds[-1].replace("-", "")
+    try:
+        import akshare as ak  # type: ignore[import-untyped]
+    except Exception:
+        return {}
+    try:
+        raw = ak.stock_hsgt_hist_em(symbol="北向资金", start_date=start, end_date=end)
+    except Exception:
+        try:
+            raw = ak.stock_hsgt_hist_em(symbol="沪股通", start_date=start, end_date=end)
+        except Exception:
+            return {}
+    if raw is None or getattr(raw, "empty", True):
+        return {}
+    df = raw.copy()
+    date_col = next(
+        (c for c in df.columns if "日期" in str(c) or str(c).lower() == "date"),
+        df.columns[0],
+    )
+    val_col = next(
+        (
+            c
+            for c in df.columns
+            if "净" in str(c)
+            or "流入" in str(c)
+            or "当日" in str(c)
+            or str(c).lower() in ("value", "net", "amount")
+        ),
+        None,
+    )
+    if val_col is None:
+        num_cols = [c for c in df.columns if c != date_col and str(df[c].dtype).startswith(("float", "int"))]
+        if not num_cols:
+            return {}
+        val_col = num_cols[-1]
+    ser = pd.to_numeric(df[val_col], errors="coerce")
+    dt = pd.to_datetime(df[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+    g = pd.DataFrame({"d": dt, "v": ser}).dropna(subset=["d", "v"])
+    if g.empty:
+        return {}
+    mu = float(g["v"].mean())
+    sig = float(g["v"].std(ddof=0))
+    if not np.isfinite(mu) or not np.isfinite(sig) or sig < 1e-12:
+        return {}
+    out: dict[str, float] = {}
+    for _, row in g.iterrows():
+        z = (float(row["v"]) - mu) / sig
+        if np.isfinite(z):
+            out[str(row["d"])[:10]] = float(z)
+    return out
+
+
+def attach_hsgt_flow_interact(
+    panel: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    ret_col: str = "factor_return_5d",
+    out_col: str = "factor_hsgt_flow_interact",
+) -> pd.DataFrame:
+    """按 ``date_col`` 将北向 Z 与 ``ret_col`` 相乘写入 ``out_col``；失败则置 0。"""
+    if panel.empty or date_col not in panel.columns:
+        return panel
+    work = panel.copy()
+    if ret_col not in work.columns:
+        work[out_col] = 0.0
+        return work
+    dates = work[date_col].astype(str).str[:10].tolist()
+    zmap = build_hsgt_net_zscore_by_trade_date(dates)
+    if not zmap:
+        work[out_col] = 0.0
+        return work
+    zv = work[date_col].astype(str).str[:10].map(zmap).astype(float)
+    r = pd.to_numeric(work[ret_col], errors="coerce").astype(float)
+    work[out_col] = (zv.fillna(0.0) * r.fillna(0.0)).replace([np.inf, -np.inf], 0.0)
+    return work
+
+
 def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     """与 ``train_model`` / ``run_daily`` 一致：按 ``FEATURE_COLUMNS`` 输出因子列。"""
     if df.empty:
@@ -130,10 +240,10 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     vol = work["volume"].astype(float)
 
     eps = 1e-12
-    ma5 = close.rolling(5).mean()
-    ma10 = close.rolling(10).mean()
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
+    ma5 = _roll_ewm_blend(close, 5)
+    ma10 = _roll_ewm_blend(close, 10)
+    ma20 = _roll_ewm_blend(close, 20)
+    ma60 = _roll_ewm_blend(close, 60)
 
     out = pd.DataFrame(index=work.index)
     out["factor_bias_5"] = (close - ma5) / (ma5 + eps)
@@ -147,8 +257,8 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     out["factor_return_5d"] = close.pct_change(5)
     out["factor_momentum_10d"] = close / (close.shift(10) + eps) - 1.0
 
-    vol_ma5 = vol.rolling(5).mean()
-    vol_ma20 = vol.rolling(20).mean()
+    vol_ma5 = _roll_ewm_blend(vol, 5)
+    vol_ma20 = _roll_ewm_blend(vol, 20)
     out["factor_volume_ratio"] = vol / (vol_ma5 + eps)
     out["factor_volume_position"] = vol_ma5 / (vol_ma20 + eps) - 1.0
 
@@ -167,7 +277,36 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
         dtype=float,
     ).clip(0.0, 1.0)
 
+    # --- 扩展因子（OHLCV；北向交互在面板层 ``attach_hsgt_flow_interact`` 填充）---
+    ret1 = close.pct_change(1)
+    dollar_vol = (close * vol).replace(0, np.nan)
+    out["factor_amihud_20d"] = (ret1.abs() / (dollar_vol + eps)).rolling(20, min_periods=5).mean()
+
+    dv = vol.pct_change(1).replace([np.inf, -np.inf], np.nan)
+    out["factor_pv_corr_10d"] = ret1.rolling(10, min_periods=5).corr(dv)
+
+    typical = (high + low + close) / 3.0
+    vwap_num = (typical * vol).rolling(20, min_periods=5).sum()
+    vwap_den = vol.rolling(20, min_periods=5).sum()
+    vwap20 = vwap_num / (vwap_den + eps)
+    out["factor_vwap_bias_20d"] = close / (vwap20 + eps) - 1.0
+
+    std20 = close.rolling(20, min_periods=5).std()
+    out["factor_bb_width_20d"] = (4.0 * std20) / (ma20 + eps)
+
+    roll_max60 = close.rolling(60, min_periods=20).max()
+    out["factor_drawdown_60d"] = close / (roll_max60 + eps) - 1.0
+
+    d1 = close.pct_change(1)
+    shrink_day = (d1 < 0) & (vol < vol_ma5)
+    out["factor_shrink_pullback_5d"] = shrink_day.astype(float).rolling(5, min_periods=1).mean()
+
+    out["factor_hsgt_flow_interact"] = 0.0
+
     out = out.replace([np.inf, -np.inf], np.nan)
+    for c in FEATURE_COLUMNS:
+        if c not in out.columns:
+            out[c] = np.nan
     out[FEATURE_COLUMNS] = out[FEATURE_COLUMNS].ffill().bfill().fillna(0.0)
 
     return out[FEATURE_COLUMNS]

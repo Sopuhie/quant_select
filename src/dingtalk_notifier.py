@@ -189,3 +189,54 @@ def maybe_push_daily_selections(trade_date: str) -> bool:
     else:
         print("钉钉推送失败，请检查 Webhook、加签与网络")
     return ok
+
+
+def maybe_push_pipeline_failure_alert(task_name: str, log_excerpt: str) -> bool:
+    """
+    Pipeline 失败时推送钉钉：含任务名、时间、日志尾部（含 Traceback 摘要）。
+    受 ``notification.send_on_error`` 与钉钉开关控制。
+    """
+    from .config_manager import config_manager
+    from .database import insert_system_log
+
+    config_manager.reload()
+    if not config_manager.config.get("notification", {}).get("send_on_error", True):
+        return False
+    if not config_manager.is_dingtalk_enabled():
+        return False
+
+    raw = str(log_excerpt or "")
+    tail = raw[-3500:] if len(raw) > 3500 else raw
+    tb_idx = tail.rfind("Traceback")
+    if tb_idx >= 0:
+        tb_part = tail[tb_idx:]
+        summary = tb_part[:1800] + ("…" if len(tb_part) > 1800 else "")
+    else:
+        summary = tail[-1200:]
+
+    title = "A-Quant Pipeline 失败告警"
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    task_esc = html.escape(str(task_name).strip())
+    body = (
+        f"### {title}\n\n"
+        f"- **任务**: {task_esc}\n"
+        f"- **时间**: {now_s}\n\n"
+        f"**日志摘要**（尾部 / 异常栈）:\n\n"
+        f"```text\n{html.escape(summary)}\n```\n"
+    )
+    notifier = DingTalkNotifier(
+        config_manager.get_dingtalk_webhook_url(),
+        config_manager.get_dingtalk_secret() or None,
+    )
+    ok = notifier.send_markdown(title, body)
+    if not ok:
+        try:
+            insert_system_log(
+                task_name="钉钉Pipeline失败推送",
+                status="FAILED",
+                parameters=json.dumps({"pipeline_task": task_name}, ensure_ascii=False),
+                log_output="钉钉发送失败或返回非 0",
+            )
+        except Exception:
+            pass
+    return ok

@@ -17,7 +17,7 @@
   - 股票池优先 AkShare 成分；失败则自动改为「库内出现的代码」。
   - 沪深300 基准：优先读库内代码 000300；若无则再尝试 AkShare。
   - 净值序列默认写入 data/backtest_results.csv。
-  - 换仓时默认计入双边摩擦：成交价按 ``--slippage-rate`` 劣化，成交额按 ``--transaction-fee-rate`` 扣费（佣金+印花税等合一费率）。
+  - 换仓时计入 **单边佣金**（默认万三）与 **卖出印花税**（默认千一），以及 ``--slippage-rate`` 冲击成本。
 """
 from __future__ import annotations
 
@@ -49,16 +49,19 @@ from src.config import (  # noqa: E402
     TOP_N_SELECTION,
     STOCK_POOL,
     MAX_STOCKS_UNIVERSE,
+    get_quant_config_merged,
 )
 from src.data_fetcher import fetch_daily_hist, get_stock_pool  # noqa: E402
 from src.database import get_active_model_version  # noqa: E402
 from src.factor_calculator import (  # noqa: E402
+    attach_hsgt_flow_interact,
     clean_cross_sectional_features,
     compute_factors_for_history,
 )
-from src.model_trainer import load_model  # noqa: E402
+from src.model_trainer import load_model, load_xgb_ranker_optional  # noqa: E402
 from src.predictor import (  # noqa: E402
     apply_experience_trading_filters,
+    blend_ranker_scores_with_optional_meta,
     filter_predictions,
     prune_zero_volume_rows,
     suppress_high_recent_gains,
@@ -66,6 +69,72 @@ from src.predictor import (  # noqa: E402
 
 PriceKind = Literal["open", "close"]
 TRADING_DAYS_PER_YEAR = 242
+
+
+def _board_limit_pct(code: str) -> float:
+    z = _normalize_stock_code(code)
+    if z.startswith(("300", "301", "688")):
+        return 0.20
+    return 0.10
+
+
+def _is_suspended_row(row: pd.Series) -> bool:
+    v = row.get("volume")
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return True
+    return not (np.isfinite(fv) and fv > 1e-8)
+
+
+def _is_one_word_limit_up(row: pd.Series, code: str, prev_close: float) -> bool:
+    """选股次日开盘近似一字涨停：难以按开盘价成交。"""
+    if not np.isfinite(prev_close) or prev_close <= 1e-8:
+        return False
+    pct = _board_limit_pct(code)
+    lim = prev_close * (1.0 + pct - 1e-4)
+    try:
+        o = float(row["open"])
+        h = float(row["high"])
+        l_ = float(row["low"])
+        cl = float(row["close"])
+    except (TypeError, ValueError, KeyError):
+        return True
+    if not all(np.isfinite(x) for x in (o, h, l_, cl)):
+        return True
+    if o < lim * 0.997:
+        return False
+    if cl < lim * 0.992:
+        return False
+    intraday_range = (h - l_) / max(prev_close, 1e-9)
+    if intraday_range > 0.02:
+        return False
+    return True
+
+
+def _is_one_word_limit_down(row: pd.Series, code: str, prev_close: float) -> bool:
+    """一字跌停：难以按开盘价卖出。"""
+    if not np.isfinite(prev_close) or prev_close <= 1e-8:
+        return False
+    pct = _board_limit_pct(code)
+    lim = prev_close * (1.0 - pct + 1e-4)
+    try:
+        o = float(row["open"])
+        h = float(row["high"])
+        l_ = float(row["low"])
+        cl = float(row["close"])
+    except (TypeError, ValueError, KeyError):
+        return True
+    if not all(np.isfinite(x) for x in (o, h, l_, cl)):
+        return True
+    if o > lim * 1.003:
+        return False
+    if cl > lim * 1.008:
+        return False
+    intraday_range = (h - l_) / max(prev_close, 1e-9)
+    if intraday_range > 0.02:
+        return False
+    return True
 
 
 def _normalize_date(s: str) -> str:
@@ -86,11 +155,13 @@ def _board_allowed(code: str, *, include_300: bool, include_688: bool) -> bool:
     return True
 
 
-def load_active_model() -> Any:
-    """载入磁盘上的 LightGBM 模型（与每日选股一致）。"""
+def load_active_models() -> tuple[Any, Any | None]:
+    """载入 LightGBM 与可选 XGBoost Ranker（与每日选股 / Meta 融合一致）。"""
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"找不到模型文件: {MODEL_PATH}（请先 train_model.py 训练并落盘）")
-    return load_model(MODEL_PATH)
+    lgb = load_model(MODEL_PATH)
+    xgb = load_xgb_ranker_optional()
+    return lgb, xgb
 
 
 def get_stock_daily_kline_date_bounds(db_path: Path) -> tuple[str | None, str | None]:
@@ -404,7 +475,8 @@ def _score_universe_for_date(
     trade_date: str,
     by_code: dict[str, pd.DataFrame],
     universe: list[tuple[str, str]],
-    model: Any,
+    lgb_model: Any,
+    xgb_model: Any | None = None,
     *,
     include_300: bool = False,
     include_688: bool = False,
@@ -420,6 +492,7 @@ def _score_universe_for_date(
     if not rows:
         return []
     feat_df = pd.DataFrame(rows)
+    feat_df = attach_hsgt_flow_interact(feat_df, date_col="trade_date")
     feat_df = prune_zero_volume_rows(feat_df)
     feat_df = feat_df.drop(columns=["volume"], errors="ignore")
     if feat_df.empty:
@@ -442,7 +515,9 @@ def _score_universe_for_date(
     if feat_df.empty:
         return []
     X = feat_df[FEATURE_COLUMNS].astype(np.float64)
-    scores = model.predict(X.values)
+    ls = lgb_model.predict(X.values)
+    xs = xgb_model.predict(X.values) if xgb_model is not None else None
+    scores = blend_ranker_scores_with_optional_meta(ls, xs)
     feat_df = feat_df.copy()
     feat_df["score"] = scores.astype(float)
     feat_df = feat_df.sort_values(
@@ -569,13 +644,16 @@ class HeldShare:
 class BacktestEngine:
     bars: pd.DataFrame
     trade_dates: list[str]
-    model: Any
+    lgb_model: Any
+    xgb_model: Any | None
     initial_cash: float
     holding_days: int
     buy_price: PriceKind
     sell_price: PriceKind
-    """单边综合费率（佣金+印花税等），按成交名义金额在买卖两端各扣一次。"""
-    transaction_fee_rate: float
+    """单边佣金率（买/卖均按成交金额计）。"""
+    commission_rate: float
+    """卖出单边印花税率（仅卖出）。"""
+    stamp_duty_sell_rate: float
     """买卖冲击成本：买入成交价 = 市价×(1+rate)，卖出 = 市价×(1−rate)。"""
     slippage_rate: float
     get_universe: Callable[[str], list[tuple[str, str]]]
@@ -597,6 +675,15 @@ class BacktestEngine:
         if pos is None:
             return None
         return self.by_code[code].iloc[pos]
+
+    def _prev_row(self, code: str, d: str) -> pd.Series | None:
+        g = self.by_code.get(code)
+        if g is None:
+            return None
+        pos = self.date_pos.get(code, {}).get(d)
+        if pos is None or int(pos) < 1:
+            return None
+        return g.iloc[int(pos) - 1]
 
     def run(self) -> None:
         self.by_code = {
@@ -620,7 +707,8 @@ class BacktestEngine:
                     sig_date,
                     self.by_code,
                     univ,
-                    self.model,
+                    self.lgb_model,
+                    self.xgb_model,
                     include_300=self.include_300,
                     include_688=self.include_688,
                 )
@@ -631,26 +719,38 @@ class BacktestEngine:
     def _sell_all_open(self, d: str) -> None:
         if not self.positions:
             return
-        total_cost = sum(p.cost_cash for p in self.positions)
-        proceeds_sum = 0.0
         slip = max(0.0, float(self.slippage_rate))
-        fee_r = max(0.0, float(self.transaction_fee_rate))
+        comm_r = max(0.0, float(self.commission_rate))
+        stamp_r = max(0.0, float(self.stamp_duty_sell_rate))
+        proceeds_sum = 0.0
+        sold_cost = 0.0
+        remaining: list[HeldShare] = []
         for pos in self.positions:
             row = self._row(d, pos.code)
-            if row is None:
+            if row is None or _is_suspended_row(row):
+                remaining.append(pos)
+                continue
+            prev = self._prev_row(pos.code, d)
+            prev_c = float(prev["close"]) if prev is not None else float("nan")
+            if np.isfinite(prev_c) and _is_one_word_limit_down(row, pos.code, prev_c):
+                remaining.append(pos)
                 continue
             px = _price_on(row, self.sell_price)
             if not np.isfinite(px) or px <= 0:
+                remaining.append(pos)
                 continue
             px_eff = px * (1.0 - slip)
             if px_eff <= 0:
+                remaining.append(pos)
                 continue
             gross = pos.shares * px_eff
-            fee = gross * fee_r
-            proceeds_sum += gross - fee
-        self.trade_pnls.append(float(proceeds_sum - total_cost))
+            fee_comm = gross * comm_r
+            fee_stamp = gross * stamp_r
+            proceeds_sum += gross - fee_comm - fee_stamp
+            sold_cost += pos.cost_cash
+        self.trade_pnls.append(float(proceeds_sum - sold_cost))
         self.cash += proceeds_sum
-        self.positions = []
+        self.positions = remaining
 
     def _buy_equal_open(self, d: str, codes: list[str]) -> None:
         codes = [c for c in codes if c in self.by_code]
@@ -660,10 +760,14 @@ class BacktestEngine:
         spent_total = 0.0
         new_holdings: list[HeldShare] = []
         slip = max(0.0, float(self.slippage_rate))
-        fee_r = max(0.0, float(self.transaction_fee_rate))
+        comm_r = max(0.0, float(self.commission_rate))
         for code in codes:
             row = self._row(d, code)
-            if row is None:
+            if row is None or _is_suspended_row(row):
+                continue
+            prev = self._prev_row(code, d)
+            prev_c = float(prev["close"]) if prev is not None else float("nan")
+            if np.isfinite(prev_c) and _is_one_word_limit_up(row, code, prev_c):
                 continue
             px = _price_on(row, self.buy_price)
             if not np.isfinite(px) or px <= 0:
@@ -671,16 +775,15 @@ class BacktestEngine:
             px_eff = px * (1.0 + slip)
             if px_eff <= 0:
                 continue
-            denom = px_eff * (1.0 + fee_r)
+            denom = px_eff * (1.0 + comm_r)
             if denom <= 1e-15:
                 continue
             alloc = min(per, max(0.0, self.cash - spent_total))
             if alloc <= 0:
                 break
-            # alloc = shares * px_eff + fee = shares * px_eff * (1+fee_r)
             shares = alloc / denom
             gross = shares * px_eff
-            fee = gross * fee_r
+            fee = gross * comm_r
             cash_use = gross + fee
             if cash_use > self.cash - spent_total + 1e-9:
                 continue
@@ -794,7 +897,7 @@ def _compute_metrics(
 def _print_report(m: dict[str, Any]) -> None:
     dd0, dd1 = m["drawdown_interval"]
     print("\n" + "=" * 56)
-    print("回测结果摘要（净值已含滑点与双边综合费率）")
+    print("回测结果摘要（净值已含滑点、佣金与卖出印花税）")
     print("=" * 56)
     print(f"累计收益率:           {m['cumulative_return'] * 100:>10.2f} %")
     print(f"年化收益率 ({TRADING_DAYS_PER_YEAR} 日): {m['annualized_return'] * 100:>10.2f} %")
@@ -838,10 +941,22 @@ def main() -> None:
     parser.add_argument("--buy-price", type=str, default="open", choices=["open", "close"])
     parser.add_argument("--sell-price", type=str, default="open", choices=["open", "close"])
     parser.add_argument(
+        "--commission-rate",
+        type=float,
+        default=None,
+        help="单边佣金率（如万三=0.0003）；默认取 config quant.backtest",
+    )
+    parser.add_argument(
+        "--stamp-duty-sell-rate",
+        type=float,
+        default=None,
+        help="卖出单边印花税率（如千一=0.001）；默认取 config quant.backtest",
+    )
+    parser.add_argument(
         "--transaction-fee-rate",
         type=float,
-        default=8e-4,
-        help="换仓单边综合费率（佣金+印花税等），按成交名义金额计；默认 0.0008",
+        default=None,
+        help="已弃用：若填写且未显式指定 commission/stamp，则视为单边综合佣金且印花税=0（兼容旧脚本）",
     )
     parser.add_argument(
         "--slippage-rate",
@@ -891,18 +1006,37 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    tx_fee = float(args.transaction_fee_rate)
+    qbt = get_quant_config_merged().get("backtest", {})
     slip = float(args.slippage_rate)
     if args.buy_fee_rate is not None or args.sell_fee_rate is not None:
         print(
-            "提示: --buy-fee-rate / --sell-fee-rate 已弃用，统一使用 "
-            "--transaction-fee-rate；本次仍按新参数执行。",
+            "提示: --buy-fee-rate / --sell-fee-rate 已弃用；请使用 --commission-rate / --stamp-duty-sell-rate。",
             flush=True,
         )
-    if tx_fee < 0 or slip < 0 or slip >= 1:
-        raise SystemExit(
-            "transaction-fee-rate 须 ≥0，slippage-rate 须在 [0, 1) 内。"
+    if slip < 0 or slip >= 1:
+        raise SystemExit("slippage-rate 须在 [0, 1) 内。")
+
+    if args.transaction_fee_rate is not None:
+        comm = float(args.transaction_fee_rate)
+        stamp = 0.0
+        print(
+            "[回测] 使用已弃用的 --transaction-fee-rate 作为单边佣金，印花税按 0（旧合并费率近似）。",
+            flush=True,
         )
+    else:
+        comm = float(
+            args.commission_rate
+            if args.commission_rate is not None
+            else qbt.get("commission_rate", 0.0003)
+        )
+        stamp = float(
+            args.stamp_duty_sell_rate
+            if args.stamp_duty_sell_rate is not None
+            else qbt.get("stamp_duty_sell_rate", 0.001)
+        )
+
+    if comm < 0 or stamp < 0:
+        raise SystemExit("commission-rate 与 stamp-duty-sell-rate 须 ≥0。")
 
     db_lo, db_hi = get_stock_daily_kline_date_bounds(DB_PATH)
     if db_lo is None or db_hi is None:
@@ -928,7 +1062,7 @@ def main() -> None:
     else:
         print("当前激活模型版本:", mv.get("version"), "train_end_date=", mv.get("train_end_date"))
 
-    model = load_active_model()
+    lgb_m, xgb_m = load_active_models()
 
     # 股票池：优先结束日成分（可能需联网）；失败则用本地库内代码
     pairs: list[tuple[str, str]] = []
@@ -992,19 +1126,22 @@ def main() -> None:
     engine = BacktestEngine(
         bars=bars,
         trade_dates=trade_dates,
-        model=model,
+        lgb_model=lgb_m,
+        xgb_model=xgb_m,
         initial_cash=args.initial_cash,
         holding_days=args.holding_days,
         buy_price=args.buy_price,
         sell_price=args.sell_price,
-        transaction_fee_rate=tx_fee,
+        commission_rate=comm,
+        stamp_duty_sell_rate=stamp,
         slippage_rate=slip,
         get_universe=universe_fn,
         include_300=args.include_300,
         include_688=args.include_688,
     )
     print(
-        f"摩擦假设: transaction_fee_rate={tx_fee:.6g}, slippage_rate={slip:.6g}",
+        f"摩擦假设: commission_rate={comm:.6g}, stamp_duty_sell_rate={stamp:.6g}, "
+        f"slippage_rate={slip:.6g}",
         flush=True,
     )
     print(
@@ -1038,7 +1175,8 @@ def main() -> None:
     nav_out["close_trade_win_rate"] = (
         float(np.mean([1.0 if x > 0 else 0.0 for x in pnls])) if n_close > 0 else float("nan")
     )
-    nav_out["transaction_fee_rate"] = tx_fee
+    nav_out["commission_rate"] = comm
+    nav_out["stamp_duty_sell_rate"] = stamp
     nav_out["slippage_rate"] = slip
     nav_out.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"净值序列已写入: {out_path.resolve()}")

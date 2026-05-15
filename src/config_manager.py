@@ -87,6 +87,18 @@ class ConfigManager:
                 "send_on_error": True,
             },
             "experience_filters": {},
+            "quant": {
+                "backtest": {
+                    "commission_rate": 0.0003,
+                    "stamp_duty_sell_rate": 0.001,
+                },
+                "pattern": {"coarse_top_k": 100, "dtw_volume_weight": 1.0},
+                "psi": {"bins": 12, "alert_threshold": 0.25},
+                "ranking": {
+                    "extreme_loss_weight": 2.5,
+                    "extreme_loss_thresh": -0.05,
+                },
+            },
         }
 
     def save_config(self) -> bool:

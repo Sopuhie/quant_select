@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS stock_daily_kline (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(date, stock_code)
 );
+-- 按 (stock_code, date) 查询本地 K 线的主路径索引（与上表 UNIQUE 约束并存）
 CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date);
 
 CREATE TABLE IF NOT EXISTS stock_financial_data (

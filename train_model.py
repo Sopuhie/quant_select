@@ -37,10 +37,12 @@ from src.config import (
     MIN_HISTORY_BARS,
     MODEL_PATH,
     XGB_MODEL_PATH,
+    get_quant_config_merged,
 )
 from src.database import init_db, register_model_version
 from src.factor_calculator import (
     DEFAULT_INDUSTRY_LABEL,
+    attach_hsgt_flow_interact,
     clean_cross_sectional_features,
     compute_factors_for_history,
     label_forward_return,
@@ -48,9 +50,13 @@ from src.factor_calculator import (
 )
 from src.model_trainer import (
     _json_safe,
+    _prepare_rank_xy,
+    fit_meta_stacker_ridge,
     load_ranker_params_json,
     merge_ranker_params,
     optuna_tune_lgbm_ranker,
+    population_stability_index,
+    save_meta_stacker,
     save_model,
     save_ranker_params_json,
     train_lgbm_ranker,
@@ -195,6 +201,9 @@ def main() -> None:
     )
 
     if verbose:
+        print("[北向交互] 正在为面板附加北向×5日收益因子列…", flush=True)
+    panel = attach_hsgt_flow_interact(panel, date_col="date")
+    if verbose:
         print(
             f"[截面清洗] 行数 {len(panel)}，分位秩 + 行业内 MAD/Z + 市值残差中性化…",
             flush=True,
@@ -303,6 +312,32 @@ def main() -> None:
             metrics_register[k] = v
     metrics_register.update({k: v for k, v in xgb_metrics.items() if v is not None})
 
+    tr_r, X_tr_m, y_tr_m = _prepare_rank_xy(train_df, date_col="date")
+    va_r, X_va_m, y_va_m = _prepare_rank_xy(val_df, date_col="date")
+    pred_tr_lgb = np.asarray(model.predict(X_tr_m), dtype=float).ravel()
+    pred_va_lgb = np.asarray(model.predict(X_va_m), dtype=float).ravel()
+    qconf = get_quant_config_merged()
+    psi_bins = int(qconf.get("psi", {}).get("bins", 12))
+    psi_val = population_stability_index(
+        pred_tr_lgb, pred_va_lgb, n_bins=psi_bins
+    )
+    metrics_register["psi_lgb_pred_train_vs_val"] = psi_val
+    psi_thr = float(qconf.get("psi", {}).get("alert_threshold", 0.25))
+    if np.isfinite(psi_val) and psi_val > psi_thr:
+        metrics_register["psi_alert"] = f"PSI={psi_val:.4f} 超过阈值 {psi_thr}"
+
+    meta_model, meta_m = fit_meta_stacker_ridge(
+        model,
+        xgb_model,
+        X_tr_m,
+        X_va_m,
+        y_tr_m,
+        y_va_m,
+        va_r["date"].to_numpy(),
+    )
+    metrics_register.update({k: v for k, v in meta_m.items() if v is not None})
+    save_meta_stacker(meta_model)
+
     save_model(model, MODEL_PATH)
     save_model(xgb_model, XGB_MODEL_PATH)
     register_model_version(
@@ -320,6 +355,8 @@ def main() -> None:
             "train_end_date": train_end_register,
             "mean_rank_ic_val": rank_metrics.get("mean_rank_ic_val"),
             "xgb_mean_rank_ic_val": xgb_metrics.get("xgb_mean_rank_ic_val"),
+            "psi_lgb_pred_train_vs_val": metrics_register.get("psi_lgb_pred_train_vs_val"),
+            "meta_mean_rank_ic_val": metrics_register.get("meta_mean_rank_ic_val"),
             "model_path": str(MODEL_PATH),
             "xgb_model_path": str(XGB_MODEL_PATH),
             "best_params_json": str(BEST_LGB_PARAMS_JSON) if args.tune else None,

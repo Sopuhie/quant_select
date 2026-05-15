@@ -44,11 +44,12 @@ from .database import (
     selection_exists_for_date,
 )
 from .factor_calculator import (
+    attach_hsgt_flow_interact,
     clean_cross_sectional_features,
     compute_factors_for_history,
     normalize_industry_label,
 )
-from .model_trainer import load_model, load_xgb_ranker_optional
+from .model_trainer import load_model, load_meta_stacker_optional, load_xgb_ranker_optional
 from .utils import is_kline_too_stale_vs_prediction
 
 
@@ -115,6 +116,13 @@ def analyze_stock_reasons(
         "factor_volatility_5d": "短期历史波动率处于变盘临界点，个股向上拉升弹性极大",
         "factor_volatility_20d": "中期波幅收敛后重新发散，有望打开全新一轮上升主升浪",
         "factor_close_position": "收盘价几乎死死封在全天最高点，日内主力资金控盘和买入抢筹极其坚决",
+        "factor_amihud_20d": "Amihud 非流动性偏高，盘口承接变薄、冲击成本上升",
+        "factor_pv_corr_10d": "近 10 日价量变化协同性（负值常对应量价背离）",
+        "factor_vwap_bias_20d": "相对 20 日 VWAP 偏离，反映成本中枢与筹码重心",
+        "factor_bb_width_20d": "布林带宽度扩张或收敛，波动 regime 切换信号",
+        "factor_drawdown_60d": "相对 60 日高点的回撤深度，套牢盘与反弹弹性代理",
+        "factor_shrink_pullback_5d": "近 5 日下跌段缩量特征，缩量回调为正向结构",
+        "factor_hsgt_flow_interact": "北向净流入强度与短期收益的交互项（市场资金面共振）",
     }
 
     contributions: list[tuple[str, float]] = []
@@ -164,6 +172,38 @@ def blend_ranker_scores(
     return (
         (float(lgb_weight) / w) * lgb_r + (float(xgb_weight) / w) * xgb_r
     ).astype(float)
+
+
+def blend_ranker_scores_with_optional_meta(
+    lgb_scores: np.ndarray | pd.Series,
+    xgb_scores: np.ndarray | pd.Series | None,
+    *,
+    lgb_weight: float = 0.6,
+    xgb_weight: float = 0.4,
+) -> np.ndarray:
+    """
+    若存在 ``models/meta_rank_stacker.pkl``（Ridge 元学习器），则用 [LGB 原始分, XGB 原始分] 预测
+    截面分位秩得分；否则退回 ``blend_ranker_scores``。
+    """
+    ls = np.asarray(lgb_scores, dtype=float).ravel()
+    if xgb_scores is None:
+        return ls.astype(float)
+    xs = np.asarray(xgb_scores, dtype=float).ravel()
+    if xs.shape[0] != ls.shape[0]:
+        raise ValueError("LightGBM 与 XGBoost 预测长度不一致")
+    pack = load_meta_stacker_optional()
+    if pack:
+        ridge = pack.get("model")
+        if ridge is not None:
+            try:
+                z = np.column_stack([ls, xs])
+                raw = np.asarray(ridge.predict(z), dtype=float).ravel()
+                return pd.Series(raw).rank(pct=True).to_numpy(dtype=float)
+            except Exception:
+                pass
+    return blend_ranker_scores(
+        ls, xs, lgb_weight=lgb_weight, xgb_weight=xgb_weight
+    )
 
 
 def _normalize_stock_display_name(stock_name: Optional[str]) -> str:
@@ -382,6 +422,7 @@ def _cross_section_features_for_diagnose(
     if not rows:
         return None, anchor_td, "no_factor_rows"
     feat_df = pd.DataFrame(rows)
+    feat_df = attach_hsgt_flow_interact(feat_df, date_col="trade_date")
     feat_df = prune_zero_volume_rows(feat_df)
     feat_df = feat_df.drop(columns=["volume"], errors="ignore")
     if feat_df.empty:
@@ -553,6 +594,7 @@ def predict_universe_scores(
             "关闭兜底排查：set QUANT_BAOSTOCK_FALLBACK=0"
         )
     feat_df = pd.DataFrame(raw_rows)
+    feat_df = attach_hsgt_flow_interact(feat_df, date_col="trade_date")
     tb = feat_df["trade_date"].map(lambda x: str(x).strip()[:10])
 
     if target_trade_date is not None:
@@ -602,7 +644,7 @@ def predict_universe_scores(
     X = feat_df[FEATURE_COLUMNS].astype(np.float64)
     lgb_scores = lgb_model.predict(X)
     xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
-    feat_df["score"] = blend_ranker_scores(lgb_scores, xgb_scores)
+    feat_df["score"] = blend_ranker_scores_with_optional_meta(lgb_scores, xgb_scores)
     feat_df = feat_df.sort_values(
         ["score", "stock_code"],
         ascending=[False, True],
@@ -945,10 +987,21 @@ def diagnose_single_stock(
         return None, f"无法加载模型：{exc}", "error"
 
     xgb_model = load_xgb_ranker_optional()
+    # 全市场截面成功时，北向交互已在 ``_cross_section_features_for_diagnose`` 中与因子一并清洗，勿重复覆盖。
+    if cs_map is None:
+        _hsgt_df = pd.DataFrame([feat_map])
+        _hsgt_df["trade_date"] = td
+        _hsgt_df = attach_hsgt_flow_interact(_hsgt_df, date_col="trade_date")
+        feat_map = {c: float(_hsgt_df.iloc[0][c]) for c in FEATURE_COLUMNS}
     X = pd.DataFrame([[feat_map[c] for c in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
     lgb_scores = lgb_model.predict(X)
     xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
-    blended = float(np.asarray(blend_ranker_scores(lgb_scores, xgb_scores), dtype=float).ravel()[0])
+    blended = float(
+        np.asarray(
+            blend_ranker_scores_with_optional_meta(lgb_scores, xgb_scores),
+            dtype=float,
+        ).ravel()[0]
+    )
 
     pct, ref_td = _reference_score_percentile(blended)
     stock_name = lookup_stock_display_name(code6)

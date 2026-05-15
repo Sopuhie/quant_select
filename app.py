@@ -628,7 +628,7 @@ with tab_advisor:
     st.markdown("### 🎯 A-Quant Lite 个股全维度智能诊断")
     st.caption(
         "输入 6 位代码或带交易所后缀；基于本地 stock_daily_kline、"
-        "与全市场选股相同的 14 个量价因子及 LGB/XGB 融合打分；"
+        "与全市场选股相同的扩展量价因子及 LGB/XGB/Meta 融合打分；"
         "审计 config.json 中的经验风控阈值。"
         "前期涨幅/动量压制由环境变量 QUANT_PREV_GAIN_SUPPRESSION（及 QUANT_MAX_5D_RETURN、QUANT_MAX_20D_MOMENTUM）"
         "统一控制：与全市场选股、回测、诊股一致，默认关闭（0）。"
@@ -705,7 +705,7 @@ with tab_advisor:
 
             with st.expander("因子贡献解读（与入选理由同款逻辑）", expanded=False):
                 st.write(res.get("reason_line", ""))
-            with st.expander("14 项量价因子当前值", expanded=False):
+            with st.expander("扩展量价因子当前值", expanded=False):
                 fv = res.get("features") or {}
                 st.json({k: round(float(fv[k]), 6) for k in FEATURE_COLUMNS if k in fv})
             vio = res.get("violated") or []
@@ -1400,6 +1400,13 @@ with tab_perf:
                         "factor_volatility_5d": "🌪️ 5日历史波动率 (高低价差比)",
                         "factor_volatility_20d": "🌪️ 20日历史波动率",
                         "factor_close_position": "🎯 日内收盘位置 (主力真买入强度/资金代理)",
+                        "factor_amihud_20d": "💧 Amihud 非流动性（冲击成本代理）",
+                        "factor_pv_corr_10d": "🔗 价量 10 日滚动相关（背离为负）",
+                        "factor_vwap_bias_20d": "📐 相对 20 日 VWAP 偏离",
+                        "factor_bb_width_20d": "📈 布林带宽度（波动 regime）",
+                        "factor_drawdown_60d": "⬇️ 60 日高点回撤深度",
+                        "factor_shrink_pullback_5d": "🪫 下跌段缩量程度（缩量回调）",
+                        "factor_hsgt_flow_interact": "🌐 北向强度×5日收益交互",
                     }
 
                     raw_features = FEATURE_COLUMNS[:n]
@@ -1570,22 +1577,17 @@ with tab_data:
         use_container_width=True,
     )
     if onekey_btn:
-        from src.pipeline import run_complete_pipeline
-
-        log_lines: list[str] = []
-        ph = st.empty()
-
-        def _pipe_log(line: str) -> None:
-            log_lines.append(line)
-            ph.code("".join(log_lines[-28:]), language="bash")
-
-        with st.spinner(
-            "全套工作流执行中，请勿关闭页面；下方为实时步骤输出…",
-        ):
-            ok_pipe = run_complete_pipeline(
-                task_name="页面手动一键执行",
-                log_consumer=_pipe_log,
+        _pipe_cmd = [
+            sys.executable,
+            "-m",
+            "src.pipeline",
+        ]
+        with st.spinner("全套工作流已在独立子进程中执行，日志实时刷新…"):
+            ret_code, pipe_log = run_command_interactive(
+                _pipe_cmd,
+                task_name="页面手动一键执行(Pipeline子进程)",
             )
+        ok_pipe = ret_code == 0
         if ok_pipe:
             st.success(
                 "🎉 全套工作流已顺序完成（详见上方输出与「系统运行日志」）。"

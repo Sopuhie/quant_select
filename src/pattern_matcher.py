@@ -1,6 +1,7 @@
 """
 图形相似度匹配引擎。
-使用本地 SQLite 行情：可选皮尔逊相关 + 形状距离（向量化），或纯 NumPy DTW（双行 DP，可选 Sakoe-Chiba 带状）。
+使用本地 SQLite 行情：皮尔逊 / RMSE 粗筛 + 可选 DTW；DTW 支持「收盘价+成交量」
+双序列拼接后的多维 DTW（等价于每步代价为价、量平方误差加权和）。
 """
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from datetime import timedelta
 import numpy as np
 import pandas as pd
 
+from .config import get_quant_config_merged
 from .database import get_connection
 
 
@@ -25,7 +27,7 @@ def get_normalized_series(series: pd.Series) -> np.ndarray:
 
 
 def _row_minmax_norm(X: np.ndarray) -> np.ndarray:
-    """对二维收盘价矩阵按行 Min-Max 到 [0,1]，与 ``get_normalized_series`` 规则一致。"""
+    """对二维矩阵按行 Min-Max 到 [0,1]。"""
     mins = X.min(axis=1, keepdims=True)
     maxs = X.max(axis=1, keepdims=True)
     rng = maxs - mins
@@ -34,17 +36,10 @@ def _row_minmax_norm(X: np.ndarray) -> np.ndarray:
     return out
 
 
-# Sakoe-Chiba 带宽（|i−j|≤R）；R 为常数时单条序列约 O(W·R)，全候选合计 O(N·W·R)≈O(N·W)。
 DEFAULT_DTW_SAKOE_CHIBA_RADIUS = 12
-# DTW 精筛前按 Pearson 相关系数保留的候选数量上限（全市场粗筛）
-DTW_PEARSON_COARSE_TOP_K = 100
 
 
 def _dtw_accumulated_sq_cost_full_2row(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    完整 DTW：累计平方欧式路径代价（未开方）。
-    双行滚动数组，时间 O(n·m)，空间 O(m)；无 (n+1)×(m+1) 全矩阵分配。
-    """
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
     n, m = len(a), len(b)
@@ -69,10 +64,6 @@ def _dtw_accumulated_sq_cost_banded_2row(
     b: np.ndarray,
     radius: int,
 ) -> float:
-    """
-    Sakoe-Chiba 带状 DTW（|i−j|≤radius），双行滚动。
-    固定 radius 且 n≈m=W 时，时间约 O(W·radius)。
-    """
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
     n, m = len(a), len(b)
@@ -101,7 +92,6 @@ def _dtw_euclidean_distance(
     *,
     sakoe_chiba_radius: int | None,
 ) -> float:
-    """欧式 DTW 距离；优先带状加速，累计代价非有限时回退完整 DTW。"""
     rad = (
         int(sakoe_chiba_radius)
         if sakoe_chiba_radius is not None
@@ -119,7 +109,6 @@ def _dtw_distances_ref_to_rows(
     *,
     sakoe_chiba_radius: int | None,
 ) -> np.ndarray:
-    """样板 ``ref`` (W,) 与候选矩阵 ``X`` (N,W) 的 DTW 距离向量 (N,)。"""
     ref = np.asarray(ref, dtype=np.float64).ravel()
     out = np.empty(X.shape[0], dtype=np.float64)
     for i in range(X.shape[0]):
@@ -128,7 +117,6 @@ def _dtw_distances_ref_to_rows(
 
 
 def _pearson_rows(ref: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """``ref`` 形状 (W,)，``X`` (N, W)；返回每只候选与 ``ref`` 的皮尔逊相关系数 (N,)。"""
     ref_mean = ref.mean()
     X_mean = X.mean(axis=1, keepdims=True)
     rc = ref - ref_mean
@@ -143,6 +131,11 @@ def _pearson_rows(ref: np.ndarray, X: np.ndarray) -> np.ndarray:
     return corr.astype(np.float64)
 
 
+def _rmse_rows(ref: np.ndarray, X: np.ndarray) -> np.ndarray:
+    diff = X - ref
+    return np.sqrt(np.mean(diff**2, axis=1)).astype(np.float64)
+
+
 def find_similar_patterns(
     target_code: str,
     start_date: str,
@@ -154,17 +147,15 @@ def find_similar_patterns(
     dtw_sakoe_chiba_radius: int | None = None,
 ) -> list[dict]:
     """
-    在本地行情库中，寻找与目标股票给定区间收盘价形态最相似的个股（最近窗口长度与模板一致）。
+    在本地行情库中，寻找与目标股票给定区间形态最相似的个股。
 
-    Args:
-        target_code: 模板股票代码
-        start_date / end_date: 模板区间（YYYY-MM-DD）
-        compare_days: 日历跨度近似控制候选数据加载起点（越大越耗内存，默认覆盖约一季以上交易日）
-        limit_results: 返回前几条
-        algorithm: ``pearson`` | ``dtw``；``dtw`` 时先按 Pearson 在全市场粗筛再对前若干只（见模块常量 ``DTW_PEARSON_COARSE_TOP_K``）做 DTW。
-        dtw_sakoe_chiba_radius: DTW 的 Sakoe-Chiba 带宽 R（``|i-j|≤R``）；``None`` 时用模块默认值。
-            固定 R 时复杂度约 ``O(N·W·R)``；过紧时会自动回退完整双行 DTW。
+    - **粗筛**：皮尔逊（收盘）+ 皮尔逊（成交量）+ RMSE（收盘）综合排序，仅保留 Top K（见 ``config`` quant.pattern）。
+    - **DTW**：在 Top K 上，对 ``[归一化收盘 || w·归一化成交量]`` 拼接序列做 DTW（量价协同）。
     """
+    qpat = get_quant_config_merged().get("pattern", {})
+    coarse_top_k = max(20, int(qpat.get("coarse_top_k", 100)))
+    vol_w = float(qpat.get("dtw_volume_weight", 1.0))
+
     algo = str(algorithm).strip().lower()
     if algo not in ("pearson", "dtw"):
         algo = "pearson"
@@ -174,7 +165,7 @@ def find_similar_patterns(
     end_date = str(end_date).strip()[:10]
 
     sql_target = """
-        SELECT date, close FROM stock_daily_kline
+        SELECT date, close, volume FROM stock_daily_kline
         WHERE stock_code = ? AND date >= ? AND date <= ?
         ORDER BY date ASC
     """
@@ -188,7 +179,8 @@ def find_similar_patterns(
 
         window_size = len(target_df)
         target_series = get_normalized_series(target_df["close"])
-        if len(target_series) != window_size:
+        target_vol = get_normalized_series(target_df["volume"])
+        if len(target_series) != window_size or len(target_vol) != window_size:
             return []
 
         end_dt = pd.Timestamp(end_date)
@@ -196,7 +188,7 @@ def find_similar_patterns(
         cutoff = (end_dt - timedelta(days=calendar_slack)).strftime("%Y-%m-%d")
 
         sql_all = """
-            SELECT date, stock_code, stock_name, close FROM stock_daily_kline
+            SELECT date, stock_code, stock_name, close, volume FROM stock_daily_kline
             WHERE stock_code != ? AND date >= ?
             ORDER BY stock_code, date ASC
         """
@@ -206,11 +198,13 @@ def find_similar_patterns(
         return []
 
     all_df["close"] = pd.to_numeric(all_df["close"], errors="coerce")
-    all_df = all_df.dropna(subset=["close"])
+    all_df["volume"] = pd.to_numeric(all_df["volume"], errors="coerce")
+    all_df = all_df.dropna(subset=["close", "volume"])
 
     stock_codes: list[str] = []
     stock_names: list[str] = []
     raw_blocks: list[np.ndarray] = []
+    raw_vol_blocks: list[np.ndarray] = []
     dates_blocks: list[list[str]] = []
     raw_price_blocks: list[list[float]] = []
 
@@ -224,7 +218,10 @@ def find_similar_patterns(
 
         candidate_window = group.tail(window_size)
         closes = candidate_window["close"].to_numpy(dtype=np.float64, copy=False)
+        vols = candidate_window["volume"].to_numpy(dtype=np.float64, copy=False)
         if closes.shape[0] != window_size or not np.all(np.isfinite(closes)):
+            continue
+        if vols.shape[0] != window_size or not np.all(np.isfinite(vols)) or np.any(vols <= 0):
             continue
 
         candidate_name = str(candidate_window["stock_name"].iloc[0] or "").strip()
@@ -239,6 +236,7 @@ def find_similar_patterns(
         stock_codes.append(code_z)
         stock_names.append(candidate_name)
         raw_blocks.append(closes)
+        raw_vol_blocks.append(vols)
         dates_blocks.append(dates_fmt)
         raw_price_blocks.append(closes.astype(float).tolist())
 
@@ -246,17 +244,29 @@ def find_similar_patterns(
         return []
 
     X_raw = np.vstack(raw_blocks)
+    X_vol_raw = np.vstack(raw_vol_blocks)
     X_norm = _row_minmax_norm(X_raw)
+    X_vol_norm = _row_minmax_norm(X_vol_raw)
     ref = np.asarray(target_series, dtype=np.float64)
+    ref_v = np.asarray(target_vol, dtype=np.float64)
+
+    corr_c = _pearson_rows(ref, X_norm)
+    corr_v = _pearson_rows(ref_v, X_vol_norm)
+    rmse_c = _rmse_rows(ref, X_norm)
+    rmse_score = 1.0 / (1.0 + rmse_c)
+    coarse = 0.45 * corr_c + 0.25 * corr_v + 0.30 * rmse_score
 
     limit = int(limit_results)
+    k_coarse = min(coarse_top_k, len(coarse))
+
     if algo == "dtw":
-        corr_all = _pearson_rows(ref, X_norm)
-        k_coarse = min(int(DTW_PEARSON_COARSE_TOP_K), len(corr_all))
-        top_idx = np.argsort(-corr_all)[:k_coarse]
-        X_sub = X_norm[top_idx]
+        top_idx = np.argsort(-coarse)[:k_coarse]
+        ref_cat = np.concatenate([ref, vol_w * ref_v])
+        X_sub = np.concatenate(
+            [X_norm[top_idx], vol_w * X_vol_norm[top_idx]], axis=1
+        )
         dtw_d = _dtw_distances_ref_to_rows(
-            ref,
+            ref_cat,
             X_sub,
             sakoe_chiba_radius=dtw_sakoe_chiba_radius,
         )
@@ -270,27 +280,25 @@ def find_similar_patterns(
         similarity = np.full(len(stock_codes), -1.0, dtype=np.float64)
         similarity[top_idx] = similarity_sub
     else:
-        corr = _pearson_rows(ref, X_norm)
-        diff = X_norm - ref
-        dist = np.sqrt(np.mean(diff**2, axis=1))
-        dist_score = 1.0 / (1.0 + dist)
-        similarity = np.maximum(0.0, (corr + 1.0) / 2.0 * 80.0 + dist_score * 20.0)
-
-    if algo != "dtw":
+        similarity = np.maximum(0.0, (coarse + 1.0) / 2.0 * 85.0 + rmse_score * 15.0)
         order = np.argsort(-similarity)[:limit]
 
     tgt_list = ref.tolist()
+    tgt_vol_list = ref_v.tolist()
     results: list[dict] = []
     for k in order:
         i = int(k)
         row_norm = X_norm[i]
+        row_v_norm = X_vol_norm[i]
         results.append(
             {
                 "stock_code": stock_codes[i],
                 "stock_name": stock_names[i],
                 "similarity": float(similarity[i]),
                 "target_trajectory": tgt_list,
+                "target_volume_trajectory": tgt_vol_list,
                 "candidate_trajectory": row_norm.tolist(),
+                "candidate_volume_trajectory": row_v_norm.tolist(),
                 "dates": dates_blocks[i],
                 "raw_prices": raw_price_blocks[i],
             }

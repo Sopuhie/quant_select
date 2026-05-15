@@ -51,6 +51,7 @@ from src.database import (
 )
 from src.dingtalk_notifier import maybe_push_daily_selections
 from src.factor_calculator import (
+    attach_hsgt_flow_interact,
     clean_cross_sectional_features,
     compute_factors_for_history,
     normalize_industry_label,
@@ -59,7 +60,7 @@ from src.model_trainer import load_model, load_xgb_ranker_optional
 from src.predictor import (
     analyze_stock_reasons,
     apply_experience_trading_filters,
-    blend_ranker_scores,
+    blend_ranker_scores_with_optional_meta,
     feature_importances_aligned,
     filter_predictions,
     prune_zero_volume_rows,
@@ -409,6 +410,7 @@ def predict_daily(
 
     # 转化为 DataFrame（已按 pairs 顺序，便于与训练/排查对齐）
     feat_df = pd.DataFrame(rows)
+    feat_df = attach_hsgt_flow_interact(feat_df, date_col="trade_date")
     feat_df = prune_zero_volume_rows(feat_df)
     feat_df = feat_df.drop(columns=["volume"], errors="ignore")
     if feat_df.empty:
@@ -451,7 +453,7 @@ def predict_daily(
     xgb_scores = xgb_model.predict(X.values) if xgb_model is not None else None
 
     filtered_df = filtered_df.copy()
-    filtered_df["score"] = blend_ranker_scores(lgb_scores, xgb_scores)
+    filtered_df["score"] = blend_ranker_scores_with_optional_meta(lgb_scores, xgb_scores)
 
     # 全市场排序并记录预测数据（分数相同时按代码稳定次序，避免重复运行 Top 边界跳动）
     filtered_df = filtered_df.sort_values(
