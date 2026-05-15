@@ -153,6 +153,21 @@ CREATE TABLE IF NOT EXISTS system_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_logs_task_name ON system_logs(task_name);
 CREATE INDEX IF NOT EXISTS idx_logs_created ON system_logs(created_at);
+
+CREATE TABLE IF NOT EXISTS signal_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code TEXT NOT NULL,
+    stock_name TEXT,
+    signal_time TEXT NOT NULL,
+    signal_price REAL,
+    signal_type TEXT NOT NULL,
+    reason TEXT,
+    realtime_score REAL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_signal_code_time ON signal_history(stock_code, signal_time);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_dedup_minute
+    ON signal_history(stock_code, signal_time, signal_type);
 """
 
 
@@ -1057,6 +1072,125 @@ def upsert_stock_money_flow_rows(
             )
 
     _retry_sqlite_locked(_do, attempts=5)
+
+
+def fetch_top3_selections_for_monitor(
+    trade_date: str | None = None,
+    db_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """读取指定或最近交易日的 rank 1–TOP_N 选股，供实盘监控模块使用。"""
+    from .config import TOP_N_SELECTION
+
+    if trade_date:
+        td = str(trade_date).strip()[:10]
+    else:
+        with get_connection(db_path) as conn:
+            cur = conn.execute("SELECT MAX(trade_date) FROM daily_selections")
+            row = cur.fetchone()
+            if row is None or row[0] is None:
+                return []
+            td = str(row[0]).strip()[:10]
+    df = query_df(
+        """
+        SELECT rank, stock_code, stock_name, score, close_price
+        FROM daily_selections
+        WHERE trade_date = ? AND rank BETWEEN 1 AND ?
+        ORDER BY rank ASC
+        """,
+        (td, int(TOP_N_SELECTION)),
+        db_path,
+    )
+    if df.empty:
+        return []
+    return df.to_dict("records")
+
+
+def insert_signal_record(
+    *,
+    stock_code: str,
+    stock_name: str | None,
+    signal_time: str,
+    signal_price: float,
+    signal_type: str,
+    reason: str | None = None,
+    realtime_score: float | None = None,
+    db_path: Path | None = None,
+) -> None:
+    """写入盘中信号；多线程下通过 WAL + 重试保证安全。"""
+    code = str(stock_code).strip().zfill(6)
+    st_norm = str(signal_time).strip()[:19]
+    params = (
+        code,
+        stock_name,
+        st_norm,
+        float(signal_price),
+        str(signal_type).strip(),
+        reason,
+        float(realtime_score) if realtime_score is not None else None,
+        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+    def _do() -> None:
+        with get_connection(db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO signal_history
+                (stock_code, stock_name, signal_time, signal_price, signal_type,
+                 reason, realtime_score, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+
+    _retry_sqlite_locked(_do, attempts=5)
+
+
+def signal_exists_in_minute(
+    stock_code: str,
+    signal_time_minute: str,
+    signal_type: str,
+    db_path: Path | None = None,
+) -> bool:
+    """同股、同分钟桶、同类型是否已存在（用于去重）。"""
+    code = str(stock_code).strip().zfill(6)
+    bucket = str(signal_time_minute).strip()[:16]
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT 1 FROM signal_history
+            WHERE stock_code = ? AND substr(signal_time, 1, 16) = ? AND signal_type = ?
+            LIMIT 1
+            """,
+            (code, bucket, str(signal_type).strip()),
+        )
+        return cur.fetchone() is not None
+
+
+def fetch_signal_history_for_stock_on_date(
+    stock_code: str,
+    trade_date: str | None = None,
+    db_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """读取单只股票某日（默认今日）已触发的信号，供图表标注。"""
+    code = str(stock_code).strip().zfill(6)
+    day = (
+        str(trade_date).strip()[:10]
+        if trade_date
+        else datetime.now().strftime("%Y-%m-%d")
+    )
+    df = query_df(
+        """
+        SELECT signal_time, signal_price, signal_type, reason, realtime_score
+        FROM signal_history
+        WHERE stock_code = ? AND signal_time LIKE ?
+        ORDER BY signal_time ASC
+        """,
+        (code, f"{day}%"),
+        db_path,
+    )
+    if df.empty:
+        return []
+    return df.to_dict("records")
 
 
 def upsert_stock_north_hold_rows(

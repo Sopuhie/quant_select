@@ -169,6 +169,20 @@ def get_a_share_trade_date_set() -> set[str]:
     return set(get_sorted_a_share_trade_dates())
 
 
+def is_a_share_intraday_session(now: datetime | None = None) -> bool:
+    """
+    是否处于 A 股连续竞价时段（9:30–11:30、13:00–15:00，本地时间）。
+    非交易日返回 False。
+    """
+    n = now or datetime.now()
+    if not is_a_share_trading_day(n.strftime("%Y-%m-%d")):
+        return False
+    t = n.time()
+    morning = time(9, 30) <= t <= time(11, 30)
+    afternoon = time(13, 0) <= t <= time(15, 0)
+    return morning or afternoon
+
+
 def is_a_share_trading_day(d: str) -> bool:
     """
     判断 ``d``（YYYY-MM-DD）是否为 A 股交易日。

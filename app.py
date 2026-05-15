@@ -49,7 +49,12 @@ from src.config import (
     get_experience_thresholds,
 )
 from src.config_manager import config_manager
-from src.database import get_connection, init_db, insert_system_log, query_df
+from src.database import (
+    get_connection,
+    init_db,
+    insert_system_log,
+    query_df,
+)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -505,67 +510,71 @@ with tab_today:
             st.session_state.selected_stock = None
 
         if not today_df.empty:
-            cols = st.columns(len(today_df))
-            for i, col in enumerate(cols):
-                row = today_df.iloc[i]
-                reason_html = ""
-                if "selection_reason" in today_df.columns:
-                    rv = row.get("selection_reason")
-                    if pd.notna(rv) and str(rv).strip():
-                        reason_html = (
-                            '<p style="font-size: 0.78rem; color: #475569; text-align: left; '
-                            'margin-top: 14px; line-height: 1.45;">'
-                            f'{html.escape(str(rv).strip())}'
-                            "</p>"
-                        )
-                with col:
-                    st.markdown(
-                        f"""
-                <div style="
-                            background-color: #ffffff;
-                            border: 2px solid #0d9488;
-                            padding: 22px;
-                            border-radius: 12px;
-                            margin: 10px 0;
-                    text-align: center;
-                            box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08);
-                        ">
-                            <span style="
-                                background-color: #0d9488;
-                                color: #ffffff;
-                                font-weight: bold;
-                                padding: 3px 12px;
-                                border-radius: 20px;
-                                font-size: 0.85rem;
-                            ">RANK #{int(row["rank"])}</span>
-                            <h2 style="color: #0f172a; margin: 15px 0 5px 0; font-family: monospace; font-size: 2rem; letter-spacing: 1px;">{row["stock_code"]}</h2>
-                            <h4 style="color: #64748b; margin: 0 0 15px 0; font-weight: 500;">{row["stock_name"]}</h4>
-                            <div style="border-top: 1px solid #e2e8f0; padding-top: 12px; display: flex; justify-content: space-around;">
-                                <div>
-                                    <div style="font-size: 0.75rem; color: #64748b;">得分</div>
-                                    <div style="color: #0d9488; font-weight: bold; font-family: monospace;">{float(row["score"]):.4f}</div>
-                                </div>
-                                <div>
-                                    <div style="font-size: 0.75rem; color: #64748b;">收盘价</div>
-                                    <div style="color: #0f172a; font-weight: bold; font-family: monospace;">{row["close_price"]}</div>
-                                </div>
-                            </div>
-                            {reason_html}
-                </div>
-                """,
-                        unsafe_allow_html=True,
-                    )
+            if "quant_enable_live_monitor" not in st.session_state:
+                st.session_state.quant_enable_live_monitor = False
 
-                    btn_key = f"kline_btn_{row['stock_code']}"
-                    if st.button(
-                        f"📊 查看K线 - {row['stock_name']}",
-                        key=btn_key,
-                        use_container_width=True,
-                    ):
-                        st.session_state.selected_stock = {
-                            "code": row["stock_code"],
-                            "name": row["stock_name"],
-                        }
+            ctl_l, ctl_r = st.columns([3, 2])
+            with ctl_l:
+                st.caption(
+                    "默认：**最近交易日复盘**（daily_selections，已收盘快照）。"
+                    "仅当打开右侧「临场实盘监控」时进入分时盯盘大图，两场景互斥。"
+                )
+            with ctl_r:
+                st.toggle(
+                    "⚡ 临场实盘监控",
+                    key="quant_enable_live_monitor",
+                    help="开启后本页仅显示纵向分时+成交量+KDJ+买点表；关闭后恢复三列复盘卡片。",
+                )
+
+            is_realtime_mode = bool(st.session_state.get("quant_enable_live_monitor", False))
+
+            if not is_realtime_mode:
+                # ---------- 场景 A：历史复盘（严禁分时 / KDJ / 纵向大图）----------
+                st.markdown("##### 📋 最近交易日复盘（Top 3）")
+                hist_cols = st.columns(3)
+                for i in range(3):
+                    with hist_cols[i]:
+                        if i >= len(today_df):
+                            continue
+                        row = today_df.iloc[i]
+                        code = str(row["stock_code"]).strip().zfill(6)
+                        name = str(row.get("stock_name") or "").strip()
+                        st.markdown(f"### RANK #{int(row['rank'])}")
+                        st.markdown(
+                            f"**`{code}`** · {html.escape(name)}",
+                            unsafe_allow_html=True,
+                        )
+                        try:
+                            sc_f = float(row["score"])
+                        except (TypeError, ValueError):
+                            sc_f = float("nan")
+                        try:
+                            px = float(row["close_price"])
+                        except (TypeError, ValueError):
+                            px = float("nan")
+                        m1, m2 = st.columns(2)
+                        with m1:
+                            st.metric(
+                                "得分",
+                                f"{sc_f:.4f}" if pd.notna(sc_f) else "—",
+                            )
+                        with m2:
+                            st.metric(
+                                "收盘价",
+                                f"{px:.2f}" if pd.notna(px) else "—",
+                            )
+                        btn_key = f"kline_hist_{code}_{i}"
+                        if st.button(
+                            "📊 查看K线",
+                            key=btn_key,
+                            use_container_width=True,
+                        ):
+                            st.session_state.selected_stock = {"code": code, "name": name}
+            else:
+                # ---------- 场景 B：临场实盘（纵向大图，仅此时加载）----------
+                from src.realtime_monitor import render_today_recommend_live_monitor_section
+
+                render_today_recommend_live_monitor_section()
 
         if not t3.empty and st.session_state.selected_stock:
             st.markdown("---")

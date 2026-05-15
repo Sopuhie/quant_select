@@ -423,6 +423,7 @@ def get_realtime_min_data(stock_code: object) -> pd.DataFrame | None:
             "最高": "high",
             "最低": "low",
             "成交量": "volume",
+            "成交额": "amount",
         }
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         need = {"time", "open", "close", "high", "low", "volume"}
