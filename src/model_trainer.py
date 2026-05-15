@@ -466,7 +466,7 @@ def _walkforward_oof_fold_job(
         label_col,
         n_lgb,
         n_xgb,
-        n_cat,
+        _n_cat_oof_unused,
         es_oof,
         omp_threads,
     ) = payload
@@ -510,6 +510,7 @@ def _walkforward_oof_fold_job(
         return None
     cat_ok = False
     pcat: np.ndarray | None = None
+    # OOF 折内 CatBoost 仅作元特征趋势，固定极小迭代以缩短 Stacking 总耗时（与 n_cat 入参解耦）
     cb_m, _ = train_catboost_ranker_optional(
         tr_i,
         va_i,
@@ -517,8 +518,8 @@ def _walkforward_oof_fold_job(
         feature_cols=cols,
         date_col=date_col,
         label_col=label_col,
-        n_estimators=n_cat,
-        early_stopping_rounds=max(12, es_oof - 4),
+        n_estimators=50,
+        early_stopping_rounds=10,
         verbose=False,
         oof_worker=True,
     )
