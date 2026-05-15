@@ -235,6 +235,7 @@ RANK_SAMPLE_WEIGHT_NEG_THRESH = float(
 RANK_DRAWDOWN_WEIGHT_MULT = float(os.environ.get("QUANT_RANK_DD_WEIGHT_MULT", "2.0"))
 RANK_DRAWDOWN_WEIGHT_THRESH = float(os.environ.get("QUANT_RANK_DD_WEIGHT_THRESH", "-0.07"))
 # Meta 训练：训练集内按交易日 Walk-forward OOF 折数；0 或 1 表示关闭 OOF（与旧版同分布的 in-sample meta）
+# OOF 折内并行见 model_trainer.walkforward_oof_base_predictions：QUANT_OOF_MAX_WORKERS、QUANT_OOF_WORKER_OMP_THREADS 等
 RANK_META_OOF_FOLDS = int(os.environ.get("QUANT_META_OOF_FOLDS", "0"))
 
 # PSI：验证集 vs 训练集预测分分布稳定性（仅记录告警，不阻断训练）

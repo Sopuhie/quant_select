@@ -1,9 +1,12 @@
 """LightGBM 训练与模型落盘。"""
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -286,11 +289,13 @@ def train_catboost_ranker_optional(
     early_stopping_rounds: int = 40,
     random_state: int = 42,
     verbose: bool = False,
+    oof_worker: bool = False,
 ) -> tuple[Any | None, dict[str, Any]]:
     """可选 CatBoost YetiRank；未安装库或失败时返回 (None, skip 信息)。
 
-    训练加速（默认开启）：``QUANT_CATBOOST_SPEEDOPT=1`` 时使用 ``boosting_type=Plain``、
-    ``rsm``、较低 ``border_count``；设为 ``0`` / ``false`` / ``off`` 则恢复库默认行为。
+    - ``QUANT_CATBOOST_USE_GPU=1`` 时优先 ``task_type=GPU``（见 ``QUANT_CATBOOST_DEVICES``），
+      失败则回退 CPU；``oof_worker=True`` 时强制 CPU（避免多进程 OOF 争用同一块 GPU）。
+    - CPU 训练加速：``QUANT_CATBOOST_SPEEDOPT=1`` 时使用 ``Plain`` / ``rsm`` / 较低 ``border_count``。
     """
     cols = feature_cols or list(FEATURE_COLUMNS)
     try:
@@ -345,6 +350,51 @@ def train_catboost_ranker_optional(
         label=y_fit_va,
         group_id=g_va,
     )
+
+    def _cat_metrics(model: Any) -> tuple[Any, dict[str, Any]]:
+        pred_va = model.predict(X_va)
+        ic_val = mean_cross_sectional_rank_ic(
+            pred_va, va[date_col].to_numpy(), y_va.to_numpy(dtype=float)
+        )
+        metrics: dict[str, Any] = {
+            "cat_mean_rank_ic_val": ic_val,
+            "cat_n_train": int(len(y_tr)),
+            "cat_n_val": int(len(y_va)),
+        }
+        return model, metrics
+
+    try_gpu = (not oof_worker) and (
+        os.environ.get("QUANT_CATBOOST_USE_GPU", "").strip().lower() in ("1", "true", "yes", "on")
+    )
+    if try_gpu:
+        devices = os.environ.get("QUANT_CATBOOST_DEVICES", "0").strip() or "0"
+        gpu_preprocess_threads = int(os.environ.get("QUANT_CATBOOST_GPU_THREAD_COUNT", "-1"))
+        gpu_kw: dict[str, Any] = {
+            "loss_function": "YetiRank",
+            "iterations": int(n_estimators),
+            "learning_rate": lr,
+            "depth": depth,
+            "random_seed": int(random_state),
+            "verbose": bool(verbose),
+            "early_stopping_rounds": int(early_stopping_rounds),
+            "allow_writing_files": False,
+            "task_type": "GPU",
+            "devices": devices,
+            "thread_count": gpu_preprocess_threads,
+            "bootstrap_type": "Bernoulli",
+            "subsample": float(os.environ.get("QUANT_CATBOOST_SUBSAMPLE", "0.66")),
+        }
+        try:
+            gpu_model = CatBoostRanker(**gpu_kw)
+            gpu_model.fit(train_pool, eval_set=eval_pool, use_best_model=True)
+            return _cat_metrics(gpu_model)
+        except Exception as exc:
+            warnings.warn(
+                f"CatBoost GPU 不可用或训练失败，已回退 CPU: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
+
     cb_kw: dict[str, Any] = {
         "loss_function": "YetiRank",
         "iterations": int(n_estimators),
@@ -363,22 +413,124 @@ def train_catboost_ranker_optional(
     _tc = _catboost_thread_count_from_env()
     if _tc is not None:
         cb_kw["thread_count"] = _tc
-    model = CatBoostRanker(**cb_kw)
+    cpu_model = CatBoostRanker(**cb_kw)
     try:
-        model.fit(train_pool, eval_set=eval_pool, use_best_model=True)
+        cpu_model.fit(train_pool, eval_set=eval_pool, use_best_model=True)
     except Exception as exc:
         return None, {"catboost_skip": str(exc)}
+    return _cat_metrics(cpu_model)
 
-    pred_va = model.predict(X_va)
-    ic_val = mean_cross_sectional_rank_ic(
-        pred_va, va[date_col].to_numpy(), y_va.to_numpy(dtype=float)
+
+def _resolve_oof_max_workers(n_tasks: int) -> int:
+    """OOF 并行进程数上限（不超过折数）。``QUANT_OOF_MAX_WORKERS=1`` / ``seq`` / ``serial`` 强制串行。"""
+    raw = (os.environ.get("QUANT_OOF_MAX_WORKERS", "") or "").strip().lower()
+    if raw in ("0", "1", "seq", "serial", "none"):
+        return 1
+    k = max(1, int(n_tasks))
+    cpu = os.cpu_count() or 8
+    if not raw:
+        return min(k, max(2, cpu // 4))
+    try:
+        n = int(raw)
+    except ValueError:
+        return 1
+    return max(1, min(k, n))
+
+
+def _walkforward_oof_fold_job(
+    payload: tuple[
+        pd.DataFrame,
+        pd.DataFrame,
+        np.ndarray,
+        pd.DataFrame,
+        tuple[str, ...],
+        dict[str, Any],
+        str,
+        str,
+        int,
+        int,
+        int,
+        int,
+        int,
+    ],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, bool] | None:
+    """单折 OOF：子进程入口（须为模块级函数以便 pickle）。返回 ``(pos, plgb, pxgb, pcat, cat_ok)``。"""
+    (
+        tr_i,
+        va_i,
+        pos,
+        X_te,
+        cols_t,
+        rank_params,
+        date_col,
+        label_col,
+        n_lgb,
+        n_xgb,
+        n_cat,
+        es_oof,
+        omp_threads,
+    ) = payload
+    cols = list(cols_t)
+    if omp_threads > 0:
+        os.environ["OMP_NUM_THREADS"] = str(omp_threads)
+        os.environ["MKL_NUM_THREADS"] = str(omp_threads)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(omp_threads)
+        os.environ["CATBOOST_NUM_THREADS"] = str(omp_threads)
+    try:
+        lgb_m, _ = train_lgbm_ranker(
+            tr_i,
+            va_i,
+            params=rank_params,
+            feature_cols=cols,
+            date_col=date_col,
+            label_col=label_col,
+            n_estimators=n_lgb,
+            early_stopping_rounds=es_oof,
+            verbose=False,
+        )
+        xgb_m, _ = train_xgb_ranker(
+            tr_i,
+            va_i,
+            best_params=rank_params,
+            feature_cols=cols,
+            date_col=date_col,
+            label_col=label_col,
+            n_estimators=n_xgb,
+            early_stopping_rounds=es_oof,
+            verbose=False,
+        )
+    except Exception:
+        return None
+    try:
+        plgb = np.asarray(lgb_m.predict(X_te), dtype=float).ravel()
+        pxgb = np.asarray(xgb_m.predict(X_te), dtype=float).ravel()
+    except Exception:
+        del lgb_m, xgb_m
+        gc.collect()
+        return None
+    cat_ok = False
+    pcat: np.ndarray | None = None
+    cb_m, _ = train_catboost_ranker_optional(
+        tr_i,
+        va_i,
+        best_params=rank_params,
+        feature_cols=cols,
+        date_col=date_col,
+        label_col=label_col,
+        n_estimators=n_cat,
+        early_stopping_rounds=max(12, es_oof - 4),
+        verbose=False,
+        oof_worker=True,
     )
-    metrics: dict[str, Any] = {
-        "cat_mean_rank_ic_val": ic_val,
-        "cat_n_train": int(len(y_tr)),
-        "cat_n_val": int(len(y_va)),
-    }
-    return model, metrics
+    if cb_m is not None:
+        try:
+            pcat = np.asarray(cb_m.predict(X_te), dtype=float).ravel()
+            cat_ok = True
+        except Exception:
+            pcat = None
+    del lgb_m, xgb_m, cb_m
+    gc.collect()
+    return (pos, plgb, pxgb, pcat, cat_ok)
 
 
 def walkforward_oof_base_predictions(
@@ -391,8 +543,15 @@ def walkforward_oof_base_predictions(
     label_col: str = "label_ret",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
-    训练集内按交易日分块 Walk-forward，重训轻量 LGB / XGB /（可选）Cat 以构造 OOF 一级打分，
+    训练集内按交易日分块 Walk-forward，重训轻量 LGB / XGB / Cat 以构造 OOF 一级打分，
     供 Ridge 元学习器拟合，降低元特征与标签的同期泄漏。
+
+    并行：默认 ``ProcessPoolExecutor``（``QUANT_OOF_MAX_WORKERS`` 未设时按 CPU 与折数自动取并发数；
+    设为 ``1`` / ``seq`` / ``serial`` 则串行）。子进程内 CatBoost 强制 CPU，避免多进程争用 GPU。
+
+    OOF 内树轮偏少（仅构元特征趋势）：``QUANT_OOF_LGB_ESTIMATORS`` / ``QUANT_OOF_XGB_ESTIMATORS`` /
+    ``QUANT_OOF_CAT_ESTIMATORS``（默认 56/56/52），``QUANT_OOF_EARLY_STOPPING``（默认 24）。
+    每进程 OpenMP 上限：``QUANT_OOF_WORKER_OMP_THREADS``；未设时为 ``max(1, cpu//workers//2)``。
     """
     work = prepare_ranking_frame(train_df, date_col).reset_index(drop=True)
     uds = sorted(pd.unique(work[date_col].astype(str)))
@@ -401,10 +560,28 @@ def walkforward_oof_base_predictions(
         return np.zeros(n, dtype=float), np.zeros(n, dtype=float), None
     K = max(2, min(int(n_folds), max(2, len(uds) // 12)))
     blocks = np.array_split(np.array(uds, dtype=object), K)
-    oof_lgb = np.full(len(work), np.nan, dtype=float)
-    oof_xgb = np.full(len(work), np.nan, dtype=float)
-    oof_cat = np.full(len(work), np.nan, dtype=float)
-    cat_any = False
+    n_lgb_oof = int(os.environ.get("QUANT_OOF_LGB_ESTIMATORS", "56"))
+    n_xgb_oof = int(os.environ.get("QUANT_OOF_XGB_ESTIMATORS", "56"))
+    n_cat_oof = int(os.environ.get("QUANT_OOF_CAT_ESTIMATORS", "52"))
+    es_oof = int(os.environ.get("QUANT_OOF_EARLY_STOPPING", "24"))
+
+    cols_t = tuple(cols)
+    raw_tasks: list[
+        tuple[
+            pd.DataFrame,
+            pd.DataFrame,
+            np.ndarray,
+            pd.DataFrame,
+            tuple[str, ...],
+            dict[str, Any],
+            str,
+            str,
+            int,
+            int,
+            int,
+            int,
+        ]
+    ] = []
     for ki in range(K):
         te_dates = set(blocks[ki].tolist())
         tr_df = work.loc[~work[date_col].isin(te_dates)].copy()
@@ -417,59 +594,82 @@ def walkforward_oof_base_predictions(
             va_i = _tail_date_split(tr_df, date_col, tail_frac=0.25)[1]
         if len(va_i) < 25:
             continue
-        try:
-            lgb_m, _ = train_lgbm_ranker(
-                tr_i,
-                va_i,
-                params=rank_params,
-                feature_cols=cols,
-                date_col=date_col,
-                label_col=label_col,
-                n_estimators=260,
-                early_stopping_rounds=35,
-                verbose=False,
-            )
-            xgb_m, _ = train_xgb_ranker(
-                tr_i,
-                va_i,
-                best_params=rank_params,
-                feature_cols=cols,
-                date_col=date_col,
-                label_col=label_col,
-                n_estimators=160,
-                early_stopping_rounds=35,
-                verbose=False,
-            )
-        except Exception:
-            continue
         m_te = work[date_col].isin(te_dates).to_numpy()
         w_te = work.loc[m_te].copy()
         pos = w_te.index.to_numpy()
         X_te = w_te[cols].apply(pd.to_numeric, errors="coerce")
-        try:
-            plgb = np.asarray(lgb_m.predict(X_te), dtype=float).ravel()
-            pxgb = np.asarray(xgb_m.predict(X_te), dtype=float).ravel()
-            oof_lgb[pos] = plgb
-            oof_xgb[pos] = pxgb
-        except Exception:
-            continue
-        cb_m, _ = train_catboost_ranker_optional(
-            tr_i,
-            va_i,
-            best_params=rank_params,
-            feature_cols=cols,
-            date_col=date_col,
-            label_col=label_col,
-            n_estimators=120,
-            early_stopping_rounds=25,
-            verbose=False,
+        raw_tasks.append(
+            (
+                tr_i,
+                va_i,
+                pos,
+                X_te,
+                cols_t,
+                dict(rank_params),
+                date_col,
+                label_col,
+                n_lgb_oof,
+                n_xgb_oof,
+                n_cat_oof,
+                es_oof,
+            )
         )
-        if cb_m is not None:
+
+    oof_lgb = np.full(len(work), np.nan, dtype=float)
+    oof_xgb = np.full(len(work), np.nan, dtype=float)
+    oof_cat = np.full(len(work), np.nan, dtype=float)
+    cat_any = False
+
+    n_tasks = len(raw_tasks)
+    if n_tasks == 0:
+        for arr in (oof_lgb, oof_xgb):
+            m = ~np.isfinite(arr)
+            if m.any():
+                arr[m] = (
+                    float(np.nanmean(arr[np.isfinite(arr)]))
+                    if np.isfinite(arr).any()
+                    else 0.0
+                )
+        gc.collect()
+        return oof_lgb, oof_xgb, None
+
+    max_workers = min(_resolve_oof_max_workers(n_tasks), n_tasks)
+    cpu = os.cpu_count() or 8
+    wt = int(os.environ.get("QUANT_OOF_WORKER_OMP_THREADS", "0"))
+    if wt <= 0:
+        wt = max(1, cpu // max(max_workers, 1) // 2)
+    tasks = [(*t, wt) for t in raw_tasks]
+
+    def _merge_fold(r: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, bool]) -> None:
+        nonlocal cat_any
+        pos, plgb, pxgb, pcat, cok = r
+        oof_lgb[pos] = plgb
+        oof_xgb[pos] = pxgb
+        if pcat is not None:
+            oof_cat[pos] = pcat
+            cat_any = cat_any or cok
+
+    if max_workers <= 1:
+        for t in tasks:
             try:
-                oof_cat[pos] = np.asarray(cb_m.predict(X_te), dtype=float).ravel()
-                cat_any = True
+                r = _walkforward_oof_fold_job(t)
             except Exception:
-                pass
+                continue
+            if r is None:
+                continue
+            _merge_fold(r)
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_walkforward_oof_fold_job, t) for t in tasks]
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                except Exception:
+                    continue
+                if r is None:
+                    continue
+                _merge_fold(r)
+
     for arr in (oof_lgb, oof_xgb):
         m = ~np.isfinite(arr)
         if m.any():
@@ -484,6 +684,7 @@ def walkforward_oof_base_predictions(
             )
     else:
         oof_cat = None
+    gc.collect()
     return oof_lgb, oof_xgb, oof_cat
 
 
@@ -1226,6 +1427,7 @@ def train_panel_and_register(
         metrics=_json_safe({"objective": "lambdarank", **metrics}),
         set_active=True,
     )
+    gc.collect()
     return model, {"version": version, **metrics, "rows": len(panel_df)}
 
 
