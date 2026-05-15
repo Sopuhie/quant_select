@@ -11,11 +11,15 @@ import numpy as np
 import pandas as pd
 
 from .config import (
+    ENABLE_PREV_GAIN_SUPPRESSION,
     FACTOR_EWM_BLEND,
     FACTOR_EWM_HALFLIFE_DAYS,
     FEATURE_COLUMNS,
     LABEL_HORIZON_DAYS,
+    MAX_ALLOWED_20D_RETURN,
+    MAX_ALLOWED_5D_RETURN,
 )
+from .utils import gram_schmidt_columns_cross_section, rank_gauss_cross_section
 
 # 行业内样本过少时退回当日全截面 MAD+Z，避免行业组统计不稳
 MIN_INDUSTRY_GROUP_SIZE = 5
@@ -53,13 +57,32 @@ PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
     "factor_return_1d",
     "factor_return_5d",
     "factor_momentum_10d",
-    "factor_volume_ratio",
-    "factor_volatility_5d",
-    "factor_volatility_20d",
     "factor_amihud_20d",
     "factor_bb_width_20d",
     "factor_drawdown_60d",
     "factor_hsgt_flow_interact",
+    "factor_big_order_net_ratio",
+    "factor_north_hold_ratio_chg",
+    "factor_chip_profit_ratio",
+    "factor_chip_concentration_width",
+    "factor_rsi_14",
+    "factor_kdj_j",
+    "factor_macd_hist",
+)
+
+# 波动 / 换手类：分位秩后做 RankGauss（在 ``clean_cross_sectional_features`` 内顺序执行）
+RANK_GAUSS_AFTER_RANK_FEATURES: tuple[str, ...] = (
+    "factor_volatility_5d",
+    "factor_volatility_20d",
+    "factor_volume_ratio",
+    "factor_volume_position",
+)
+
+# 技术指标：在截面分位前对原始因子做施密特正交（列顺序固定）
+TECHNICAL_ORTHOGONAL_FEATURE_COLS: tuple[str, ...] = (
+    "factor_rsi_14",
+    "factor_kdj_j",
+    "factor_macd_hist",
 )
 
 
@@ -227,6 +250,122 @@ def attach_hsgt_flow_interact(
     return work
 
 
+def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    在 ``clean_cross_sectional_features`` 之前：按原始 ``factor_return_5d``、
+    ``factor_momentum_10d`` 剔除短期透支标的（与 ``ENABLE_PREV_GAIN_SUPPRESSION`` 一致）。
+    """
+    if feat_df is None or len(feat_df) == 0:
+        return feat_df
+    try:
+        if not ENABLE_PREV_GAIN_SUPPRESSION:
+            return feat_df
+        out = feat_df.copy()
+        n0 = len(out)
+        if "factor_return_5d" in out.columns:
+            r5 = pd.to_numeric(out["factor_return_5d"], errors="coerce")
+            out = out[r5 <= float(MAX_ALLOWED_5D_RETURN)]
+        if "factor_momentum_10d" in out.columns and len(out) > 0:
+            m10 = pd.to_numeric(out["factor_momentum_10d"], errors="coerce")
+            out = out[m10 <= float(MAX_ALLOWED_20D_RETURN)]
+        if len(out) < n0:
+            print(
+                "[风控增强] 已强行剔除过去5日涨幅过大或中线动量过高的高位超买股 "
+                f"（5日上限 {MAX_ALLOWED_5D_RETURN * 100:.1f}%，动量上限 {MAX_ALLOWED_20D_RETURN * 100:.1f}%），"
+                f"共剔除 {n0 - len(out)} 只。",
+                flush=True,
+            )
+        return out.reset_index(drop=True)
+    except Exception as exc:
+        print(f"[警告] 前期涨幅压制阀门执行异常: {exc}", flush=True)
+        return feat_df
+
+
+def merge_incremental_db_features(
+    panel: pd.DataFrame,
+    *,
+    date_col: str = "date",
+) -> pd.DataFrame:
+    """
+    将 SQLite 增量表中的资金流 / 北向持股变化左连接进面板；无键则保留原列（通常为 OHLCV 代理或 0）。
+    """
+    if panel.empty or date_col not in panel.columns or "stock_code" not in panel.columns:
+        return panel
+    try:
+        from .database import fetch_auxiliary_feature_frames
+    except Exception:
+        return panel
+    work = panel.copy()
+    dates_u = sorted({str(d)[:10] for d in work[date_col].astype(str).tolist() if d})
+    codes_u = sorted({str(c).strip().zfill(6) for c in work["stock_code"].tolist() if c})
+    try:
+        from .auxiliary_ak_sync import maybe_autofill_auxiliary_from_env
+
+        maybe_autofill_auxiliary_from_env(dates_u, codes_u, verbose=True)
+    except Exception as exc:
+        print(f"[merge_incremental_db_features] 自动补全跳过: {exc}", flush=True)
+    mf, nh = fetch_auxiliary_feature_frames(dates_u, codes_u)
+    work["_k_date"] = work[date_col].astype(str).str[:10]
+    work["_k_code"] = work["stock_code"].astype(str).str.zfill(6)
+    if mf is not None and not mf.empty and "big_net_ratio" in mf.columns:
+        work = work.merge(
+            mf,
+            on=["_k_date", "_k_code"],
+            how="left",
+        )
+        bn = pd.to_numeric(work["big_net_ratio"], errors="coerce")
+        if "factor_big_order_net_ratio" in work.columns:
+            base = pd.to_numeric(work["factor_big_order_net_ratio"], errors="coerce")
+            work["factor_big_order_net_ratio"] = bn.where(bn.notna(), base).fillna(0.0)
+        else:
+            work["factor_big_order_net_ratio"] = bn.fillna(0.0)
+        work = work.drop(columns=["big_net_ratio"], errors="ignore")
+    if nh is not None and not nh.empty and "hold_pct_chg" in nh.columns:
+        work = work.merge(
+            nh,
+            on=["_k_date", "_k_code"],
+            how="left",
+        )
+        hc = pd.to_numeric(work["hold_pct_chg"], errors="coerce")
+        if "factor_north_hold_ratio_chg" in work.columns:
+            base = pd.to_numeric(work["factor_north_hold_ratio_chg"], errors="coerce")
+            work["factor_north_hold_ratio_chg"] = hc.where(hc.notna(), base).fillna(0.0)
+        else:
+            work["factor_north_hold_ratio_chg"] = hc.fillna(0.0)
+        drop_nh = [c for c in ("hold_pct_chg", "hold_pct") if c in work.columns]
+        if drop_nh:
+            work = work.drop(columns=drop_nh, errors="ignore")
+    return work.drop(columns=["_k_date", "_k_code"], errors="ignore")
+
+
+def prepare_ranking_cross_section_pipeline(
+    feat_df: pd.DataFrame,
+    *,
+    date_col: str = "trade_date",
+) -> pd.DataFrame:
+    """
+    训练 / 预测 / 回测共用的截面排序特征管道：
+    北向交互 → 增量库特征合并 → 截面分组用 ``date`` → 前期涨幅抑制 → 截面清洗。
+
+    当 ``date_col="trade_date"`` 时，会临时构造 ``date`` 供 ``clean_cross_sectional_features`` 分组，
+    结束后删除 ``date``，保留 ``trade_date``。当 ``date_col="date"``（训练面板）时**保留** ``date``。
+    """
+    if feat_df.empty:
+        return feat_df
+    w = feat_df.copy()
+    w = attach_hsgt_flow_interact(w, date_col=date_col)
+    w = merge_incremental_db_features(w, date_col=date_col)
+    if "date" not in w.columns:
+        w["date"] = w[date_col].astype(str).str[:10]
+    else:
+        w["date"] = w["date"].astype(str).str[:10]
+    w = suppress_high_recent_gains(w)
+    w = clean_cross_sectional_features(w)
+    if str(date_col) != "date":
+        w = w.drop(columns=["date"], errors="ignore")
+    return w
+
+
 def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     """与 ``train_model`` / ``run_daily`` 一致：按 ``FEATURE_COLUMNS`` 输出因子列。"""
     if df.empty:
@@ -301,6 +440,51 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     shrink_day = (d1 < 0) & (vol < vol_ma5)
     out["factor_shrink_pullback_5d"] = shrink_day.astype(float).rolling(5, min_periods=1).mean()
 
+    # --- RSI / KDJ / MACD（时间序列；截面正交在 clean 内完成）---
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    ag = gain.ewm(alpha=1.0 / 14.0, adjust=False).mean()
+    al = loss.ewm(alpha=1.0 / 14.0, adjust=False).mean()
+    rs = ag / (al + eps)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    out["factor_rsi_14"] = (rsi - 50.0) / 50.0
+
+    low9 = low.rolling(9, min_periods=5).min()
+    high9 = high.rolling(9, min_periods=5).max()
+    rsv = (close - low9) / (high9 - low9 + eps) * 100.0
+    rsv = rsv.clip(0.0, 100.0)
+    K = rsv.rolling(3, min_periods=1).mean()
+    D = K.rolling(3, min_periods=1).mean()
+    J = 3.0 * K - 2.0 * D
+    out["factor_kdj_j"] = (J - 50.0) / 50.0
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    out["factor_macd_hist"] = (dif - dea) / (close + eps)
+
+    vwap60_num = (typical * vol).rolling(60, min_periods=20).sum()
+    vwap60_den = vol.rolling(60, min_periods=20).sum()
+    vwap60 = vwap60_num / (vwap60_den + eps)
+    out["factor_chip_profit_ratio"] = (close - vwap60) / (close + eps)
+
+    w90 = close.rolling(60, min_periods=20).quantile(0.95) - close.rolling(
+        60, min_periods=20
+    ).quantile(0.05)
+    w70 = close.rolling(60, min_periods=20).quantile(0.85) - close.rolling(
+        60, min_periods=20
+    ).quantile(0.15)
+    out["factor_chip_concentration_width"] = (w90 - w70) / (close + eps)
+
+    r1 = close.pct_change(1).replace([np.inf, -np.inf], np.nan)
+    signed_amt = (close * vol) * np.sign(r1.fillna(0.0))
+    out["factor_big_order_net_ratio"] = signed_amt.rolling(5, min_periods=2).sum() / (
+        dollar_vol.rolling(5, min_periods=2).sum() + eps
+    )
+    out["factor_north_hold_ratio_chg"] = 0.0
+
     out["factor_hsgt_flow_interact"] = 0.0
 
     out = out.replace([np.inf, -np.inf], np.nan)
@@ -323,7 +507,9 @@ def clean_cross_sectional_features(
     截面清洗：
 
     - 按 ``date`` / ``trade_date`` 分组；
-    - 可选：对 ``PERCENTILE_RANK_FEATURES`` 做 ``rank(pct=True) - 0.5``；
+    - 对 ``TECHNICAL_ORTHOGONAL_FEATURE_COLS`` 先做列向 Gram–Schmidt 正交；
+    - 对 ``PERCENTILE_RANK_FEATURES`` 做 ``rank(pct=True) - 0.5``；
+    - 对 ``RANK_GAUSS_AFTER_RANK_FEATURES`` 做截面 RankGauss；
     - 可选：在每个行业组内对因子（除 ``factor_size_mcap``）相对市值对数做 OLS 残差提取；
     - 可选：行业内 MAD+Z；组内过少则退回当日全截面 MAD+Z。
     """
@@ -339,12 +525,28 @@ def clean_cross_sectional_features(
     for _date, day_df in df.groupby(group_key, sort=False):
         day_df = day_df.copy()
 
+        og_ok = all(c in day_df.columns for c in TECHNICAL_ORTHOGONAL_FEATURE_COLS)
+        if og_ok:
+            M = (
+                day_df.loc[:, list(TECHNICAL_ORTHOGONAL_FEATURE_COLS)]
+                .apply(pd.to_numeric, errors="coerce")
+                .to_numpy(dtype=float)
+            )
+            Q = gram_schmidt_columns_cross_section(M)
+            for j, c in enumerate(TECHNICAL_ORTHOGONAL_FEATURE_COLS):
+                day_df[c] = Q[:, j]
+
         if use_percentile_rank_volatility:
             for col in PERCENTILE_RANK_FEATURES:
                 if col not in day_df.columns:
                     continue
                 s = day_df[col].astype(float)
                 day_df[col] = s.rank(pct=True, method="average") - 0.5
+            for col in RANK_GAUSS_AFTER_RANK_FEATURES:
+                if col not in day_df.columns:
+                    continue
+                s = day_df[col].astype(float)
+                day_df[col] = rank_gauss_cross_section(s)
 
         ind_series_name = "_cs_industry_key"
         if use_industry_neutralization and "industry" in day_df.columns:

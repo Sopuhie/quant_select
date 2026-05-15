@@ -18,11 +18,15 @@ from sklearn.model_selection import train_test_split
 
 from .config import (
     BEST_LGB_PARAMS_JSON,
+    CATBOOST_MODEL_PATH,
     FEATURE_COLUMNS,
     LGB_PARAMS,
     LGB_RANKER_DEFAULT_PARAMS,
     META_STACKER_PATH,
     MODEL_PATH,
+    RANK_DRAWDOWN_WEIGHT_MULT,
+    RANK_DRAWDOWN_WEIGHT_THRESH,
+    RANK_META_OOF_FOLDS,
     RANK_SAMPLE_WEIGHT_EXTREME_RET,
     RANK_SAMPLE_WEIGHT_NEG_THRESH,
     XGB_MODEL_PATH,
@@ -31,11 +35,11 @@ from .config import (
 from .data_fetcher import fetch_daily_hist, has_enough_history
 from .database import fetch_latest_industry_by_codes, init_db, register_model_version
 from .factor_calculator import (
-    attach_hsgt_flow_interact,
     build_stock_panel_features,
-    clean_cross_sectional_features,
     normalize_industry_label,
+    prepare_ranking_cross_section_pipeline,
 )
+from .utils import permutation_importance_rank_ic_delta
 
 # LambdaRank 默认 label_gain 长度 31，relevance 合法索引仅为 0..30（见 LightGBM 文档）
 LAMBDARANK_MAX_REL_INDEX = 30
@@ -156,6 +160,15 @@ def ranking_sample_weights_extreme_loss(
         if np.isfinite(y[i]) and y[i] < thr:
             depth = float(thr - y[i])
             w[i] = 1.0 + alpha * min(depth / max(abs(thr), 1e-6), 5.0)
+    dd_mult = float(q.get("drawdown_penalty_mult", RANK_DRAWDOWN_WEIGHT_MULT))
+    dd_thr = float(q.get("drawdown_penalty_thresh", RANK_DRAWDOWN_WEIGHT_THRESH))
+    if "factor_drawdown_60d" in sorted_df.columns:
+        dd = pd.to_numeric(sorted_df["factor_drawdown_60d"], errors="coerce").to_numpy(
+            dtype=np.float64
+        )
+        for i in range(len(y)):
+            if np.isfinite(dd[i]) and dd[i] < dd_thr:
+                w[i] *= dd_mult
     return w
 
 
@@ -222,15 +235,309 @@ def fit_meta_stacker_ridge(
     ridge.fit(z_tr[m], yt[m])
     pred_va = ridge.predict(z_va)
     ic_meta = mean_cross_sectional_rank_ic(pred_va, dates_va, yv)
-    return ridge, {"meta_mean_rank_ic_val": ic_meta}
+    return ridge, {"meta_mean_rank_ic_val": ic_meta, "meta_n_base": 2.0}
 
 
-def save_meta_stacker(model: Ridge | None, path: Path | None = None) -> Path | None:
+def _tail_date_split(
+    df: pd.DataFrame,
+    date_col: str,
+    *,
+    tail_frac: float = 0.12,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按交易日尾部切出验证子集（用于 OOF 折内早停）。"""
+    if df.empty:
+        return df, df.iloc[:0].copy()
+    uds = sorted(pd.unique(df[date_col].astype(str)))
+    if len(uds) < 15:
+        return df, df.iloc[:0].copy()
+    cut_i = max(1, int(len(uds) * (1.0 - float(tail_frac))) - 1)
+    cut = uds[min(cut_i, len(uds) - 1)]
+    tr = df[df[date_col].astype(str) <= cut].copy()
+    va = df[df[date_col].astype(str) > cut].copy()
+    if tr.empty or va.empty:
+        return df, df.iloc[:0].copy()
+    return tr, va
+
+
+def train_catboost_ranker_optional(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    best_params: dict[str, Any],
+    feature_cols: list[str] | None = None,
+    date_col: str = "date",
+    label_col: str = "label_ret",
+    n_estimators: int = 200,
+    early_stopping_rounds: int = 40,
+    random_state: int = 42,
+    verbose: bool = False,
+) -> tuple[Any | None, dict[str, Any]]:
+    """可选 CatBoost YetiRank；未安装库或失败时返回 (None, skip 信息)。"""
+    cols = feature_cols or list(FEATURE_COLUMNS)
+    try:
+        from catboost import CatBoostRanker, Pool  # type: ignore[import-untyped]
+    except Exception as exc:
+        return None, {"catboost_skip": str(exc)}
+
+    tr = prepare_ranking_frame(train_df, date_col)
+    va = prepare_ranking_frame(val_df, date_col)
+    X_tr = tr[cols].apply(pd.to_numeric, errors="coerce")
+    y_tr = pd.to_numeric(tr[label_col], errors="coerce")
+    X_va = va[cols].apply(pd.to_numeric, errors="coerce")
+    y_va = pd.to_numeric(va[label_col], errors="coerce")
+    mt = np.isfinite(X_tr.to_numpy()).all(axis=1) & np.isfinite(y_tr.to_numpy())
+    mv = np.isfinite(X_va.to_numpy()).all(axis=1) & np.isfinite(y_va.to_numpy())
+    tr = tr.loc[mt].reset_index(drop=True)
+    va = va.loc[mv].reset_index(drop=True)
+    X_tr = X_tr.loc[mt].reset_index(drop=True)
+    y_tr = y_tr.loc[mt].reset_index(drop=True)
+    X_va = X_va.loc[mv].reset_index(drop=True)
+    y_va = y_va.loc[mv].reset_index(drop=True)
+    if len(tr) < 300 or len(va) < 30:
+        return None, {"catboost_skip": "too_few_rows"}
+
+    y_tr_rel = relevance_labels_int_from_returns(tr, label_col, date_col)
+    y_va_rel = relevance_labels_int_from_returns(va, label_col, date_col)
+    y_fit_tr = np.ascontiguousarray(y_tr_rel, dtype=np.int32)
+    y_fit_va = np.ascontiguousarray(y_va_rel, dtype=np.int32)
+    _sw = ranking_sample_weights_extreme_loss(tr, label_col)
+    _ = _sw
+    g_tr = tr[date_col].astype(str).str[:10].tolist()
+    g_va = va[date_col].astype(str).str[:10].tolist()
+
+    bp = dict(best_params)
+    lr = float(bp.get("learning_rate", 0.05))
+    depth = int(np.clip(int(bp.get("num_leaves", 31)) // 8, 4, 8))
+
+    train_pool = Pool(
+        data=X_tr,
+        label=y_fit_tr,
+        group_id=g_tr,
+    )
+    eval_pool = Pool(
+        data=X_va,
+        label=y_fit_va,
+        group_id=g_va,
+    )
+    model = CatBoostRanker(
+        loss_function="YetiRank",
+        iterations=int(n_estimators),
+        learning_rate=lr,
+        depth=depth,
+        random_seed=int(random_state),
+        verbose=bool(verbose),
+        early_stopping_rounds=int(early_stopping_rounds),
+        allow_writing_files=False,
+    )
+    try:
+        model.fit(train_pool, eval_set=eval_pool, use_best_model=True)
+    except Exception as exc:
+        return None, {"catboost_skip": str(exc)}
+
+    pred_va = model.predict(X_va)
+    ic_val = mean_cross_sectional_rank_ic(
+        pred_va, va[date_col].to_numpy(), y_va.to_numpy(dtype=float)
+    )
+    metrics: dict[str, Any] = {
+        "cat_mean_rank_ic_val": ic_val,
+        "cat_n_train": int(len(y_tr)),
+        "cat_n_val": int(len(y_va)),
+    }
+    return model, metrics
+
+
+def walkforward_oof_base_predictions(
+    train_df: pd.DataFrame,
+    *,
+    date_col: str,
+    cols: list[str],
+    rank_params: dict[str, Any],
+    n_folds: int,
+    label_col: str = "label_ret",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """
+    训练集内按交易日分块 Walk-forward，重训轻量 LGB / XGB /（可选）Cat 以构造 OOF 一级打分，
+    供 Ridge 元学习器拟合，降低元特征与标签的同期泄漏。
+    """
+    work = prepare_ranking_frame(train_df, date_col).reset_index(drop=True)
+    uds = sorted(pd.unique(work[date_col].astype(str)))
+    if len(uds) < 30:
+        n = len(work)
+        return np.zeros(n, dtype=float), np.zeros(n, dtype=float), None
+    K = max(2, min(int(n_folds), max(2, len(uds) // 12)))
+    blocks = np.array_split(np.array(uds, dtype=object), K)
+    oof_lgb = np.full(len(work), np.nan, dtype=float)
+    oof_xgb = np.full(len(work), np.nan, dtype=float)
+    oof_cat = np.full(len(work), np.nan, dtype=float)
+    cat_any = False
+    for ki in range(K):
+        te_dates = set(blocks[ki].tolist())
+        tr_df = work.loc[~work[date_col].isin(te_dates)].copy()
+        te_df = work.loc[work[date_col].isin(te_dates)].copy()
+        if len(tr_df) < 800 or len(te_df) < 40:
+            continue
+        tr_i, va_i = _tail_date_split(tr_df, date_col, tail_frac=0.12)
+        if len(tr_i) < 400 or len(va_i) < 30:
+            tr_i = tr_df
+            va_i = _tail_date_split(tr_df, date_col, tail_frac=0.25)[1]
+        if len(va_i) < 25:
+            continue
+        try:
+            lgb_m, _ = train_lgbm_ranker(
+                tr_i,
+                va_i,
+                params=rank_params,
+                feature_cols=cols,
+                date_col=date_col,
+                label_col=label_col,
+                n_estimators=260,
+                early_stopping_rounds=35,
+                verbose=False,
+            )
+            xgb_m, _ = train_xgb_ranker(
+                tr_i,
+                va_i,
+                best_params=rank_params,
+                feature_cols=cols,
+                date_col=date_col,
+                label_col=label_col,
+                n_estimators=160,
+                early_stopping_rounds=35,
+                verbose=False,
+            )
+        except Exception:
+            continue
+        m_te = work[date_col].isin(te_dates).to_numpy()
+        w_te = work.loc[m_te].copy()
+        pos = w_te.index.to_numpy()
+        X_te = w_te[cols].apply(pd.to_numeric, errors="coerce")
+        try:
+            plgb = np.asarray(lgb_m.predict(X_te), dtype=float).ravel()
+            pxgb = np.asarray(xgb_m.predict(X_te), dtype=float).ravel()
+            oof_lgb[pos] = plgb
+            oof_xgb[pos] = pxgb
+        except Exception:
+            continue
+        cb_m, _ = train_catboost_ranker_optional(
+            tr_i,
+            va_i,
+            best_params=rank_params,
+            feature_cols=cols,
+            date_col=date_col,
+            label_col=label_col,
+            n_estimators=120,
+            early_stopping_rounds=25,
+            verbose=False,
+        )
+        if cb_m is not None:
+            try:
+                oof_cat[pos] = np.asarray(cb_m.predict(X_te), dtype=float).ravel()
+                cat_any = True
+            except Exception:
+                pass
+    for arr in (oof_lgb, oof_xgb):
+        m = ~np.isfinite(arr)
+        if m.any():
+            arr[m] = float(np.nanmean(arr[np.isfinite(arr)])) if np.isfinite(arr).any() else 0.0
+    if cat_any:
+        m = ~np.isfinite(oof_cat)
+        if m.any():
+            oof_cat[m] = (
+                float(np.nanmean(oof_cat[np.isfinite(oof_cat)]))
+                if np.isfinite(oof_cat).any()
+                else 0.0
+            )
+    else:
+        oof_cat = None
+    return oof_lgb, oof_xgb, oof_cat
+
+
+def fit_meta_stacker_ridge_oof(
+    lgb_model: Any,
+    xgb_model: Any,
+    cat_model: Any | None,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    *,
+    date_col: str,
+    cols: list[str],
+    rank_params: dict[str, Any],
+) -> tuple[Ridge | None, dict[str, Any]]:
+    """
+    以 Walk-forward OOF 一级打分为训练特征拟合 Ridge；验证集使用已训好的全量一级模型打分评估。
+    """
+    tr_sorted, X_tr_m, y_tr_m = _prepare_rank_xy(train_df, date_col=date_col, feature_cols=cols)
+    va_r, X_va_m, y_va_m = _prepare_rank_xy(val_df, date_col=date_col, feature_cols=cols)
+    qconf = get_quant_config_merged().get("ranking", {})
+    kfolds = int(qconf.get("meta_oof_folds", RANK_META_OOF_FOLDS))
+    if kfolds <= 1:
+        return fit_meta_stacker_ridge(
+            lgb_model,
+            xgb_model,
+            X_tr_m,
+            X_va_m,
+            y_tr_m,
+            y_va_m,
+            va_r["date"].to_numpy(),
+        )
+    oof_lgb, oof_xgb, oof_cat = walkforward_oof_base_predictions(
+        train_df,
+        date_col=date_col,
+        cols=cols,
+        rank_params=rank_params,
+        n_folds=kfolds,
+    )
+    yt = pd.to_numeric(y_tr_m, errors="coerce").to_numpy(dtype=float)
+    if oof_cat is not None and cat_model is not None:
+        z_tr = np.column_stack([oof_lgb, oof_xgb, oof_cat])
+        z_va = np.column_stack(
+            [
+                np.asarray(lgb_model.predict(X_va_m), dtype=float).ravel(),
+                np.asarray(xgb_model.predict(X_va_m), dtype=float).ravel(),
+                np.asarray(cat_model.predict(X_va_m), dtype=float).ravel(),
+            ]
+        )
+        n_base = 3
+    else:
+        z_tr = np.column_stack([oof_lgb, oof_xgb])
+        z_va = np.column_stack(
+            [
+                np.asarray(lgb_model.predict(X_va_m), dtype=float).ravel(),
+                np.asarray(xgb_model.predict(X_va_m), dtype=float).ravel(),
+            ]
+        )
+        n_base = 2
+    m = np.isfinite(z_tr).all(axis=1) & np.isfinite(yt)
+    if int(m.sum()) < 200:
+        return None, {"meta_skip": "too_few_oof_rows"}
+    ridge = Ridge(alpha=10.0, random_state=42)
+    ridge.fit(z_tr[m], yt[m])
+    pred_va = ridge.predict(z_va)
+    yv = pd.to_numeric(y_va_m, errors="coerce").to_numpy(dtype=float)
+    ic_meta = mean_cross_sectional_rank_ic(
+        pred_va, va_r["date"].to_numpy(), yv
+    )
+    return ridge, {"meta_mean_rank_ic_val": ic_meta, "meta_n_base": float(n_base)}
+
+
+def save_meta_stacker(
+    model: Ridge | None,
+    path: Path | None = None,
+    *,
+    n_base: int = 2,
+) -> Path | None:
     p = path or META_STACKER_PATH
     if model is None:
         return None
     p.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"kind": "ridge_return", "model": model}, p)
+    joblib.dump(
+        {
+            "kind": "ridge_return",
+            "model": model,
+            "n_base": int(n_base),
+        },
+        p,
+    )
     return p
 
 
@@ -382,7 +689,7 @@ def train_xgb_ranker(
     verbose: bool = False,
 ) -> tuple[XGBRanker, dict[str, Any]]:
     """
-    与 ``train_lgbm_ranker`` 相同的按日分组与 relevance 标签，训练 ``rank:ndcg`` 的 XGBRanker。
+    与 ``train_lgbm_ranker`` 相同的按日分组与 relevance 标签，训练 ``rank:pairwise`` 的 XGBRanker。
     超参与 Optuna/LightGBM 结果对齐：树深度由 ``num_leaves`` 映射，学习率/子采样等直接沿用。
     """
     cols = feature_cols or list(FEATURE_COLUMNS)
@@ -420,7 +727,7 @@ def train_xgb_ranker(
     colsample_bytree = float(bp.get("colsample_bytree", 0.8))
 
     model = XGBRanker(
-        objective="rank:ndcg",
+        objective="rank:pairwise",
         eval_metric=["ndcg@3", "ndcg@5"],
         learning_rate=lr,
         max_depth=max_depth,
@@ -679,6 +986,75 @@ def load_xgb_ranker_optional(path: Path | None = None) -> Any | None:
         return None
 
 
+def load_catboost_ranker_optional(path: Path | None = None) -> Any | None:
+    """若 ``models/cat_ranker.cbm`` 不存在或 CatBoost 未安装则返回 None。"""
+    p = path or CATBOOST_MODEL_PATH
+    if not p.exists():
+        return None
+    try:
+        from catboost import CatBoostRanker  # type: ignore[import-untyped]
+
+        m = CatBoostRanker()
+        m.load_model(str(p))
+        return m
+    except Exception:
+        return None
+
+
+def estimate_ranker_n_features(model: Any) -> int | None:
+    """推断排序模型训练时的特征列数（sklearn / LightGBM Booster / CatBoost）。"""
+    n = getattr(model, "n_features_in_", None)
+    if n is not None and int(n) > 0:
+        return int(n)
+    try:
+        booster = model.booster_
+        return int(booster.num_feature())
+    except Exception:
+        pass
+    try:
+        fn = getattr(model, "feature_names_", None)
+        if fn is not None:
+            return len(list(fn))
+    except Exception:
+        pass
+    return None
+
+
+def assert_feature_matrix_matches_rankers(
+    X: pd.DataFrame,
+    *,
+    lgb_model: Any,
+    xgb_model: Any | None = None,
+    cat_model: Any | None = None,
+    feature_cols: list[str] | None = None,
+    context: str = "",
+) -> None:
+    """
+    预测前校验：当前 ``FEATURE_COLUMNS`` 维数须与各已加载 Ranker 落盘时一致，否则给出明确重训指引。
+    """
+    cols = feature_cols or list(FEATURE_COLUMNS)
+    if int(X.shape[1]) != len(cols):
+        raise ValueError(
+            f"特征矩阵列数 {X.shape[1]} 与 FEATURE_COLUMNS 长度 {len(cols)} 不一致。"
+        )
+    prefix = f"{context}: " if context else ""
+    for label, m in (
+        ("LightGBM", lgb_model),
+        ("XGBoost", xgb_model),
+        ("CatBoost", cat_model),
+    ):
+        if m is None:
+            continue
+        exp = estimate_ranker_n_features(m)
+        if exp is None:
+            continue
+        if int(exp) != int(X.shape[1]):
+            raise ValueError(
+                f"{prefix}{label} 模型期望 {exp} 个特征，当前为 {X.shape[1]} 个（代码已扩展 FEATURE_COLUMNS，"
+                "与旧模型不兼容）。请在项目根目录重新训练：python train_model.py"
+            )
+
+
 def _prepare_rank_xy(
     df: pd.DataFrame,
     *,
@@ -741,6 +1117,22 @@ def train_panel_and_register(
     save_model(xgb_model, XGB_MODEL_PATH)
     metrics = {**metrics, **xgb_metrics}
 
+    cat_model, cat_metrics = train_catboost_ranker_optional(
+        train_df,
+        val_df,
+        best_params=params,
+        n_estimators=180,
+        early_stopping_rounds=40,
+        verbose=False,
+    )
+    metrics.update({k: v for k, v in cat_metrics.items() if v is not None})
+    if cat_model is not None:
+        try:
+            cat_model.save_model(str(CATBOOST_MODEL_PATH))
+            metrics["cat_model_path"] = str(CATBOOST_MODEL_PATH)
+        except Exception as exc:
+            metrics["cat_model_save_error"] = str(exc)
+
     tr_r, X_tr_m, y_tr_m = _prepare_rank_xy(train_df, date_col="date")
     va_r, X_va_m, y_va_m = _prepare_rank_xy(val_df, date_col="date")
     pred_tr_lgb = np.asarray(model.predict(X_tr_m), dtype=float).ravel()
@@ -756,17 +1148,41 @@ def train_panel_and_register(
     if np.isfinite(psi_val) and psi_val > psi_thr:
         metrics["psi_alert"] = f"PSI={psi_val:.4f} 超过阈值 {psi_thr}"
 
-    meta_model, meta_m = fit_meta_stacker_ridge(
+    yv_arr = y_va_m.to_numpy(dtype=float)
+    dt_va = va_r["date"].to_numpy()
+
+    def _baseline_ic_lgb() -> float:
+        p0 = np.asarray(model.predict(X_va_m), dtype=float).ravel()
+        return float(mean_cross_sectional_rank_ic(p0, dt_va, yv_arr))
+
+    try:
+        pi_lgb = permutation_importance_rank_ic_delta(
+            lambda xdf: np.asarray(model.predict(xdf), dtype=float).ravel(),
+            X_va_m,
+            yv_arr,
+            dt_va,
+            list(FEATURE_COLUMNS),
+            baseline_ic_fn=_baseline_ic_lgb,
+            n_repeats=1,
+            seed=42,
+        )
+        metrics["perm_importance_lgb_mean_ic_drop"] = _json_safe(pi_lgb)
+    except Exception as exc:
+        metrics["perm_importance_lgb_error"] = str(exc)
+
+    meta_model, meta_m = fit_meta_stacker_ridge_oof(
         model,
         xgb_model,
-        X_tr_m,
-        X_va_m,
-        y_tr_m,
-        y_va_m,
-        va_r["date"].to_numpy(),
+        cat_model,
+        train_df,
+        val_df,
+        date_col="date",
+        cols=list(FEATURE_COLUMNS),
+        rank_params=params,
     )
     metrics.update(meta_m)
-    save_meta_stacker(meta_model)
+    n_base = int(float(meta_m.get("meta_n_base", 2))) if meta_m else 2
+    save_meta_stacker(meta_model, n_base=n_base)
 
     register_model_version(
         version=version,
@@ -794,8 +1210,9 @@ def train_and_register(
     )
     if all_features.empty:
         raise RuntimeError("训练样本为空，请检查网络、股票池与日期区间。")
-    all_features = attach_hsgt_flow_interact(all_features, date_col="date")
-    all_features = clean_cross_sectional_features(all_features)
+    all_features = prepare_ranking_cross_section_pipeline(
+        all_features, date_col="date"
+    )
     return train_panel_and_register(
         all_features,
         train_end_date=train_end_date,

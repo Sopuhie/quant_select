@@ -1,12 +1,106 @@
-"""日期与交易日工具。"""
+"""日期与交易日工具；截面 RankGauss、施密特正交与排列重要性等纯数学工具。"""
 from __future__ import annotations
 
 import os
 import time as time_module
 from datetime import date, datetime, time, timedelta
+from statistics import NormalDist
 from typing import Optional
 
+import numpy as np
 import pandas as pd
+
+_nd = NormalDist()
+
+
+def rank_gauss_cross_section(s: pd.Series, *, eps: float = 1e-6) -> pd.Series:
+    """
+    截面 RankGauss：将分位秩映射为近似标准正态，缓解重尾。
+    使用平均秩分位 ``(rank - 0.5) / n`` 再 ``NormalDist.inv_cdf``。
+    """
+    if s is None or len(s) == 0:
+        return s
+    v = pd.to_numeric(s, errors="coerce").astype(float)
+    n = int(v.notna().sum())
+    if n == 0:
+        return pd.Series(np.nan, index=v.index)
+    r = v.rank(method="average", pct=False)
+    u = (r - 0.5) / max(float(n), 1.0)
+    u = u.clip(float(eps), 1.0 - float(eps))
+    out = np.full(len(v), np.nan, dtype=float)
+    m = v.notna().to_numpy()
+    inv = np.fromiter((_nd.inv_cdf(float(x)) for x in u[m]), dtype=float, count=int(m.sum()))
+    out[np.where(m)[0]] = inv
+    return pd.Series(out, index=v.index, dtype=float)
+
+
+def gram_schmidt_columns_cross_section(X: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """
+    列向施密特正交化（单位列）：``X`` 形状 ``(n_samples, n_features)``，逐列相对前面列去相关并单位化。
+    用于同一交易日内多只股票在技术指标因子张成的子空间上去共线。
+    """
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("gram_schmidt_columns_cross_section expects 2d array")
+    n, k = X.shape
+    Q = np.zeros((n, k), dtype=float)
+    for j in range(k):
+        v = X[:, j].copy()
+        for i in range(j):
+            qi = Q[:, i]
+            ip = float(np.dot(qi, v))
+            v = v - ip * qi
+        norm = float(np.linalg.norm(v))
+        if norm > float(eps):
+            Q[:, j] = v / norm
+        else:
+            Q[:, j] = 0.0
+    return Q
+
+
+def permutation_importance_rank_ic_delta(
+    predict_fn,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    dates: np.ndarray,
+    feature_cols: list[str],
+    *,
+    baseline_ic_fn,
+    n_repeats: int = 1,
+    seed: int = 42,
+) -> dict[str, float]:
+    """
+    对排序模型做简易排列重要性：逐列打乱后 Rank IC 相对基线的下降量（越大越重要）。
+    ``predict_fn(X_df) -> 1d array``；``baseline_ic_fn`` 无参，返回当前未扰动基线 IC。
+    """
+    rng = np.random.default_rng(int(seed))
+    base = float(baseline_ic_fn())
+    out: dict[str, float] = {}
+    for c in feature_cols:
+        if c not in X.columns:
+            continue
+        drops: list[float] = []
+        for _ in range(max(1, int(n_repeats))):
+            Xp = X.copy()
+            col = Xp[c].to_numpy(copy=True)
+            rng.shuffle(col)
+            Xp[c] = col
+            pred = np.asarray(predict_fn(Xp), dtype=float).ravel()
+            frame = pd.DataFrame(
+                {"d": pd.Series(dates).astype(str).str[:10], "p": pred, "y": y}
+            )
+            ics: list[float] = []
+            for _, sub in frame.groupby("d", sort=False):
+                if len(sub) < 10:
+                    continue
+                ic = sub["p"].corr(sub["y"], method="spearman")
+                if pd.notna(ic):
+                    ics.append(float(ic))
+            ic_m = float(np.mean(ics)) if ics else float("nan")
+            if np.isfinite(base) and np.isfinite(ic_m):
+                drops.append(base - ic_m)
+        out[c] = float(np.mean(drops)) if drops else 0.0
+    return out
 
 # 新浪交易日历缓存（进程内）：成功拉取后按 TTL 刷新，避免「首日失败永久空列表」或日历滞后不含当日
 _SORTED_TRADE_DATES: list[str] | None = None

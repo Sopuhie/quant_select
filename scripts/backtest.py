@@ -54,17 +54,20 @@ from src.config import (  # noqa: E402
 from src.data_fetcher import fetch_daily_hist, get_stock_pool  # noqa: E402
 from src.database import get_active_model_version  # noqa: E402
 from src.factor_calculator import (  # noqa: E402
-    attach_hsgt_flow_interact,
-    clean_cross_sectional_features,
     compute_factors_for_history,
+    prepare_ranking_cross_section_pipeline,
 )
-from src.model_trainer import load_model, load_xgb_ranker_optional  # noqa: E402
+from src.model_trainer import (  # noqa: E402
+    assert_feature_matrix_matches_rankers,
+    load_catboost_ranker_optional,
+    load_model,
+    load_xgb_ranker_optional,
+)
 from src.predictor import (  # noqa: E402
     apply_experience_trading_filters,
     blend_ranker_scores_with_optional_meta,
     filter_predictions,
     prune_zero_volume_rows,
-    suppress_high_recent_gains,
 )
 
 PriceKind = Literal["open", "close"]
@@ -155,13 +158,14 @@ def _board_allowed(code: str, *, include_300: bool, include_688: bool) -> bool:
     return True
 
 
-def load_active_models() -> tuple[Any, Any | None]:
-    """载入 LightGBM 与可选 XGBoost Ranker（与每日选股 / Meta 融合一致）。"""
+def load_active_models() -> tuple[Any, Any | None, Any | None]:
+    """载入 LightGBM、可选 XGBoost / CatBoost Ranker（与每日选股 / Meta 融合一致）。"""
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"找不到模型文件: {MODEL_PATH}（请先 train_model.py 训练并落盘）")
     lgb = load_model(MODEL_PATH)
     xgb = load_xgb_ranker_optional()
-    return lgb, xgb
+    cat = load_catboost_ranker_optional()
+    return lgb, xgb, cat
 
 
 def get_stock_daily_kline_date_bounds(db_path: Path) -> tuple[str | None, str | None]:
@@ -477,6 +481,7 @@ def _score_universe_for_date(
     universe: list[tuple[str, str]],
     lgb_model: Any,
     xgb_model: Any | None = None,
+    cat_model: Any | None = None,
     *,
     include_300: bool = False,
     include_688: bool = False,
@@ -492,13 +497,11 @@ def _score_universe_for_date(
     if not rows:
         return []
     feat_df = pd.DataFrame(rows)
-    feat_df = attach_hsgt_flow_interact(feat_df, date_col="trade_date")
     feat_df = prune_zero_volume_rows(feat_df)
     feat_df = feat_df.drop(columns=["volume"], errors="ignore")
     if feat_df.empty:
         return []
-    feat_df = suppress_high_recent_gains(feat_df)
-    feat_df = clean_cross_sectional_features(feat_df)
+    feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
     feat_df = filter_predictions(feat_df)
     if feat_df.empty:
         return []
@@ -515,9 +518,19 @@ def _score_universe_for_date(
     if feat_df.empty:
         return []
     X = feat_df[FEATURE_COLUMNS].astype(np.float64)
-    ls = lgb_model.predict(X.values)
-    xs = xgb_model.predict(X.values) if xgb_model is not None else None
-    scores = blend_ranker_scores_with_optional_meta(ls, xs)
+    assert_feature_matrix_matches_rankers(
+        X,
+        lgb_model=lgb_model,
+        xgb_model=xgb_model,
+        cat_model=cat_model,
+        context="回测",
+    )
+    ls = lgb_model.predict(X)
+    xs = xgb_model.predict(X) if xgb_model is not None else None
+    cs = cat_model.predict(X) if cat_model is not None else None
+    scores = blend_ranker_scores_with_optional_meta(
+        ls, xs, cs, as_of_trade_date=str(trade_date)[:10]
+    )
     feat_df = feat_df.copy()
     feat_df["score"] = scores.astype(float)
     feat_df = feat_df.sort_values(
@@ -646,6 +659,7 @@ class BacktestEngine:
     trade_dates: list[str]
     lgb_model: Any
     xgb_model: Any | None
+    cat_model: Any | None
     initial_cash: float
     holding_days: int
     buy_price: PriceKind
@@ -709,6 +723,7 @@ class BacktestEngine:
                     univ,
                     self.lgb_model,
                     self.xgb_model,
+                    self.cat_model,
                     include_300=self.include_300,
                     include_688=self.include_688,
                 )
@@ -1062,7 +1077,7 @@ def main() -> None:
     else:
         print("当前激活模型版本:", mv.get("version"), "train_end_date=", mv.get("train_end_date"))
 
-    lgb_m, xgb_m = load_active_models()
+    lgb_m, xgb_m, cat_m = load_active_models()
 
     # 股票池：优先结束日成分（可能需联网）；失败则用本地库内代码
     pairs: list[tuple[str, str]] = []
@@ -1128,6 +1143,7 @@ def main() -> None:
         trade_dates=trade_dates,
         lgb_model=lgb_m,
         xgb_model=xgb_m,
+        cat_model=cat_m,
         initial_cash=args.initial_cash,
         holding_days=args.holding_days,
         buy_price=args.buy_price,

@@ -45,43 +45,83 @@ from .database import (
 )
 from .factor_calculator import (
     attach_hsgt_flow_interact,
-    clean_cross_sectional_features,
     compute_factors_for_history,
     normalize_industry_label,
+    prepare_ranking_cross_section_pipeline,
 )
-from .model_trainer import load_model, load_meta_stacker_optional, load_xgb_ranker_optional
+from .model_trainer import (
+    assert_feature_matrix_matches_rankers,
+    load_catboost_ranker_optional,
+    load_model,
+    load_meta_stacker_optional,
+    load_xgb_ranker_optional,
+)
 from .utils import is_kline_too_stale_vs_prediction
 
 
-def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
+def compute_market_regime_blend_weights(
+    as_of_trade_date: str | None = None,
+) -> tuple[float, float, dict[str, Any]]:
     """
-    在 ``clean_cross_sectional_features`` 之前：按原始 ``factor_return_5d``、
-    ``factor_momentum_10d`` 剔除短期透支标的（与 ``ENABLE_PREV_GAIN_SUPPRESSION`` 一致）。
+    环境感知动态 LGB/XGB 权重：指数均线空头略抬高 XGB；高波动略抬高 LGB。
+    失败时退回 (0.55, 0.45)。
     """
-    if feat_df is None or len(feat_df) == 0:
-        return feat_df
+    meta: dict[str, Any] = {"regime": "fallback", "bear": False, "high_vol": False}
+    wl, wx = 0.55, 0.45
     try:
-        if not ENABLE_PREV_GAIN_SUPPRESSION:
-            return feat_df
-        out = feat_df.copy()
-        n0 = len(out)
-        if "factor_return_5d" in out.columns:
-            r5 = pd.to_numeric(out["factor_return_5d"], errors="coerce")
-            out = out[r5 <= float(MAX_ALLOWED_5D_RETURN)]
-        if "factor_momentum_10d" in out.columns and len(out) > 0:
-            m10 = pd.to_numeric(out["factor_momentum_10d"], errors="coerce")
-            out = out[m10 <= float(MAX_ALLOWED_20D_RETURN)]
-        if len(out) < n0:
-            print(
-                "[风控增强] 已强行剔除过去5日涨幅过大或中线动量过高的高位超买股 "
-                f"（5日上限 {MAX_ALLOWED_5D_RETURN * 100:.1f}%，动量上限 {MAX_ALLOWED_20D_RETURN * 100:.1f}%），"
-                f"共剔除 {n0 - len(out)} 只。",
-                flush=True,
-            )
-        return out.reset_index(drop=True)
+        from .config import ensure_eastmoney_no_proxy_if_configured
+
+        ensure_eastmoney_no_proxy_if_configured()
+        import akshare as ak  # type: ignore[import-untyped]
+
+        df = ak.stock_zh_index_daily_em(symbol="沪深300")
+        if df is None or getattr(df, "empty", True):
+            return wl, wx, meta
+        c0 = next(
+            (c for c in df.columns if str(c).strip() in ("收盘", "close", "Close")),
+            df.columns[-1],
+        )
+        d0 = next(
+            (c for c in df.columns if "日期" in str(c) or str(c).lower() == "date"),
+            df.columns[0],
+        )
+        sub = df[[d0, c0]].copy()
+        sub.columns = ["dt", "cl"]
+        sub["dt"] = pd.to_datetime(sub["dt"], errors="coerce")
+        sub["cl"] = pd.to_numeric(sub["cl"], errors="coerce")
+        sub = sub.dropna(subset=["dt", "cl"]).sort_values("dt")
+        if as_of_trade_date is not None:
+            cut = pd.Timestamp(str(as_of_trade_date)[:10])
+            sub = sub.loc[sub["dt"] <= cut]
+        if len(sub) < 65:
+            return wl, wx, meta
+        tail = sub.tail(120).reset_index(drop=True)
+        cl = tail["cl"].astype(float)
+        ma20 = cl.rolling(20, min_periods=10).mean()
+        ma60 = cl.rolling(60, min_periods=30).mean()
+        ret1 = cl.pct_change()
+        vol20 = float(ret1.tail(20).std(ddof=0)) if len(ret1) >= 20 else float("nan")
+        i = len(tail) - 1
+        bear = bool(
+            np.isfinite(ma20.iloc[i])
+            and np.isfinite(ma60.iloc[i])
+            and ma20.iloc[i] < ma60.iloc[i]
+            and cl.iloc[i] < ma20.iloc[i]
+        )
+        high_vol = bool(np.isfinite(vol20) and vol20 > 0.014)
+        meta["bear"] = bear
+        meta["high_vol"] = high_vol
+        if bear:
+            wl, wx = 0.45, 0.55
+            meta["regime"] = "bear_trend"
+        elif high_vol:
+            wl, wx = 0.58, 0.42
+            meta["regime"] = "high_vol"
+        else:
+            meta["regime"] = "neutral"
     except Exception as exc:
-        print(f"[警告] 前期涨幅压制阀门执行异常: {exc}", flush=True)
-        return feat_df
+        meta["error"] = str(exc)
+    return wl, wx, meta
 
 
 def feature_importances_aligned(model: Any) -> list[float]:
@@ -122,6 +162,13 @@ def analyze_stock_reasons(
         "factor_bb_width_20d": "布林带宽度扩张或收敛，波动 regime 切换信号",
         "factor_drawdown_60d": "相对 60 日高点的回撤深度，套牢盘与反弹弹性代理",
         "factor_shrink_pullback_5d": "近 5 日下跌段缩量特征，缩量回调为正向结构",
+        "factor_big_order_net_ratio": "大单与超大单净流入占成交比重（或 OHLCV 代理），资金主动性与方向共振",
+        "factor_north_hold_ratio_chg": "北向持股占 A 股比例的日度变化（增量库优先）",
+        "factor_chip_profit_ratio": "获利盘代理：现价相对 60 日 VWAP 的偏离",
+        "factor_chip_concentration_width": "筹码集中度代理：宽分位价差与窄分位价差之差",
+        "factor_rsi_14": "RSI 相对强弱经截面正交后的技术结构项",
+        "factor_kdj_j": "KDJ 的 J 经截面正交后的摆动项",
+        "factor_macd_hist": "MACD 柱经截面正交后的趋势动能项",
         "factor_hsgt_flow_interact": "北向净流入强度与短期收益的交互项（市场资金面共振）",
     }
 
@@ -177,33 +224,57 @@ def blend_ranker_scores(
 def blend_ranker_scores_with_optional_meta(
     lgb_scores: np.ndarray | pd.Series,
     xgb_scores: np.ndarray | pd.Series | None,
+    cat_scores: np.ndarray | pd.Series | None = None,
     *,
     lgb_weight: float = 0.6,
     xgb_weight: float = 0.4,
+    as_of_trade_date: str | None = None,
+    fusion_log: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """
-    若存在 ``models/meta_rank_stacker.pkl``（Ridge 元学习器），则用 [LGB 原始分, XGB 原始分] 预测
-    截面分位秩得分；否则退回 ``blend_ranker_scores``。
+    若存在 ``models/meta_rank_stacker.pkl``（Ridge），则用一级模型 **原始分** 做元回归，
+    支持 2 维 (LGB,XGB) 或 3 维 (+Cat)；否则 ``blend_ranker_scores`` 并采用指数环境动态权重。
     """
     ls = np.asarray(lgb_scores, dtype=float).ravel()
     if xgb_scores is None:
+        if fusion_log is not None:
+            fusion_log["path"] = "lgb_only"
         return ls.astype(float)
     xs = np.asarray(xgb_scores, dtype=float).ravel()
     if xs.shape[0] != ls.shape[0]:
         raise ValueError("LightGBM 与 XGBoost 预测长度不一致")
+    cs = None
+    if cat_scores is not None:
+        cs = np.asarray(cat_scores, dtype=float).ravel()
+        if cs.shape[0] != ls.shape[0]:
+            raise ValueError("CatBoost 预测长度与 LightGBM 不一致")
+
     pack = load_meta_stacker_optional()
+    n_base_meta = int(pack.get("n_base", 2)) if isinstance(pack, dict) else 2
     if pack:
         ridge = pack.get("model")
         if ridge is not None:
             try:
-                z = np.column_stack([ls, xs])
+                if n_base_meta >= 3 and cs is not None:
+                    z = np.column_stack([ls, xs, cs])
+                else:
+                    z = np.column_stack([ls, xs])
                 raw = np.asarray(ridge.predict(z), dtype=float).ravel()
-                return pd.Series(raw).rank(pct=True).to_numpy(dtype=float)
-            except Exception:
-                pass
-    return blend_ranker_scores(
-        ls, xs, lgb_weight=lgb_weight, xgb_weight=xgb_weight
-    )
+                out = pd.Series(raw).rank(pct=True).to_numpy(dtype=float)
+                if fusion_log is not None:
+                    fusion_log["path"] = "meta_ridge"
+                    fusion_log["meta_n_base"] = int(z.shape[1])
+                return out.astype(float)
+            except Exception as exc:
+                if fusion_log is not None:
+                    fusion_log["meta_error"] = str(exc)
+    wl, wx, reg = compute_market_regime_blend_weights(as_of_trade_date)
+    if fusion_log is not None:
+        fusion_log["path"] = "dynamic_rank_blend"
+        fusion_log["lgb_weight"] = wl
+        fusion_log["xgb_weight"] = wx
+        fusion_log.update({f"idx_{k}": v for k, v in reg.items()})
+    return blend_ranker_scores(ls, xs, lgb_weight=wl, xgb_weight=wx)
 
 
 def _normalize_stock_display_name(stock_name: Optional[str]) -> str:
@@ -422,18 +493,14 @@ def _cross_section_features_for_diagnose(
     if not rows:
         return None, anchor_td, "no_factor_rows"
     feat_df = pd.DataFrame(rows)
-    feat_df = attach_hsgt_flow_interact(feat_df, date_col="trade_date")
     feat_df = prune_zero_volume_rows(feat_df)
     feat_df = feat_df.drop(columns=["volume"], errors="ignore")
     if feat_df.empty:
         return None, anchor_td, "empty_after_prune"
-    feat_df["date"] = feat_df["trade_date"]
-    feat_df = suppress_high_recent_gains(feat_df)
+    feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
     codes_s = feat_df["stock_code"].astype(str).str.zfill(6)
     if code6 not in set(codes_s):
         return None, anchor_td, "suppressed_or_missing"
-    feat_df = clean_cross_sectional_features(feat_df)
-    feat_df = feat_df.drop(columns=["date"], errors="ignore")
     mask = feat_df["stock_code"].astype(str).str.zfill(6) == code6
     if not mask.any():
         return None, anchor_td, "missing_after_clean"
@@ -594,7 +661,6 @@ def predict_universe_scores(
             "关闭兜底排查：set QUANT_BAOSTOCK_FALLBACK=0"
         )
     feat_df = pd.DataFrame(raw_rows)
-    feat_df = attach_hsgt_flow_interact(feat_df, date_col="trade_date")
     tb = feat_df["trade_date"].map(lambda x: str(x).strip()[:10])
 
     if target_trade_date is not None:
@@ -624,16 +690,12 @@ def predict_universe_scores(
     if feat_df.empty:
         raise RuntimeError("剔除停牌或锚定日零成交量标的后样本为空。")
 
-    # 与 train_model / run_daily 一致：按「date」分组做截面清洗（业内 MAD+Z + 分位秩）
-    feat_df["date"] = feat_df["trade_date"]
-    feat_df = suppress_high_recent_gains(feat_df)
+    feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
     if feat_df.empty:
         raise RuntimeError(
             "前期涨幅压制后无剩余候选股票，可设置 QUANT_PREV_GAIN_SUPPRESSION=0 关闭，"
             "或放宽 QUANT_MAX_5D_RETURN / QUANT_MAX_20D_MOMENTUM。"
         )
-    feat_df = clean_cross_sectional_features(feat_df)
-    feat_df = feat_df.drop(columns=["date"], errors="ignore")
 
     feat_df = filter_predictions(feat_df)
     if EXCLUDE_ST:
@@ -641,10 +703,39 @@ def predict_universe_scores(
     if feat_df.empty:
         raise RuntimeError("经 ST/涨跌停过滤后无可用股票，请检查股票池或关闭部分过滤开关。")
 
+    cat_model = load_catboost_ranker_optional()
     X = feat_df[FEATURE_COLUMNS].astype(np.float64)
+    assert_feature_matrix_matches_rankers(
+        X,
+        lgb_model=lgb_model,
+        xgb_model=xgb_model,
+        cat_model=cat_model,
+        context="全市场预测",
+    )
     lgb_scores = lgb_model.predict(X)
     xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
-    feat_df["score"] = blend_ranker_scores_with_optional_meta(lgb_scores, xgb_scores)
+    cat_scores = cat_model.predict(X) if cat_model is not None else None
+    fusion: dict[str, Any] = {}
+    feat_df["score"] = blend_ranker_scores_with_optional_meta(
+        lgb_scores,
+        xgb_scores,
+        cat_scores,
+        as_of_trade_date=as_of,
+        fusion_log=fusion,
+    )
+    try:
+        import json
+
+        from .database import insert_system_log
+
+        insert_system_log(
+            "ranker_fusion",
+            "OK",
+            json.dumps({"as_of_trade_date": as_of, **fusion}, ensure_ascii=False),
+            "",
+        )
+    except Exception:
+        pass
     feat_df = feat_df.sort_values(
         ["score", "stock_code"],
         ascending=[False, True],
@@ -835,7 +926,7 @@ def diagnose_single_stock(
     ``QUANT_MAX_20D_MOMENTUM`` 做近 5 日/10 日动量硬提示。
 
     模型输入侧与 ``run_daily`` / ``train_model`` 对齐：在锚定日拉取全市场可预测池，
-    经 ``suppress_high_recent_gains`` 与 ``clean_cross_sectional_features`` 后取该股截面清洗特征；
+    经 ``prepare_ranking_cross_section_pipeline``（含前期涨幅抑制与截面清洗）后取该股清洗特征；
     若池化失败则退回单股原始因子并在结论文本中说明。
 
     ``end_date``：诊断截止日 YYYY-MM-DD（含），仅使用 ``date <= end_date`` 的 K 线；
@@ -996,9 +1087,16 @@ def diagnose_single_stock(
     X = pd.DataFrame([[feat_map[c] for c in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
     lgb_scores = lgb_model.predict(X)
     xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
+    cat_model = load_catboost_ranker_optional()
+    cat_scores = cat_model.predict(X) if cat_model is not None else None
     blended = float(
         np.asarray(
-            blend_ranker_scores_with_optional_meta(lgb_scores, xgb_scores),
+            blend_ranker_scores_with_optional_meta(
+                lgb_scores,
+                xgb_scores,
+                cat_scores,
+                as_of_trade_date=str(td)[:10],
+            ),
             dtype=float,
         ).ravel()[0]
     )

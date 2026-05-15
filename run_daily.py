@@ -45,18 +45,23 @@ from src.database import (
     init_db,
     insert_daily_predictions,
     insert_daily_selections,
+    insert_system_log,
     list_predict_universe_from_kline,
     selection_exists_for_date,
     stock_codes_with_local_bars,
 )
 from src.dingtalk_notifier import maybe_push_daily_selections
 from src.factor_calculator import (
-    attach_hsgt_flow_interact,
-    clean_cross_sectional_features,
     compute_factors_for_history,
     normalize_industry_label,
+    prepare_ranking_cross_section_pipeline,
 )
-from src.model_trainer import load_model, load_xgb_ranker_optional
+from src.model_trainer import (
+    assert_feature_matrix_matches_rankers,
+    load_catboost_ranker_optional,
+    load_model,
+    load_xgb_ranker_optional,
+)
 from src.predictor import (
     analyze_stock_reasons,
     apply_experience_trading_filters,
@@ -64,7 +69,6 @@ from src.predictor import (
     feature_importances_aligned,
     filter_predictions,
     prune_zero_volume_rows,
-    suppress_high_recent_gains,
 )
 from src.utils import get_last_trading_date, is_a_share_trading_day
 
@@ -298,6 +302,7 @@ def predict_daily(
         sys.exit(1)
     lgb_model = load_model(MODEL_PATH)
     xgb_model = load_xgb_ranker_optional()
+    cat_model = load_catboost_ranker_optional()
 
     # 2. 股票池：默认完全来自本地库；--online-pool 时用在线成分与本地可算股票求交
     if use_online_pool:
@@ -410,25 +415,19 @@ def predict_daily(
 
     # 转化为 DataFrame（已按 pairs 顺序，便于与训练/排查对齐）
     feat_df = pd.DataFrame(rows)
-    feat_df = attach_hsgt_flow_interact(feat_df, date_col="trade_date")
     feat_df = prune_zero_volume_rows(feat_df)
     feat_df = feat_df.drop(columns=["volume"], errors="ignore")
     if feat_df.empty:
         print("警告: 剔除停牌或零成交量标的后没有剩余的候选股票。")
         sys.exit(1)
 
-    # 4. 【核心升级】执行多因子截面去极值与 Z-Score 标准化清洗
-    # 构造临时的 'date' 列以适配 clean_cross_sectional_features 的按日期分组逻辑
-    feat_df["date"] = feat_df["trade_date"]
-    feat_df = suppress_high_recent_gains(feat_df)
+    feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
     if feat_df.empty:
         print(
             "警告: 前期涨幅压制后无剩余候选股票，可设置 QUANT_PREV_GAIN_SUPPRESSION=0 关闭，"
             "或放宽 QUANT_MAX_5D_RETURN / QUANT_MAX_20D_MOMENTUM。"
         )
         sys.exit(1)
-    feat_df = clean_cross_sectional_features(feat_df)
-    feat_df = feat_df.drop(columns=["date"])
 
     # 5. 过滤掉 ST 以及无法建仓的股票（如上一日已接近涨跌停）
     filtered_df = filter_predictions(feat_df)
@@ -447,13 +446,37 @@ def predict_daily(
         print("警告: 板块过滤后没有剩余的候选股票。")
         sys.exit(1)
 
-    # 6. LightGBM + XGBoost Ranker 打分并截面秩融合（无 xgb 文件时等同仅 LGB）
+    # 6. LightGBM + XGBoost (+CatBoost) 融合；融合路径写入 system_logs
     X = filtered_df[FEATURE_COLUMNS].astype(np.float64)
-    lgb_scores = lgb_model.predict(X.values)
-    xgb_scores = xgb_model.predict(X.values) if xgb_model is not None else None
+    assert_feature_matrix_matches_rankers(
+        X,
+        lgb_model=lgb_model,
+        xgb_model=xgb_model,
+        cat_model=cat_model,
+        context="每日选股",
+    )
+    lgb_scores = lgb_model.predict(X)
+    xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
+    cat_scores = cat_model.predict(X) if cat_model is not None else None
 
     filtered_df = filtered_df.copy()
-    filtered_df["score"] = blend_ranker_scores_with_optional_meta(lgb_scores, xgb_scores)
+    fusion: dict[str, object] = {}
+    filtered_df["score"] = blend_ranker_scores_with_optional_meta(
+        lgb_scores,
+        xgb_scores,
+        cat_scores,
+        as_of_trade_date=str(anchor_td)[:10],
+        fusion_log=fusion,
+    )
+    try:
+        insert_system_log(
+            "ranker_fusion",
+            "OK",
+            json.dumps({"trade_date": str(anchor_td)[:10], **fusion}, ensure_ascii=False),
+            "",
+        )
+    except Exception:
+        pass
 
     # 全市场排序并记录预测数据（分数相同时按代码稳定次序，避免重复运行 Top 边界跳动）
     filtered_df = filtered_df.sort_values(

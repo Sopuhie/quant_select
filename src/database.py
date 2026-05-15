@@ -123,6 +123,25 @@ CREATE TABLE IF NOT EXISTS stock_financial_data (
 );
 CREATE INDEX IF NOT EXISTS idx_financial_code_pub ON stock_financial_data(stock_code, pub_date);
 
+CREATE TABLE IF NOT EXISTS stock_money_flow_daily (
+    trade_date TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    big_net_ratio REAL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trade_date, stock_code)
+);
+CREATE INDEX IF NOT EXISTS idx_mf_date ON stock_money_flow_daily(trade_date);
+
+CREATE TABLE IF NOT EXISTS stock_north_hold_daily (
+    trade_date TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    hold_pct REAL,
+    hold_pct_chg REAL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trade_date, stock_code)
+);
+CREATE INDEX IF NOT EXISTS idx_nh_date ON stock_north_hold_daily(trade_date);
+
 CREATE TABLE IF NOT EXISTS system_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_name TEXT NOT NULL,
@@ -919,3 +938,150 @@ def stock_codes_with_local_bars(
     finally:
         conn.close()
     return {str(r[0]).strip().zfill(6) for r in rows}
+
+
+def fetch_auxiliary_feature_frames(
+    dates: list[str],
+    codes: list[str],
+    *,
+    db_path: Path | None = None,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """
+    读取增量表 ``stock_money_flow_daily`` / ``stock_north_hold_daily``，
+    返回可 merge 的 DataFrame（列：``_k_date``, ``_k_code``, ``big_net_ratio`` / ``hold_pct_chg``）。
+    """
+    if not dates or not codes:
+        return None, None
+    ds = [str(d).strip()[:10] for d in dates]
+    cs = [str(c).strip().zfill(6) for c in codes]
+    path = str(db_path or DB_PATH)
+    placeholders_d = ",".join("?" * len(ds))
+    placeholders_c = ",".join("?" * len(cs))
+    mf_sql = f"""
+        SELECT trade_date AS _k_date, stock_code AS _k_code, big_net_ratio
+        FROM stock_money_flow_daily
+        WHERE trade_date IN ({placeholders_d}) AND stock_code IN ({placeholders_c})
+    """
+    nh_sql = f"""
+        SELECT trade_date AS _k_date, stock_code AS _k_code, hold_pct_chg, hold_pct
+        FROM stock_north_hold_daily
+        WHERE trade_date IN ({placeholders_d}) AND stock_code IN ({placeholders_c})
+    """
+    params = tuple(ds + cs)
+    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        mf = pd.read_sql_query(mf_sql, conn, params=params)
+        nh = pd.read_sql_query(nh_sql, conn, params=params)
+    finally:
+        conn.close()
+    if mf.empty:
+        mf = None
+    else:
+        mf["_k_code"] = mf["_k_code"].astype(str).str.zfill(6)
+        mf["_k_date"] = mf["_k_date"].astype(str).str[:10]
+    if nh.empty:
+        nh = None
+    else:
+        nh["_k_code"] = nh["_k_code"].astype(str).str.zfill(6)
+        nh["_k_date"] = nh["_k_date"].astype(str).str[:10]
+    return mf, nh
+
+
+def fetch_existing_auxiliary_key_sets(
+    dates: list[str],
+    codes: list[str],
+    *,
+    db_path: Path | None = None,
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """
+    返回库中已存在的 ``(trade_date, stock_code6)`` 集合（资金流 / 北向），用于计算缺失键。
+    """
+    mf_keys: set[tuple[str, str]] = set()
+    nh_keys: set[tuple[str, str]] = set()
+    if not dates or not codes:
+        return mf_keys, nh_keys
+    ds = [str(d).strip()[:10] for d in dates]
+    cs = [str(c).strip().zfill(6) for c in codes]
+    path = str(db_path or DB_PATH)
+    placeholders_d = ",".join("?" * len(ds))
+    placeholders_c = ",".join("?" * len(cs))
+    params = tuple(ds + cs)
+    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        cur = conn.execute(
+            f"""
+            SELECT trade_date, stock_code FROM stock_money_flow_daily
+            WHERE trade_date IN ({placeholders_d}) AND stock_code IN ({placeholders_c})
+            """,
+            params,
+        )
+        for r in cur.fetchall():
+            mf_keys.add((str(r[0])[:10], str(r[1]).zfill(6)))
+        cur = conn.execute(
+            f"""
+            SELECT trade_date, stock_code FROM stock_north_hold_daily
+            WHERE trade_date IN ({placeholders_d}) AND stock_code IN ({placeholders_c})
+            """,
+            params,
+        )
+        for r in cur.fetchall():
+            nh_keys.add((str(r[0])[:10], str(r[1]).zfill(6)))
+    finally:
+        conn.close()
+    return mf_keys, nh_keys
+
+
+def upsert_stock_money_flow_rows(
+    rows: list[tuple[str, str, float]],
+    *,
+    db_path: Path | None = None,
+) -> None:
+    """rows: (trade_date YYYY-MM-DD, stock_code6, big_net_ratio)"""
+    if not rows:
+        return
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _do() -> None:
+        with get_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO stock_money_flow_daily (trade_date, stock_code, big_net_ratio, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(trade_date, stock_code) DO UPDATE SET
+                  big_net_ratio=excluded.big_net_ratio,
+                  updated_at=excluded.updated_at
+                """,
+                [(a[0], a[1], float(a[2]), now) for a in rows],
+            )
+
+    _retry_sqlite_locked(_do, attempts=5)
+
+
+def upsert_stock_north_hold_rows(
+    rows: list[tuple[str, str, float, float]],
+    *,
+    db_path: Path | None = None,
+) -> None:
+    """rows: (trade_date, stock_code6, hold_pct, hold_pct_chg)"""
+    if not rows:
+        return
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _do() -> None:
+        with get_connection(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO stock_north_hold_daily
+                  (trade_date, stock_code, hold_pct, hold_pct_chg, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, stock_code) DO UPDATE SET
+                  hold_pct=excluded.hold_pct,
+                  hold_pct_chg=excluded.hold_pct_chg,
+                  updated_at=excluded.updated_at
+                """,
+                [(a[0], a[1], float(a[2]), float(a[3]), now) for a in rows],
+            )
+
+    _retry_sqlite_locked(_do, attempts=5)

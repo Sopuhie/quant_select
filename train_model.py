@@ -1,6 +1,7 @@
 """
 使用本地 SQLite（stock_daily_kline）中的日线计算因子并重训排序模型：
-LightGBM LambdaRank + 配套 XGBoost XGBRanker（rank:ndcg），落盘 lgb_model.pkl / xgb_model.pkl。
+LightGBM LambdaRank + XGBoost XGBRanker（rank:pairwise）+ 可选 CatBoost YetiRank，
+落盘 lgb_model.pkl / xgb_model.pkl /（可选）cat_ranker.cbm；元学习器 Ridge 默认使用训练集 Walk-forward OOF（可用 ``QUANT_META_OOF_FOLDS=0`` 关闭以加速）。
 不依赖在线行情拉取；预测侧仍使用 factor_calculator 中同一套因子定义。
 
 用法（在 quant_select 目录下）:
@@ -32,6 +33,7 @@ import pandas as pd
 
 from src.config import (
     BEST_LGB_PARAMS_JSON,
+    CATBOOST_MODEL_PATH,
     FEATURE_COLUMNS,
     LABEL_HORIZON_DAYS,
     MIN_HISTORY_BARS,
@@ -42,26 +44,28 @@ from src.config import (
 from src.database import init_db, register_model_version
 from src.factor_calculator import (
     DEFAULT_INDUSTRY_LABEL,
-    attach_hsgt_flow_interact,
-    clean_cross_sectional_features,
     compute_factors_for_history,
     label_forward_return,
     normalize_industry_column,
+    prepare_ranking_cross_section_pipeline,
 )
 from src.model_trainer import (
     _json_safe,
     _prepare_rank_xy,
-    fit_meta_stacker_ridge,
+    fit_meta_stacker_ridge_oof,
     load_ranker_params_json,
+    mean_cross_sectional_rank_ic,
     merge_ranker_params,
     optuna_tune_lgbm_ranker,
     population_stability_index,
     save_meta_stacker,
     save_model,
     save_ranker_params_json,
+    train_catboost_ranker_optional,
     train_lgbm_ranker,
     train_xgb_ranker,
 )
+from src.utils import permutation_importance_rank_ic_delta
 
 
 def _load_local_kline_panel(
@@ -201,14 +205,11 @@ def main() -> None:
     )
 
     if verbose:
-        print("[北向交互] 正在为面板附加北向×5日收益因子列…", flush=True)
-    panel = attach_hsgt_flow_interact(panel, date_col="date")
-    if verbose:
         print(
-            f"[截面清洗] 行数 {len(panel)}，分位秩 + 行业内 MAD/Z + 市值残差中性化…",
+            "[特征管道] 北向交互 + 增量库 + 截面清洗（与预测侧 prepare_ranking_cross_section_pipeline 一致）…",
             flush=True,
         )
-    panel = clean_cross_sectional_features(panel)
+    panel = prepare_ranking_cross_section_pipeline(panel, date_col="date")
     panel = panel.replace([np.inf, -np.inf], np.nan).dropna(
         subset=FEATURE_COLUMNS + ["label_ret"]
     )
@@ -282,7 +283,7 @@ def main() -> None:
     )
 
     if verbose:
-        print("[XGBRanker] rank:ndcg，与 LightGBM 相同分组与 relevance …", flush=True)
+        print("[XGBRanker] rank:pairwise，与 LightGBM 相同分组与 relevance …", flush=True)
     xgb_model, xgb_metrics = train_xgb_ranker(
         train_df,
         val_df,
@@ -290,6 +291,16 @@ def main() -> None:
         feature_cols=list(FEATURE_COLUMNS),
         n_estimators=200,
         early_stopping_rounds=50,
+        verbose=verbose,
+    )
+
+    cat_model, cat_metrics = train_catboost_ranker_optional(
+        train_df,
+        val_df,
+        best_params=best_full,
+        feature_cols=list(FEATURE_COLUMNS),
+        n_estimators=180,
+        early_stopping_rounds=40,
         verbose=verbose,
     )
 
@@ -311,6 +322,7 @@ def main() -> None:
         if k not in metrics_register and str(k).startswith("val_ndcg"):
             metrics_register[k] = v
     metrics_register.update({k: v for k, v in xgb_metrics.items() if v is not None})
+    metrics_register.update({k: v for k, v in cat_metrics.items() if v is not None})
 
     tr_r, X_tr_m, y_tr_m = _prepare_rank_xy(train_df, date_col="date")
     va_r, X_va_m, y_va_m = _prepare_rank_xy(val_df, date_col="date")
@@ -326,20 +338,50 @@ def main() -> None:
     if np.isfinite(psi_val) and psi_val > psi_thr:
         metrics_register["psi_alert"] = f"PSI={psi_val:.4f} 超过阈值 {psi_thr}"
 
-    meta_model, meta_m = fit_meta_stacker_ridge(
+    yv_arr = y_va_m.to_numpy(dtype=float)
+    dt_va = va_r["date"].to_numpy()
+
+    def _baseline_ic_lgb_tm() -> float:
+        p0 = np.asarray(model.predict(X_va_m), dtype=float).ravel()
+        return float(mean_cross_sectional_rank_ic(p0, dt_va, yv_arr))
+
+    try:
+        pi_lgb = permutation_importance_rank_ic_delta(
+            lambda xdf: np.asarray(model.predict(xdf), dtype=float).ravel(),
+            X_va_m,
+            yv_arr,
+            dt_va,
+            list(FEATURE_COLUMNS),
+            baseline_ic_fn=_baseline_ic_lgb_tm,
+            n_repeats=1,
+            seed=42,
+        )
+        metrics_register["perm_importance_lgb_mean_ic_drop"] = _json_safe(pi_lgb)
+    except Exception as exc:
+        metrics_register["perm_importance_lgb_error"] = str(exc)
+
+    meta_model, meta_m = fit_meta_stacker_ridge_oof(
         model,
         xgb_model,
-        X_tr_m,
-        X_va_m,
-        y_tr_m,
-        y_va_m,
-        va_r["date"].to_numpy(),
+        cat_model,
+        train_df,
+        val_df,
+        date_col="date",
+        cols=list(FEATURE_COLUMNS),
+        rank_params=best_full,
     )
     metrics_register.update({k: v for k, v in meta_m.items() if v is not None})
-    save_meta_stacker(meta_model)
+    n_base = int(float(meta_m.get("meta_n_base", 2))) if meta_m else 2
+    save_meta_stacker(meta_model, n_base=n_base)
 
     save_model(model, MODEL_PATH)
     save_model(xgb_model, XGB_MODEL_PATH)
+    if cat_model is not None:
+        try:
+            cat_model.save_model(str(CATBOOST_MODEL_PATH))
+            metrics_register["cat_model_path"] = str(CATBOOST_MODEL_PATH)
+        except Exception as exc:
+            metrics_register["cat_model_save_error"] = str(exc)
     register_model_version(
         version=version,
         train_end_date=str(train_end_register)[:10],

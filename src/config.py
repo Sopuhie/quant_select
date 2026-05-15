@@ -16,6 +16,7 @@ MODEL_PATH = MODELS_DIR / "lgb_model.pkl"
 XGB_MODEL_PATH = MODELS_DIR / "xgb_model.pkl"
 BEST_LGB_PARAMS_JSON = MODELS_DIR / "best_params.json"
 META_STACKER_PATH = MODELS_DIR / "meta_rank_stacker.pkl"
+CATBOOST_MODEL_PATH = MODELS_DIR / "cat_ranker.cbm"
 
 # 确保目录存在
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -207,6 +208,14 @@ FEATURE_COLUMNS = [
     "factor_bb_width_20d",  # 布林带宽（波动 regime）
     "factor_drawdown_60d",  # 60 日高点回撤深度（套牢/获利结构代理）
     "factor_shrink_pullback_5d",  # 近 5 日下跌中缩量程度（缩量回调为正）
+    # --- 深度优化：资金流 / 筹码 / 技术（正交在截面清洗内完成）---
+    "factor_big_order_net_ratio",  # 大单+超大单净流入占比（AkShare 增量库优先，缺省为 OHLCV 代理）
+    "factor_north_hold_ratio_chg",  # 北向持股占 A 股比例日变化（增量库；无则 0）
+    "factor_chip_profit_ratio",  # 获利盘代理：收盘相对 60 日 VWAP
+    "factor_chip_concentration_width",  # 筹码集中度：(95-5分位)-(85-15分位) 宽度 / 价
+    "factor_rsi_14",
+    "factor_kdj_j",
+    "factor_macd_hist",
     # 北向净流入强度（按日全市场相同标量）与 5 日收益交互；无数据时为 0
     "factor_hsgt_flow_interact",
 ]
@@ -222,6 +231,11 @@ RANK_SAMPLE_WEIGHT_EXTREME_RET = float(
 RANK_SAMPLE_WEIGHT_NEG_THRESH = float(
     os.environ.get("QUANT_RANK_WEIGHT_NEG_THRESH", "-0.05")
 )
+# 历史大幅回撤样本：在极端损失加权之上再乘倍数（与 quant.ranking 可合并）
+RANK_DRAWDOWN_WEIGHT_MULT = float(os.environ.get("QUANT_RANK_DD_WEIGHT_MULT", "2.0"))
+RANK_DRAWDOWN_WEIGHT_THRESH = float(os.environ.get("QUANT_RANK_DD_WEIGHT_THRESH", "-0.07"))
+# Meta 训练：训练集内按交易日 Walk-forward OOF 折数；0 或 1 表示关闭 OOF（与旧版同分布的 in-sample meta）
+RANK_META_OOF_FOLDS = int(os.environ.get("QUANT_META_OOF_FOLDS", "0"))
 
 # PSI：验证集 vs 训练集预测分分布稳定性（仅记录告警，不阻断训练）
 PSI_SCORE_BINS = max(5, int(os.environ.get("QUANT_PSI_BINS", "12")))
@@ -337,6 +351,9 @@ def get_quant_config_merged() -> dict[str, Any]:
         "ranking": {
             "extreme_loss_weight": RANK_SAMPLE_WEIGHT_EXTREME_RET,
             "extreme_loss_thresh": RANK_SAMPLE_WEIGHT_NEG_THRESH,
+            "drawdown_penalty_mult": RANK_DRAWDOWN_WEIGHT_MULT,
+            "drawdown_penalty_thresh": RANK_DRAWDOWN_WEIGHT_THRESH,
+            "meta_oof_folds": RANK_META_OOF_FOLDS,
         },
     }
     try:
