@@ -6,7 +6,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
-import math
 import hmac
 import json
 import os
@@ -16,9 +15,6 @@ from typing import Any, Dict, List
 from urllib.parse import quote_plus
 
 import requests
-
-from .utils import next_trade_day_after
-
 
 class DingTalkNotifier:
     """钉钉机器人通知"""
@@ -80,58 +76,38 @@ class DingTalkNotifier:
 
     def send_stock_selection(self, trade_date: str, selections: List[Dict[str, Any]]) -> bool:
         """
-        发送 Top3 标的（钉钉 markdown）：标题与交易日用钉钉要求的「行尾两空格 + \\n」强制分行，避免手机端与标题挤在同一行；
-        页脚三项同样内联换行；列表为「序号.  代码  名称」双空格格式。
-        展示用交易日为 trade_date 的下一 A 股交易日；无法解析日期时退回原字符串（如测试文案）。
+        发送 Top3 标的（钉钉 markdown）：与产品固定模板一致——
+        标题 + 交易日 +「序号. 代码 名称」列表（不展示分数/收盘价/理由）+ 页脚三行。
+        换行使用「行尾两空格 + \\n」，避免手机端挤行。
         Args:
-            trade_date: 选股数据对应的交易日
+            trade_date: 选股数据对应的交易日（YYYY-MM-DD）
             selections: 选股列表，每个元素需含 rank, stock_code, stock_name
 
         Returns:
             是否发送成功
         """
-        display_trade_date = next_trade_day_after(trade_date) or trade_date
-        title = f"财富密码 Top3 · {display_trade_date}"
+        title = "财富密码 Top3 推荐"
         now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        date_esc = html.escape(str(display_trade_date))
+        td_short = str(trade_date).strip()[:10]
+        date_esc = html.escape(td_short)
         # 钉钉 Markdown：单行 \n 常被合并；官方建议换行处使用「行尾两个空格 + \\n」
-        header = f"📈 **财富密码 Top3 推荐**  \n交易日： {date_esc}"
+        header = f"📈 **财富密码 Top3 推荐**  \n**交易日：{date_esc}**"
         lines: list[str] = [
             header,
             "",
             "---",
             "",
         ]
-        default_reason = "趋向指标与模型评估多头共振优秀。"
         for i, s in enumerate(selections):
             try:
                 rank = int(s["rank"])
             except (TypeError, ValueError):
                 rank = i + 1
-            code = str(s.get("stock_code", "")).strip()
+            code = str(s.get("stock_code", "")).strip().zfill(6)
             name = str(s.get("stock_name", "")).strip()
             code_esc = html.escape(code)
             name_esc = html.escape(name)
-            score_v = s.get("score")
-            try:
-                sf = float(score_v)
-                score_s = "—" if math.isnan(sf) else f"{sf:.4f}"
-            except (TypeError, ValueError):
-                score_s = "—"
-            cp_v = s.get("close_price")
-            try:
-                pf = float(cp_v)
-                price_s = "—" if math.isnan(pf) else f"{pf:.2f}"
-            except (TypeError, ValueError):
-                price_s = "—"
-            reason_raw = str(s.get("selection_reason") or "").strip() or default_reason
-            reason_esc = html.escape(reason_raw)
-            lines.append(f"{rank}. **{name_esc}** ({code_esc})  ")
-            lines.append(f"- 选股得分: {score_s}  ")
-            lines.append(f"- 收盘价格: {price_s} 元  ")
-            lines.append(f"- 核心入选逻辑: {reason_esc}  ")
-            lines.append("")
+            lines.append(f"**{rank}. {code_esc} {name_esc}**  ")
 
         footer = (
             "🤖 本推荐由量化选股系统自动生成  \n"

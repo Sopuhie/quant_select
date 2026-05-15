@@ -74,14 +74,14 @@ AKSHARE_FETCH_RETRY_SLEEP = float(os.environ.get("QUANT_FETCH_RETRY_SLEEP", "0.8
 # 自然日跨度不超过该值时，**优先**用 Baostock 拉日线（增量多为 1～数日，可避免东财限流下 AkShare 多次长退避）。
 # 设为 0 关闭优先逻辑。全量拉多年历史时跨度大，仍走 AkShare 优先。
 BAOSTOCK_FIRST_IF_RANGE_DAYS = max(
-    0, int(os.environ.get("QUANT_BAOSTOCK_FIRST_IF_RANGE_DAYS", "45"))
+    0, int(os.environ.get("QUANT_BAOSTOCK_FIRST_IF_RANGE_DAYS", "99999"))
 )
 
 # 每日选股拉 K 线：只取最近若干自然日的数据即可算满窗口因子，减轻接口压力
 PREDICT_HISTORY_CALENDAR_DAYS = int(os.environ.get("QUANT_PREDICT_LOOKBACK_DAYS", "800"))
 
 # 选股阶段并发线程数（过大易被东方财富/AkShare 限流，导致「零条有效 K 线」）
-PREDICT_FETCH_WORKERS = int(os.environ.get("QUANT_FETCH_WORKERS", "4"))
+PREDICT_FETCH_WORKERS = int(os.environ.get("QUANT_FETCH_WORKERS", "2"))
 
 # AkShare 全部失败时是否用 Baostock 串行兜底（需安装 baostock；非线程安全故全局锁串行）。
 # 另：AkShare 若因连接重置/超时等瞬时错误失败，即使本项为 0，``fetch_daily_hist`` 仍会尝试 Baostock 自动兜底。
@@ -274,5 +274,5 @@ THEME_MA_LONG = 60
 THEME_VOL_RATIO_MIN_5D = 1.5
 THEME_VOL_RATIO_MIN_1D = 1.3
 THEME_KDJ_J_SLOPE_MIN = 5.0
-THEME_KDJ_LEVEL_1 = 85.0
-THEME_KDJ_LEVEL_2 = 100.0
+THEME_KDJ_LEVEL_1 = 100.0
+THEME_KDJ_LEVEL_2 = 110.0

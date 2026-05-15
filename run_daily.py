@@ -12,11 +12,12 @@
   python run_daily.py --only-data   # 探测本地可预测股票数量
   python run_daily.py --include-300 --include-688   # 默认不传则从池中剔除 300/301/688 开头股票
 
-选股写入成功后，若 config 中启用钉钉，将自动调用推送（与 Streamlit「系统设置」一致）。
+选股写入成功后，在项目根目录写入 today.json（供外部消费）；若 config 中启用钉钉，将自动调用推送（与 Streamlit「系统设置」一致）。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -69,6 +70,39 @@ from src.utils import get_last_trading_date, is_a_share_trading_day
 
 def _normalize_stock_code(code: str) -> str:
     return str(code).strip().zfill(6)
+
+
+def write_today_json(
+    root: Path,
+    *,
+    trade_date: str,
+    selection_rows: list[dict[str, object]],
+) -> None:
+    """将当日 Top 选股写入根目录 today.json（与任务 C / 命令行 run_daily 一致）。"""
+    generated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    stocks: list[dict[str, object]] = []
+    for r in selection_rows:
+        entry: dict[str, object] = {
+            "rank": int(r["rank"]),
+            "code": _normalize_stock_code(str(r["stock_code"])),
+            "name": str(r["stock_name"]),
+            "close_price": float(r["close_price"]),
+            "score": round(float(r["score"]), 4),
+        }
+        reason = r.get("selection_reason")
+        if reason is not None and str(reason).strip():
+            entry["selection_reason"] = str(reason).strip()
+        stocks.append(entry)
+    payload = {
+        "trade_date": str(trade_date).strip()[:10],
+        "generated_at": generated_at,
+        "stocks": stocks,
+    }
+    path = root / "today.json"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _board_allowed(code: str, *, include_300: bool, include_688: bool) -> bool:
@@ -468,6 +502,8 @@ def predict_daily(
             }
         )
     insert_daily_selections(selection_rows)
+    write_today_json(ROOT, trade_date=anchor_td, selection_rows=selection_rows)
+    print(f"已写入 {ROOT / 'today.json'}", flush=True)
 
     print(f"今日选股完成！{anchor_td} 推荐 Top{TOP_N_SELECTION} 为:")
     for r in selection_rows:

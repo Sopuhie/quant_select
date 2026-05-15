@@ -6,7 +6,7 @@ Streamlit 复盘与全功能控制台（浅色清晰主题）。
   3. 每日选股预测
   4. 历史收益回填
   5. 2024 滚动回测
-  6. 🔥 热门题材高爆规则选股 v2.1（买入/卖出分表，MACD+KDJ）
+  6. 🔥 热门题材高爆规则选股 v2.0（单表共振 + 实盘决策结论，MACD+KDJ）
   7. 🎨 视觉图形选股（本地 K 线形态相似度扫描）
 
 审计：`run_command_interactive` 结束后写入 ``system_logs``；「📋 系统运行日志」Tab 可追溯控制台输出。
@@ -1245,8 +1245,10 @@ with tab_theme:
         "### 🔥 热门题材 + 量能突变 + MACD/KDJ 三位一体共振选股舱"
     )
     st.caption(
-        "规则 v2.1：趋势 + 双量比（含滞涨剔除）+ MACD/KDJ 共振生成「买入表」；「卖出表」含 KDJ 分层、MACD 零轴上死叉、顶背离等。"
-        "阈值与均线周期见 ``config.py`` 中 ``THEME_*``、``MIN_HISTORY_BARS``；大盘环境分低于 60 时本日买入/卖出表均为空。"
+        "规则 v2.0：趋势过滤（价>MA20/MA60 且 MA20>MA60）+ 双量比（剔除放量滞涨）"
+        " + MACD 金叉/红柱放大 + K 上穿 D 且 J 斜率为正；"
+        "退出参考：MACD 零轴上死叉、J≥110、或 J≥100 与强共振买点并存（结论列按 J 分层提示）。"
+        "阈值见 config.py 中 THEME_*、MIN_HISTORY_BARS；沪深300 环境分低于 60 时本日结果为空。"
     )
 
     # --- 状态机安全初始化 ---
@@ -1257,55 +1259,8 @@ with tab_theme:
 
     st.markdown("##### 🏷️ 今日全市场焦点题材推荐")
 
-    # 动态抓取最新交易日成交活跃或涨幅居前的股票代称/行业片段作为热门备选
-    try:
-        # 预设的常青核心题材词
-        candidate_words = [
-            "半导体",
-            "科技",
-            "人工智能",
-            "恒生",
-            "生物医药",
-            "新能源",
-            "中字头",
-            "机器人",
-            "低空经济",
-            "电力",
-        ]
+    hot_tags = ["科技", "新能源", "电力"]
 
-        # 利用 SQL 模糊匹配预筛；内层按 volume 排序（SQLite 不允许 DISTINCT 与 ORDER BY 非结果列直接混写）
-        where_clauses = " OR ".join(["stock_name LIKE ?" for _ in candidate_words])
-        params = [f"%{w}%" for w in candidate_words]
-
-        hot_themes_df = query_df(
-            f"""
-            SELECT DISTINCT stock_name FROM (
-                SELECT stock_name, volume
-                FROM stock_daily_kline
-                WHERE date = (SELECT MAX(date) FROM stock_daily_kline)
-                  AND ({where_clauses})
-                ORDER BY volume DESC
-                LIMIT 80
-            )
-            """,
-            tuple(params),
-        )
-
-        found_hot_words = []
-        if not hot_themes_df.empty:
-            merged_names = "|".join(hot_themes_df["stock_name"].astype(str).tolist())
-            for word in candidate_words:
-                if word in merged_names:
-                    found_hot_words.append(word)
-
-        if not found_hot_words:
-            found_hot_words = ["科技", "半导体", "人工智能", "恒生", "新能源"]
-
-        hot_tags = found_hot_words[:6]
-    except Exception:
-        hot_tags = ["科技", "半导体", "人工智能", "恒生", "新能源"]
-
-    # 渲染题材标签按钮（横向排列）
     tag_cols = st.columns(len(hot_tags) + 1)
 
     with tag_cols[0]:
@@ -1334,7 +1289,7 @@ with tab_theme:
     keyword = st.text_input(
         "💡 输入题材核心关键词/板块名称进行实时过滤 (留空代表扫描全市场)",
         value=keyword_default,
-        placeholder="例如: 恒生、科技、半导体、人工智能...",
+        placeholder="例如: 电力、科技、新能源...",
         key="theme_keyword_input_field",
     )
 
@@ -1361,7 +1316,7 @@ with tab_theme:
             try:
                 with get_connection(DB_PATH) as conn:
                     scanner = ThemeAlphaStrategy(conn)
-                    buy_df, sell_df, scanned_date = scanner.scan_hot_themes(
+                    theme_df, scanned_date = scanner.scan_hot_themes(
                         keyword=keyword.strip() or None
                     )
             except Exception as exc:
@@ -1369,35 +1324,25 @@ with tab_theme:
             else:
                 if not scanned_date:
                     st.warning("本地 stock_daily_kline 无可用日期，请先同步行情。")
-                elif buy_df.empty and sell_df.empty:
+                elif theme_df.empty:
                     if keyword.strip():
                         st.info(
-                            f"📅 交易日 {scanned_date} 在名称/代码匹配「{keyword.strip()}」下暂无买入/卖出信号（或大盘环境分未过线）。"
+                            f"📅 交易日 {scanned_date} 在名称/代码匹配「{keyword.strip()}」下暂无共振信号（或大盘环境分未过线）。"
                         )
                     else:
                         st.info(
-                            f"📅 交易日 {scanned_date} 全市场暂无买入/卖出信号（或大盘环境分未过线）。"
+                            f"📅 交易日 {scanned_date} 全市场暂无共振信号（或大盘环境分未过线）。"
                         )
                 else:
-                    st.success(f"🎯 扫描完成：交易日 {scanned_date}")
-                    if not buy_df.empty:
-                        st.markdown(f"**买入共振（{len(buy_df)}）**")
-                        st.dataframe(
-                            buy_df,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                    else:
-                        st.info("本日无买入共振信号。")
-                    if not sell_df.empty:
-                        st.markdown(f"**卖出 / 减仓提示（{len(sell_df)}）**")
-                        st.dataframe(
-                            sell_df,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                    else:
-                        st.info("本日无分层卖出信号。")
+                    n = len(theme_df)
+                    st.success(
+                        f"🎯 成功在 {scanned_date} 捕获到 {n} 个交易员经验状态拐点股:"
+                    )
+                    st.dataframe(
+                        theme_df,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
 # ----------------- TAB 4: 模型表现 -----------------
 with tab_perf:
