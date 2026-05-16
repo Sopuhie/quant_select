@@ -402,19 +402,18 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     out["factor_return_5d"] = close.pct_change(5)
     out["factor_momentum_10d"] = close / (close.shift(10) + eps) - 1.0
 
-    trend_score = (
+    raw_trend_score = (
         (ma5 > ma10).astype(float)
         + (ma10 > ma20).astype(float)
         + (ma20 > ma60).astype(float)
         + (close > ma20).astype(float)
     )
-    out["factor_ma_trend_score"] = trend_score
+    out["factor_ma_trend_score"] = raw_trend_score
 
     roll_min250 = close.rolling(250, min_periods=30).min()
     roll_max250 = close.rolling(250, min_periods=30).max()
-    out["factor_price_pos_250d"] = (close - roll_min250) / (
-        roll_max250 - roll_min250 + eps
-    )
+    raw_price_pos_250d = (close - roll_min250) / (roll_max250 - roll_min250 + eps)
+    out["factor_price_pos_250d"] = raw_price_pos_250d
 
     vol_ma5 = _roll_ewm_blend(vol, 5)
     vol_ma20 = _roll_ewm_blend(vol, 20)

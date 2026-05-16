@@ -44,6 +44,7 @@ from .database import (
     selection_exists_for_date,
 )
 from .factor_calculator import (
+    _roll_ewm_blend,
     anchor_ma_levels_from_history,
     attach_hsgt_flow_interact,
     compute_factors_for_history,
@@ -453,11 +454,13 @@ def is_major_trend_breakdown(
     return bool(close < ma20 and close < ma60 and ma20 < ma60)
 
 
-def attach_ma_levels_from_bias(feat_df: pd.DataFrame) -> pd.DataFrame:
-    """在截面清洗前，由 ``close_price`` 与原始 ``factor_bias_20/60`` 附加均线列。"""
+def attach_raw_ma_from_bias_fallback(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """缺 ``raw_ma20``/``raw_ma60`` 时，由未截面清洗前的乖离率倒推（兜底）。"""
     if feat_df is None or feat_df.empty:
         return feat_df
     work = feat_df.copy()
+    if "raw_ma20" in work.columns and "raw_ma60" in work.columns:
+        return work
     if "close_price" not in work.columns:
         return work
     if "factor_bias_20" not in work.columns or "factor_bias_60" not in work.columns:
@@ -465,61 +468,58 @@ def attach_ma_levels_from_bias(feat_df: pd.DataFrame) -> pd.DataFrame:
     cp = pd.to_numeric(work["close_price"], errors="coerce")
     b20 = pd.to_numeric(work["factor_bias_20"], errors="coerce")
     b60 = pd.to_numeric(work["factor_bias_60"], errors="coerce")
-    d20 = b20 + 1.0
-    d60 = b60 + 1.0
-    eps = 1e-12
-    work["ma20_raw"] = np.where(
-        cp.notna() & d20.notna() & (d20.abs() > eps),
-        cp / d20,
-        np.nan,
-    )
-    work["ma60_raw"] = np.where(
-        cp.notna() & d60.notna() & (d60.abs() > eps),
-        cp / d60,
-        np.nan,
-    )
+    ma20_list: list[float] = []
+    ma60_list: list[float] = []
+    for c, b2, b6 in zip(cp, b20, b60):
+        m2, m6 = infer_ma_from_close_bias(
+            float(c) if pd.notna(c) else float("nan"),
+            float(b2) if pd.notna(b2) else float("nan"),
+            float(b6) if pd.notna(b6) else float("nan"),
+        )
+        ma20_list.append(m2)
+        ma60_list.append(m6)
+    work["raw_ma20"] = ma20_list
+    work["raw_ma60"] = ma60_list
     return work
 
 
-def filter_major_trend_breakdown(
-    feat_df: pd.DataFrame,
-    *,
-    context: str = "选股",
-) -> pd.DataFrame:
+def filter_downtrend_breakdown_hard(feat_df: pd.DataFrame) -> pd.DataFrame:
     """
-    剔除触发「大趋势破位硬风险」的标的。
-    优先使用 ``ma20_raw`` / ``ma60_raw``；否则由 ``close_price`` 与原始乖离率倒推。
+    大趋势全面破位硬性风控：现价 < raw_ma20 且 < raw_ma60 且 raw_ma20 < raw_ma60。
+    须含 K 线直接计算的 ``raw_ma20``/``raw_ma60``（见 ``_fetch_one_stock_features``）。
     """
     if feat_df is None or feat_df.empty:
         return feat_df
-    work = feat_df.copy()
-    n0 = len(work)
-    if "close_price" not in work.columns:
-        return work
-    if "ma20_raw" not in work.columns or "ma60_raw" not in work.columns:
-        work = attach_ma_levels_from_bias(work)
-    cp = pd.to_numeric(work["close_price"], errors="coerce")
-    ma20 = pd.to_numeric(work.get("ma20_raw"), errors="coerce")
-    ma60 = pd.to_numeric(work.get("ma60_raw"), errors="coerce")
-    if not (np.isfinite(ma20.to_numpy(dtype=float)).any() and np.isfinite(ma60.to_numpy(dtype=float)).any()):
+    work = attach_raw_ma_from_bias_fallback(feat_df.copy())
+    if "raw_ma20" not in work.columns or "raw_ma60" not in work.columns:
         return feat_df
-    keep = np.ones(len(work), dtype=bool)
-    for i in range(len(work)):
-        if is_major_trend_breakdown(float(cp.iloc[i]), float(ma20.iloc[i]), float(ma60.iloc[i])):
-            keep[i] = False
-    out = work.loc[keep].reset_index(drop=True)
-    n_drop = n0 - len(out)
+    if "close_price" not in work.columns:
+        return feat_df
+
+    before_count = len(work)
+    cp = pd.to_numeric(work["close_price"], errors="coerce")
+    r20 = pd.to_numeric(work["raw_ma20"], errors="coerce")
+    r60 = pd.to_numeric(work["raw_ma60"], errors="coerce")
+
+    valid = cp.notna() & r20.notna() & r60.notna()
+    downtrend_mask = valid & (cp < r20) & (cp < r60) & (r20 < r60)
+    out = work.loc[~downtrend_mask].reset_index(drop=True)
+
+    n_drop = before_count - len(out)
     if n_drop > 0:
         print(
-            f"[风控增强] {context}：已剔除 {n_drop} 只中长期大趋势破位标的"
-            "（现价低于 20/60 日均线且均线死叉），"
-            f"剩余 {len(out)} 只。",
+            f"[趋势硬风控] 已强行剔除中长期大趋势破位、处于全面空头阴跌通道的股票 {n_drop} 只。",
             flush=True,
         )
-    if len(out) == 0 and n0 > 0:
+    if len(out) == 0 and before_count > 0:
         print(
-            f"[警告] {context}：大趋势破位过滤后股票池为空，"
-            "请检查行情数据或暂时放宽过滤条件。",
+            "[警告] 趋势硬风控后股票池为空，请检查行情数据或股票池范围。",
+            flush=True,
+        )
+    elif 0 < len(out) < int(TOP_N_SELECTION):
+        print(
+            f"[警告] 趋势硬风控后可用股票 {len(out)} 只，少于 Top{TOP_N_SELECTION}，"
+            "将按实际数量继续打分/入库。",
             flush=True,
         )
     return out
@@ -696,6 +696,10 @@ def _fetch_one_stock_features(
     li = len(hist) - 1
     row["volume_ratio_raw"] = float(vol_s.iloc[li] / (float(vma5.iloc[li]) + 1e-12))
     row["volume"] = float(vol_s.iloc[li])
+
+    _c_anchor, raw_ma20, raw_ma60 = anchor_ma_levels_from_history(hist)
+    row["raw_ma20"] = float(raw_ma20) if np.isfinite(raw_ma20) else float("nan")
+    row["raw_ma60"] = float(raw_ma60) if np.isfinite(raw_ma60) else float("nan")
     return row
 
 
@@ -795,8 +799,7 @@ def predict_universe_scores(
     if feat_df.empty:
         raise RuntimeError("剔除停牌或锚定日零成交量标的后样本为空。")
 
-    feat_df = attach_ma_levels_from_bias(feat_df)
-    feat_df = filter_major_trend_breakdown(feat_df, context="全市场预测")
+    feat_df = filter_downtrend_breakdown_hard(feat_df)
 
     feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
     if feat_df.empty:
@@ -850,7 +853,7 @@ def predict_universe_scores(
     ).reset_index(drop=True)
     meta_keep = [
         c
-        for c in ("mcap", "volume_ratio_raw", "ma20_raw", "ma60_raw")
+        for c in ("mcap", "volume_ratio_raw", "raw_ma20", "raw_ma60")
         if c in feat_df.columns
     ]
     cols = ["trade_date", "stock_code", "stock_name", "score", "close_price"] + meta_keep
@@ -887,14 +890,14 @@ def persist_predictions(
         scores_df = filter_st_stocks(scores_df)
     if scores_df.empty:
         raise RuntimeError("写入前过滤结果为空，无法保存预测与选股。")
-    scores_df = filter_major_trend_breakdown(scores_df, context="每日选股入库")
+    scores_df = filter_downtrend_breakdown_hard(scores_df)
     if scores_df.empty:
         print(
-            "[警告] 大趋势破位过滤后无剩余股票，无法写入 Top N；"
+            "[警告] 趋势硬风控后无剩余股票，无法写入 Top N；"
             "请检查当日行情或上游预测结果。",
             flush=True,
         )
-        raise RuntimeError("大趋势破位过滤后无剩余股票，无法保存预测与选股。")
+        return
     scores_df = scores_df.sort_values("score", ascending=False).reset_index(drop=True)
     scores_df = apply_experience_trading_filters(scores_df)
     if scores_df.empty:
@@ -1121,7 +1124,14 @@ def diagnose_single_stock(
         ret_m10 = 0.0
 
     close_price = float(df_hist.iloc[last_i]["close"])
-    _c_ma, ma20_val, ma60_val = anchor_ma_levels_from_history(df_hist)
+    hist_sorted = df_hist.sort_values("date").reset_index(drop=True)
+    close_s = hist_sorted["close"].astype(float)
+    ma20_s = _roll_ewm_blend(close_s, 20)
+    ma60_s = _roll_ewm_blend(close_s, 60)
+    ma20_last = ma20_s.iloc[-1]
+    ma60_last = ma60_s.iloc[-1]
+    ma20_val = float(ma20_last) if pd.notna(ma20_last) and np.isfinite(ma20_last) else float("nan")
+    ma60_val = float(ma60_last) if pd.notna(ma60_last) and np.isfinite(ma60_last) else float("nan")
     mc_raw = df_hist.iloc[last_i].get("market_cap")
     try:
         mc_yuan = float(mc_raw) if mc_raw is not None and pd.notna(mc_raw) else float("nan")
@@ -1157,10 +1167,19 @@ def diagnose_single_stock(
         feature_alignment_note = f"{feature_alignment_note} {extra}".strip()
 
     violated: list[str] = []
-    if is_major_trend_breakdown(close_price, ma20_val, ma60_val):
+    if (
+        pd.notna(ma20_val)
+        and pd.notna(ma60_val)
+        and np.isfinite(close_price)
+        and np.isfinite(ma20_val)
+        and np.isfinite(ma60_val)
+        and close_price < ma20_val
+        and close_price < ma60_val
+        and ma20_val < ma60_val
+    ):
         violated.append(
-            "中长期大趋势处于全面空头破位状态（现价低于20日及60日均线，且均线死叉向下），"
-            "不具备上涨动量"
+            f"中长期大趋势处于全面空头破位状态（现价 {close_price:.2f} 元同时低于20日及60日生命线，"
+            "且均线死叉向下），缺乏上涨动量，属于典型弱势阴跌股"
         )
     min_p, max_p, min_mc, max_mc, min_to, max_to = get_experience_thresholds()
     if ENABLE_PREV_GAIN_SUPPRESSION and np.isfinite(ret_5d) and ret_5d > float(
