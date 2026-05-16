@@ -196,6 +196,8 @@ FEATURE_COLUMNS = [
     "factor_return_1d",  # 1日收益
     "factor_return_5d",  # 5日收益
     "factor_momentum_10d",  # 10日动量
+    "factor_ma_trend_score",  # 多头排列得分 [0,4]：ma5>ma10>ma20>ma60 与收盘>ma20
+    "factor_price_pos_250d",  # 现价在 250 日高低区间内的分位位置 [0,1]
     "factor_volume_ratio",  # 量比（相对5日均量）
     "factor_volume_position",  # 量能位置（5日均量相对20日均量）
     "factor_volatility_5d",  # 5日波动

@@ -85,6 +85,12 @@ TECHNICAL_ORTHOGONAL_FEATURE_COLS: tuple[str, ...] = (
     "factor_macd_hist",
 )
 
+# 顺势强度因子：截面清洗时保留原尺度，不参与分位秩 / MAD-Z / 市值中性化
+PRESERVE_RAW_CROSS_SECTION_FEATURES: tuple[str, ...] = (
+    "factor_ma_trend_score",
+    "factor_price_pos_250d",
+)
+
 
 def _mad_clip_zscore(series: pd.Series) -> pd.Series:
     """单截面序列：MAD 截断后 Z-score，索引与原序列对齐。"""
@@ -123,7 +129,7 @@ def _apply_size_residual_regression(sub_df: pd.DataFrame) -> pd.DataFrame:
         return sub_df
     sz_vals = sz.to_numpy(dtype=float)
     for col in FEATURE_COLUMNS:
-        if col == SIZE_FACTOR_COL:
+        if col == SIZE_FACTOR_COL or col in PRESERVE_RAW_CROSS_SECTION_FEATURES:
             continue
         if col not in sub_df.columns:
             continue
@@ -396,6 +402,20 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     out["factor_return_5d"] = close.pct_change(5)
     out["factor_momentum_10d"] = close / (close.shift(10) + eps) - 1.0
 
+    trend_score = (
+        (ma5 > ma10).astype(float)
+        + (ma10 > ma20).astype(float)
+        + (ma20 > ma60).astype(float)
+        + (close > ma20).astype(float)
+    )
+    out["factor_ma_trend_score"] = trend_score
+
+    roll_min250 = close.rolling(250, min_periods=30).min()
+    roll_max250 = close.rolling(250, min_periods=30).max()
+    out["factor_price_pos_250d"] = (close - roll_min250) / (
+        roll_max250 - roll_min250 + eps
+    )
+
     vol_ma5 = _roll_ewm_blend(vol, 5)
     vol_ma20 = _roll_ewm_blend(vol, 20)
     out["factor_volume_ratio"] = vol / (vol_ma5 + eps)
@@ -538,12 +558,12 @@ def clean_cross_sectional_features(
 
         if use_percentile_rank_volatility:
             for col in PERCENTILE_RANK_FEATURES:
-                if col not in day_df.columns:
+                if col not in day_df.columns or col in PRESERVE_RAW_CROSS_SECTION_FEATURES:
                     continue
                 s = day_df[col].astype(float)
                 day_df[col] = s.rank(pct=True, method="average") - 0.5
             for col in RANK_GAUSS_AFTER_RANK_FEATURES:
-                if col not in day_df.columns:
+                if col not in day_df.columns or col in PRESERVE_RAW_CROSS_SECTION_FEATURES:
                     continue
                 s = day_df[col].astype(float)
                 day_df[col] = rank_gauss_cross_section(s)
@@ -566,7 +586,7 @@ def clean_cross_sectional_features(
 
         global_z = pd.DataFrame(index=out_day.index)
         for col in FEATURE_COLUMNS:
-            if col not in out_day.columns:
+            if col not in out_day.columns or col in PRESERVE_RAW_CROSS_SECTION_FEATURES:
                 continue
             global_z[col] = _mad_clip_zscore(out_day[col])
 
@@ -576,18 +596,18 @@ def clean_cross_sectional_features(
                 if len(idx) >= MIN_INDUSTRY_GROUP_SIZE:
                     sub2 = out_day.loc[idx]
                     for col in FEATURE_COLUMNS:
-                        if col not in sub2.columns:
+                        if col not in sub2.columns or col in PRESERVE_RAW_CROSS_SECTION_FEATURES:
                             continue
                         out_day.loc[idx, col] = _mad_clip_zscore(sub2[col]).values
                 else:
                     for col in FEATURE_COLUMNS:
-                        if col not in global_z.columns:
+                        if col not in global_z.columns or col in PRESERVE_RAW_CROSS_SECTION_FEATURES:
                             continue
                         out_day.loc[idx, col] = global_z.loc[idx, col].values
             else:
                 sub2 = out_day.loc[idx]
                 for col in FEATURE_COLUMNS:
-                    if col not in sub2.columns:
+                    if col not in sub2.columns or col in PRESERVE_RAW_CROSS_SECTION_FEATURES:
                         continue
                     out_day.loc[idx, col] = _mad_clip_zscore(sub2[col]).values
 
@@ -595,6 +615,26 @@ def clean_cross_sectional_features(
         cleaned_parts.append(out_day)
 
     return pd.concat(cleaned_parts, ignore_index=True)
+
+
+def anchor_ma_levels_from_history(df: pd.DataFrame) -> tuple[float, float, float]:
+    """
+    锚定日（最后一根 K 线）的收盘价与 20/60 日混合均线。
+    与 ``compute_factors_for_history`` 使用相同的 ``_roll_ewm_blend`` 定义。
+    """
+    if df is None or df.empty:
+        return float("nan"), float("nan"), float("nan")
+    work = df.sort_values("date").reset_index(drop=True)
+    close = work["close"].astype(float)
+    if close.empty:
+        return float("nan"), float("nan"), float("nan")
+    ma20 = _roll_ewm_blend(close, 20)
+    ma60 = _roll_ewm_blend(close, 60)
+    i = len(close) - 1
+    c = float(close.iloc[i])
+    m20 = float(ma20.iloc[i]) if np.isfinite(ma20.iloc[i]) else float("nan")
+    m60 = float(ma60.iloc[i]) if np.isfinite(ma60.iloc[i]) else float("nan")
+    return c, m20, m60
 
 
 def label_forward_return(close: pd.Series, horizon: int = LABEL_HORIZON_DAYS) -> pd.Series:
