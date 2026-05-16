@@ -86,19 +86,26 @@ def run_complete_pipeline(
             "args": [python_exe, str(PROJECT_ROOT / "scripts" / "update_local_data.py")],
         },
         {
-            "name": "2. 双排序模型重训 (LGBM+XGB)",
+            "name": "2. 热门概念题材与成份股同步",
+            "args": [
+                python_exe,
+                str(PROJECT_ROOT / "scripts" / "sync_hot_concept_boards.py"),
+            ],
+        },
+        {
+            "name": "3. 双排序模型重训 (LGBM+XGB)",
             "args": [python_exe, str(PROJECT_ROOT / "train_model.py")],
         },
         {
-            "name": "3. 每日智能选股",
+            "name": "4. 每日智能选股",
             "args": [python_exe, str(PROJECT_ROOT / "run_daily.py")],
         },
         {
-            "name": "4. 历史滚动回测",
+            "name": "5. 历史滚动回测",
             "args": [python_exe, str(PROJECT_ROOT / "scripts" / "backtest.py")],
         },
         {
-            "name": "5. 历史选股收益率回填",
+            "name": "6. 历史选股收益率回填",
             "args": [python_exe, str(PROJECT_ROOT / "scripts" / "update_returns.py")],
         },
     ]

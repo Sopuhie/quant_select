@@ -13,7 +13,9 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from .board_stocks import get_stock_boards, load_board_mapping
 from .config import (
+    DB_PATH,
     MIN_HISTORY_BARS,
     THEME_KDJ_J_SLOPE_MIN,
     THEME_KDJ_LEVEL_1,
@@ -23,6 +25,7 @@ from .config import (
     THEME_VOL_RATIO_MIN_1D,
     THEME_VOL_RATIO_MIN_5D,
 )
+from .database import fetch_stocks_by_concept_board
 
 THEME_HIST_LIMIT = 250
 THEME_MIN_BARS = MIN_HISTORY_BARS
@@ -30,6 +33,7 @@ THEME_MIN_BARS = MIN_HISTORY_BARS
 RESULT_COLUMNS = [
     "股票代码",
     "股票名称",
+    "题材标签",
     "最新价格",
     "当前量比",
     "KDJ_J值",
@@ -76,6 +80,63 @@ class ThemeAlphaStrategy:
 
     def check_market_environment(self, target_date: str) -> bool:
         return self.get_market_score(target_date) >= 60
+
+    def resolve_theme_stock_codes(self, keyword: str) -> set[str] | None:
+        """
+        按东方财富概念板块标签解析候选股票代码。
+        返回 None 表示不限题材；空集表示无匹配成份。
+        """
+        kw = str(keyword).strip()
+        if not kw:
+            return None
+
+        codes: set[str] = set()
+
+        try:
+            exact = fetch_stocks_by_concept_board(kw, db_path=DB_PATH)
+            codes.update(str(c).zfill(6) for c in exact)
+        except Exception:
+            pass
+
+        if not codes:
+            try:
+                cur = self.conn.execute(
+                    """
+                    SELECT DISTINCT stock_code FROM stock_concept_boards
+                    WHERE board_name = ? OR board_name LIKE ?
+                    """,
+                    (kw, f"%{kw}%"),
+                )
+                codes.update(str(r[0]).zfill(6) for r in cur.fetchall())
+            except Exception:
+                pass
+
+        if not codes:
+            mapping = load_board_mapping()
+            kw_l = kw.lower()
+            for code, boards in mapping.items():
+                for b in boards:
+                    bn = str(b)
+                    if bn == kw or kw in bn or bn in kw or kw_l in bn.lower():
+                        codes.add(str(code).zfill(6))
+                        break
+
+        if codes:
+            return codes
+
+        like_term = f"%{kw}%"
+        try:
+            cur = self.conn.execute(
+                """
+                SELECT DISTINCT stock_code FROM stock_daily_kline
+                WHERE stock_name LIKE ? OR stock_code LIKE ?
+                """,
+                (like_term, like_term),
+            )
+            fallback = {str(r[0]).zfill(6) for r in cur.fetchall()}
+            return fallback if fallback else set()
+        except Exception:
+            return set()
 
     def compute_technical_signals(
         self, df: pd.DataFrame
@@ -172,27 +233,32 @@ class ThemeAlphaStrategy:
             return (pd.DataFrame(columns=RESULT_COLUMNS), target_date)
 
         eff_kw = self._effective_keyword(keyword, theme_keywords)
-
+        theme_codes: set[str] | None = None
         if eff_kw:
-            like_term = f"%{eff_kw}%"
-            df_all = pd.read_sql_query(
-                """
-                SELECT * FROM stock_daily_kline
-                WHERE date = ? AND (stock_name LIKE ? OR stock_code LIKE ?)
-                """,
-                self.conn,
-                params=[target_date, like_term, like_term],
-            )
-        else:
-            df_all = pd.read_sql_query(
-                "SELECT * FROM stock_daily_kline WHERE date = ?",
-                self.conn,
-                params=[target_date],
-            )
+            theme_codes = self.resolve_theme_stock_codes(eff_kw)
+
+        df_all = pd.read_sql_query(
+            "SELECT * FROM stock_daily_kline WHERE date = ?",
+            self.conn,
+            params=[target_date],
+        )
         if df_all.empty:
             return (pd.DataFrame(columns=RESULT_COLUMNS), target_date)
 
         df_all["stock_code"] = df_all["stock_code"].astype(str).str.strip().str.zfill(6)
+        if eff_kw:
+            if theme_codes is not None:
+                if not theme_codes:
+                    return (pd.DataFrame(columns=RESULT_COLUMNS), target_date)
+                df_all = df_all[df_all["stock_code"].isin(theme_codes)]
+            else:
+                like_term = f"%{eff_kw}%"
+                mask = df_all["stock_name"].astype(str).str.contains(
+                    eff_kw, case=False, na=False
+                ) | df_all["stock_code"].astype(str).str.contains(eff_kw, na=False)
+                df_all = df_all[mask]
+            if df_all.empty:
+                return (pd.DataFrame(columns=RESULT_COLUMNS), target_date)
         if "stock_name" not in df_all.columns:
             df_all["stock_name"] = ""
 
@@ -271,10 +337,20 @@ class ThemeAlphaStrategy:
             )
 
             if cond_trend and cond_volume and cond_macd_buy and cond_kdj_buy:
+                boards = get_stock_boards(code)
+                if eff_kw and boards:
+                    tag_show = "、".join(
+                        b for b in boards if eff_kw in b or b in eff_kw or b == eff_kw
+                    ) or (boards[0] if boards else eff_kw)
+                elif boards:
+                    tag_show = "、".join(boards[:3])
+                else:
+                    tag_show = eff_kw or "—"
                 result_rows.append(
                     {
                         "股票代码": code,
                         "股票名称": name,
+                        "题材标签": tag_show,
                         "最新价格": f"{c_close:.2f} 元",
                         "当前量比": f"{vr5:.2f} 倍",
                         "KDJ_J值": round(j_now, 2),

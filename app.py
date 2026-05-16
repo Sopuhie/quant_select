@@ -53,6 +53,7 @@ from src.config_manager import config_manager
 from src.database import (
     get_connection,
     init_db,
+    sync_concept_boards_from_json,
     insert_system_log,
     query_df,
 )
@@ -154,6 +155,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 init_db()
+sync_concept_boards_from_json()
 
 # 后台定时任务：每个交易日 SCHEDULER_RUN_AT（默认 20:00，环境变量 QUANT_SCHEDULER_TIME=HH:MM）跑全套 Pipeline
 if os.environ.get("QUANT_DISABLE_BACKGROUND_SCHEDULER", "").strip().lower() not in (
@@ -1427,50 +1429,84 @@ with tab_theme:
         "阈值见 config.py 中 THEME_*、MIN_HISTORY_BARS；沪深300 环境分低于 60 时本日结果为空。"
     )
 
-    # --- 状态机安全初始化 ---
-    if "clicked_theme_tag" not in st.session_state:
-        st.session_state.clicked_theme_tag = ""
+    from src.board_stocks import load_board_mapping
+    from src.concept_board_sync import ensure_hot_sectors_for_trade_date
+    from src.hot_sectors import load_hot_sectors_meta, load_tags
+
+    _THEME_ALL_LABEL = "全市场（不限题材）"
+
+    @st.cache_data(ttl=3600, show_spinner="正在同步东方财富热门题材与成份股…")
+    def _cached_theme_board_setup(_trade_date: str) -> dict:
+        return ensure_hot_sectors_for_trade_date(
+            _trade_date,
+            sync_constituents=True,
+            force_refresh=False,
+            verbose=False,
+        )
+
+    with get_connection(DB_PATH) as _conn:
+        _td_row = _conn.execute(
+            "SELECT MAX(date) FROM stock_daily_kline"
+        ).fetchone()
+    _theme_trade_date = (
+        str(_td_row[0]).strip()[:10] if _td_row and _td_row[0] else ""
+    )
+    _theme_setup = (
+        _cached_theme_board_setup(_theme_trade_date)
+        if _theme_trade_date
+        else {}
+    )
+    hot_tags = list(_theme_setup.get("tags") or load_tags())
+    _theme_meta = load_hot_sectors_meta()
+    _board_map_n = len(load_board_mapping())
+    _tags_date = str(_theme_meta.get("date", "")).strip()[:10]
+
+    st.caption(
+        f"热点题材交易日：{_tags_date or '—'} · 已标注成份股 {_board_map_n} 只"
+        + (
+            f"（本页已刷新 {int(_theme_setup.get('boards_synced', 0))} 个板块成份）"
+            if _theme_setup.get("boards_synced")
+            else ""
+        )
+        + (
+            f" · 同步提示：{_theme_setup['error']}"
+            if _theme_setup.get("error")
+            else ""
+        )
+    )
+
+    _theme_options = [_THEME_ALL_LABEL] + list(hot_tags)
+
     if "theme_keyword_input_field" not in st.session_state:
         st.session_state.theme_keyword_input_field = ""
 
-    st.markdown("##### 🏷️ 今日全市场焦点题材推荐")
-
-    hot_tags = ["科技", "新能源", "电力"]
-
-    tag_cols = st.columns(len(hot_tags) + 1)
-
-    with tag_cols[0]:
-        st.markdown(
-            "<p style='margin-top:5px; font-size:0.85rem; color:#64748b; font-weight:bold;'>点击快筛:</p>",
-            unsafe_allow_html=True,
+    def _sync_theme_keyword_from_select() -> None:
+        sel = st.session_state.get("theme_focus_select", _THEME_ALL_LABEL)
+        st.session_state.theme_keyword_input_field = (
+            "" if sel == _THEME_ALL_LABEL else str(sel)
         )
 
-    for idx, tag in enumerate(hot_tags):
-        with tag_cols[idx + 1]:
-            if st.button(
-                f"✨ {tag}",
-                key=f"theme_tag_{tag}",
-                use_container_width=True,
-            ):
-                st.session_state.clicked_theme_tag = tag
-                st.session_state.theme_keyword_input_field = tag
-
-    st.markdown(
-        "<div style='margin-top: 10px;'></div>",
-        unsafe_allow_html=True,
+    st.markdown("##### 🏷️ 今日全市场焦点题材推荐（东方财富概念涨幅榜）")
+    st.selectbox(
+        "从热点题材中选择",
+        options=_theme_options,
+        index=0,
+        key="theme_focus_select",
+        help="每个交易日从东方财富概念板块行情刷新；选中后自动填入下方「题材核心关键词」。",
+        on_change=_sync_theme_keyword_from_select,
     )
 
-    # 绑定点击值到输入框
-    keyword_default = st.session_state.clicked_theme_tag
+    _sel_now = st.session_state.get("theme_focus_select", _THEME_ALL_LABEL)
+    if _sel_now != _THEME_ALL_LABEL and not st.session_state.get(
+        "theme_keyword_input_field", ""
+    ).strip():
+        st.session_state.theme_keyword_input_field = str(_sel_now)
+
     keyword = st.text_input(
-        "💡 输入题材核心关键词/板块名称进行实时过滤 (留空代表扫描全市场)",
-        value=keyword_default,
-        placeholder="例如: 电力、科技、新能源...",
+        "💡 题材核心关键词（下拉选择会自动填入，也可手动修改；留空代表扫描全市场）",
+        placeholder="例如: 人形机器人、PLC概念…",
         key="theme_keyword_input_field",
     )
-
-    if keyword != st.session_state.clicked_theme_tag:
-        st.session_state.clicked_theme_tag = keyword
 
     col_run_left, col_run_right = st.columns([4, 1])
     with col_run_left:
@@ -1481,9 +1517,21 @@ with tab_theme:
         )
     with col_run_right:
         if st.button("🔄 清空条件", use_container_width=True):
-            st.session_state.clicked_theme_tag = ""
             st.session_state.theme_keyword_input_field = ""
+            st.session_state.theme_focus_select = _THEME_ALL_LABEL
             st.rerun()
+
+    if st.button("♻️ 立即刷新热点题材与成份股", key="refresh_theme_em"):
+        _cached_theme_board_setup.clear()
+        with st.spinner("正在从东方财富拉取最新热门概念及成份股…"):
+            ensure_hot_sectors_for_trade_date(
+                _theme_trade_date or None,
+                sync_constituents=True,
+                force_refresh=True,
+                verbose=False,
+            )
+            sync_concept_boards_from_json()
+        st.rerun()
 
     if run_theme_btn:
         with st.spinner("正在抽取两市时序信号矩阵流并比对状态交叉节点..."):
@@ -1503,7 +1551,7 @@ with tab_theme:
                 elif theme_df.empty:
                     if keyword.strip():
                         st.info(
-                            f"📅 交易日 {scanned_date} 在名称/代码匹配「{keyword.strip()}」下暂无共振信号（或大盘环境分未过线）。"
+                            f"📅 交易日 {scanned_date} 在题材标签/成份股匹配「{keyword.strip()}」下暂无共振信号（或大盘环境分未过线）。"
                         )
                     else:
                         st.info(

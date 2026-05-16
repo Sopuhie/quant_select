@@ -168,6 +168,15 @@ CREATE TABLE IF NOT EXISTS signal_history (
 CREATE INDEX IF NOT EXISTS idx_signal_code_time ON signal_history(stock_code, signal_time);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_dedup_minute
     ON signal_history(stock_code, signal_time, signal_type);
+
+CREATE TABLE IF NOT EXISTS stock_concept_boards (
+    stock_code TEXT NOT NULL,
+    board_name TEXT NOT NULL,
+    updated_date TEXT NOT NULL,
+    PRIMARY KEY (stock_code, board_name)
+);
+CREATE INDEX IF NOT EXISTS idx_scb_board ON stock_concept_boards(board_name);
+CREATE INDEX IF NOT EXISTS idx_scb_date ON stock_concept_boards(updated_date);
 """
 
 
@@ -223,6 +232,14 @@ def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN market_cap REAL")
 
 
+def _ensure_stock_concept_boards(conn):
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_concept_boards'")
+    if cur.fetchone() is None:
+        conn.execute("CREATE TABLE IF NOT EXISTS stock_concept_boards (stock_code TEXT NOT NULL, board_name TEXT NOT NULL, updated_date TEXT NOT NULL, PRIMARY KEY (stock_code, board_name))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_scb_board ON stock_concept_boards(board_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_scb_date ON stock_concept_boards(updated_date)")
+
+
 def init_db(db_path: Path | None = None) -> None:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +250,7 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_stock_daily_kline_industry(conn)
         _ensure_stock_daily_kline_market_cap(conn)
         _ensure_daily_selections_selection_reason(conn)
+        _ensure_stock_concept_boards(conn)
         conn.commit()
     finally:
         conn.close()
@@ -1249,3 +1267,70 @@ def upsert_stock_north_hold_rows(
             )
 
     _retry_sqlite_locked(_do, attempts=5)
+
+
+def sync_concept_boards_from_json(db_path=None) -> int:
+    import json
+    from datetime import datetime
+    from .config import DATA_DIR
+
+    json_path = DATA_DIR / "board_stocks.json"
+    if not json_path.exists():
+        return 0
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    stock_to_boards = data.get("stock_to_boards", {})
+    if not stock_to_boards:
+        return 0
+    path = db_path or DB_PATH
+    if not path.parent.exists():
+        return 0
+    init_db(path)
+    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    today = datetime.now().strftime("%Y-%m-%d")
+    inserted = 0
+    try:
+        conn.execute("BEGIN")
+        for code, boards in stock_to_boards.items():
+            code6 = str(code).strip().zfill(6)
+            for board in boards:
+                conn.execute(
+                    "INSERT OR REPLACE INTO stock_concept_boards"
+                    "(stock_code, board_name, updated_date)"
+                    "VALUES (?, ?, ?)",
+                    (code6, str(board).strip(), today),
+                )
+                inserted += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return inserted
+
+
+def fetch_concept_boards_by_stock(stock_code: str, db_path=None) -> list[str]:
+    init_db(db_path)
+    conn = sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        cur = conn.execute(
+            "SELECT DISTINCT board_name FROM stock_concept_boards WHERE stock_code = ?",
+            (str(stock_code).zfill(6),),
+        )
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def fetch_stocks_by_concept_board(board_name: str, db_path=None) -> list[str]:
+    init_db(db_path)
+    conn = sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        cur = conn.execute(
+            "SELECT DISTINCT stock_code FROM stock_concept_boards WHERE board_name = ?",
+            (str(board_name),),
+        )
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
