@@ -13,6 +13,7 @@ Streamlit 复盘与全功能控制台（浅色清晰主题）。
 """
 from __future__ import annotations
 
+import gc
 import html
 import io
 import json
@@ -600,6 +601,11 @@ def render_realtime_monitor_panel(panel: dict[str, Any], *, in_session: bool) ->
             height=240,
         )
 
+        if fig is not None:
+            del fig
+        del sig_df
+        gc.collect()
+
 
 def _pattern_range_from_plotly_state(
     state: object,
@@ -744,6 +750,8 @@ with tab_today:
                 else:
                     for panel in panels:
                         render_realtime_monitor_panel(panel, in_session=in_session)
+                    del panels
+                    gc.collect()
 
         if not t3.empty and st.session_state.selected_stock:
             st.markdown("---")

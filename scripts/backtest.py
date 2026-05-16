@@ -557,7 +557,7 @@ def _score_universe_for_date(
     feat_df = feat_df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLUMNS)
     if feat_df.empty:
         return []
-    X = feat_df[FEATURE_COLUMNS].astype(np.float64)
+    X = feat_df[list(FEATURE_COLUMNS)].astype(np.float64)
     assert_feature_matrix_matches_rankers(
         X,
         lgb_model=lgb_model,

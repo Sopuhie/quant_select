@@ -447,7 +447,7 @@ def predict_daily(
         sys.exit(1)
 
     # 6. LightGBM + XGBoost (+CatBoost) 融合；融合路径写入 system_logs
-    X = filtered_df[FEATURE_COLUMNS].astype(np.float64)
+    X = filtered_df[list(FEATURE_COLUMNS)].astype(np.float64)
     assert_feature_matrix_matches_rankers(
         X,
         lgb_model=lgb_model,

@@ -297,7 +297,7 @@ def train_catboost_ranker_optional(
       失败则回退 CPU；``oof_worker=True`` 时强制 CPU（避免多进程 OOF 争用同一块 GPU）。
     - CPU 训练加速：``QUANT_CATBOOST_SPEEDOPT=1`` 时使用 ``Plain`` / ``rsm`` / 较低 ``border_count``。
     """
-    cols = feature_cols or list(FEATURE_COLUMNS)
+    cols = list(feature_cols or FEATURE_COLUMNS)
     try:
         from catboost import CatBoostRanker, Pool  # type: ignore[import-untyped]
     except Exception as exc:
@@ -309,6 +309,9 @@ def train_catboost_ranker_optional(
     y_tr = pd.to_numeric(tr[label_col], errors="coerce")
     X_va = va[cols].apply(pd.to_numeric, errors="coerce")
     y_va = pd.to_numeric(va[label_col], errors="coerce")
+    # CatBoost C++ 按物理列序对齐，须与 FEATURE_COLUMNS 顺序完全一致
+    X_tr = X_tr[cols]
+    X_va = X_va[cols]
     mt = np.isfinite(X_tr.to_numpy()).all(axis=1) & np.isfinite(y_tr.to_numpy())
     mv = np.isfinite(X_va.to_numpy()).all(axis=1) & np.isfinite(y_va.to_numpy())
     tr = tr.loc[mt].reset_index(drop=True)
@@ -599,6 +602,7 @@ def walkforward_oof_base_predictions(
         w_te = work.loc[m_te].copy()
         pos = w_te.index.to_numpy()
         X_te = w_te[cols].apply(pd.to_numeric, errors="coerce")
+        X_te = X_te[cols]
         raw_tasks.append(
             (
                 tr_i,
@@ -1299,9 +1303,10 @@ def _prepare_rank_xy(
     feature_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     """与 ``train_lgbm_ranker`` 相同的排序与有限值过滤，供 PSI / Stacking 复用。"""
-    cols = feature_cols or list(FEATURE_COLUMNS)
+    cols = list(feature_cols or FEATURE_COLUMNS)
     tr = prepare_ranking_frame(df, date_col)
     X = tr[cols].apply(pd.to_numeric, errors="coerce")
+    X = X[cols]
     y = pd.to_numeric(tr["label_ret"], errors="coerce")
     m = np.isfinite(X.to_numpy()).all(axis=1) & np.isfinite(y.to_numpy())
     tr = tr.loc[m].reset_index(drop=True)

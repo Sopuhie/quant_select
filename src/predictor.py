@@ -704,7 +704,7 @@ def predict_universe_scores(
         raise RuntimeError("经 ST/涨跌停过滤后无可用股票，请检查股票池或关闭部分过滤开关。")
 
     cat_model = load_catboost_ranker_optional()
-    X = feat_df[FEATURE_COLUMNS].astype(np.float64)
+    X = feat_df[list(FEATURE_COLUMNS)].astype(np.float64)
     assert_feature_matrix_matches_rankers(
         X,
         lgb_model=lgb_model,
@@ -1084,10 +1084,18 @@ def diagnose_single_stock(
         _hsgt_df["trade_date"] = td
         _hsgt_df = attach_hsgt_flow_interact(_hsgt_df, date_col="trade_date")
         feat_map = {c: float(_hsgt_df.iloc[0][c]) for c in FEATURE_COLUMNS}
-    X = pd.DataFrame([[feat_map[c] for c in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
+    X = pd.DataFrame([[feat_map[c] for c in FEATURE_COLUMNS]], columns=list(FEATURE_COLUMNS))
+    X = X[list(FEATURE_COLUMNS)]
+    cat_model = load_catboost_ranker_optional()
+    assert_feature_matrix_matches_rankers(
+        X,
+        lgb_model=lgb_model,
+        xgb_model=xgb_model,
+        cat_model=cat_model,
+        context="单股诊断",
+    )
     lgb_scores = lgb_model.predict(X)
     xgb_scores = xgb_model.predict(X) if xgb_model is not None else None
-    cat_model = load_catboost_ranker_optional()
     cat_scores = cat_model.predict(X) if cat_model is not None else None
     blended = float(
         np.asarray(

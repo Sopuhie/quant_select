@@ -355,6 +355,8 @@ def draw_candlestick(df, stock_code, stock_name):
 
     fig.update_xaxes(
         type="category",
+        tickangle=-45,
+        nticks=20,
         showgrid=False,
         linecolor=color_grid,
         tickfont=dict(color="#475569"),
@@ -364,6 +366,8 @@ def draw_candlestick(df, stock_code, stock_name):
     )
     fig.update_xaxes(
         type="category",
+        tickangle=-45,
+        nticks=20,
         showgrid=False,
         linecolor=color_grid,
         tickfont=dict(color="#475569"),

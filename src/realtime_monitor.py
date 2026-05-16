@@ -187,6 +187,8 @@ def fetch_today_minute_bars(stock_code: str) -> pd.DataFrame | None:
     raw = get_realtime_min_data(stock_code)
     if raw is None or raw.empty:
         return None
+    # 仅保留当天开盘以来的分钟线（或最多保留最近 240 个分钟节点）
+    raw = raw.tail(240).reset_index(drop=True)
     rename_extra = {}
     for c in raw.columns:
         sc = str(c)
