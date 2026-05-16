@@ -360,6 +360,42 @@ def persist_signals_for_stock(
     return written
 
 
+
+def _push_signal_to_dingtalk(
+    stock_code: str, stock_name: str,
+    signals: list[dict[str, Any]],
+    score: float | None,
+) -> None:
+    """Push buy signal alert to DingTalk."""
+    buy_sigs = [s for s in signals if str(s.get("signal_type", "")).upper() == "BUY"]
+    if not buy_sigs:
+        return
+    from .config_manager import config_manager
+    from .dingtalk_notifier import DingTalkNotifier
+    config_manager.reload()
+    wh = config_manager.get_dingtalk_webhook_url()
+    if not wh:
+        return
+    try:
+        notifier = DingTalkNotifier(wh, config_manager.get_dingtalk_secret() or None)
+    except Exception:
+        return
+    code = str(stock_code).zfill(6)
+    name = str(stock_name)
+    now_s = time.strftime("%H:%M:%S")
+    lines = [f"## 🟢 买入信号\n\n**{name}** ({code})\n\n"]
+    for s in buy_sigs:
+        price = s.get("signal_price", "?")
+        reason = str(s.get("reason", "")).strip()
+        t = str(s.get("signal_time", ""))
+        lines.append(f"- ⏱ {t}  |  💰 {price}  |  {reason}\n")
+    if score is not None:
+        lines.append(f"\n📊 量化评分: {score:.1f}\n")
+    lines.append("\n⚠️ 信号仅供参考，不构成投资建议")
+    text = "".join(lines)
+    notifier.send_markdown(f"买入信号 {name}", text)
+
+
 def run_monitor_cycle_for_targets(
     targets: list[dict[str, Any]],
     *,
@@ -416,7 +452,9 @@ def run_monitor_cycle_for_targets(
             continue
         new_sigs = detect_intraday_signals(df)
         if persist and new_sigs:
-            persist_signals_for_stock(code, name, new_sigs, realtime_score=rt_score)
+            n_written = persist_signals_for_stock(code, name, new_sigs, realtime_score=rt_score)
+            if n_written > 0:
+                _push_signal_to_dingtalk(code, name, new_sigs, rt_score)
         today_sigs = fetch_signal_history_for_stock_on_date(code)
         last = df.iloc[-1]
         open_px = float(df["open"].iloc[0])
@@ -496,7 +534,8 @@ def build_intraday_dashboard_figure(
     times = df["time"].dt.strftime("%H:%M").tolist()
     close = df["close"].astype(float)
     open_px = df["open"].astype(float) if "open" in df.columns else close.shift(1).fillna(close)
-    vol = df["volume"].astype(float)
+    vol_raw = df["volume"].astype(float)
+    vol = vol_raw.diff().fillna(vol_raw.iloc[0])  # per-minute volume
     vwap = df["vwap"].astype(float)
     k_s = df["k"].astype(float)
     d_s = df["d"].astype(float)
@@ -511,13 +550,33 @@ def build_intraday_dashboard_figure(
 
     buy_td, sell_td = compute_td_sequential_labels(close.to_numpy(dtype=float))
 
+    prev_close = panel.get("prev_close")
+    if prev_close is None:
+        c4 = str(panel.get("stock_code", "")).zfill(6)
+        try:
+            from .database import fetch_stock_daily_bars_until
+            dd = fetch_stock_daily_bars_until(c4, datetime.now().strftime("%Y-%m-%d"))
+            if dd is not None and len(dd) >= 2:
+                prev_close = float(dd.iloc[-2]["close"])
+        except Exception:
+            prev_close = None
+    if prev_close is None or prev_close <= 0:
+        prev_close = float(close.iloc[0])
+    cum_amt = (close * vol).cumsum()
+    cum_vol = vol.cumsum().replace(0, float("nan"))
+    avg_line = (cum_amt / cum_vol).ffill().bfill()
+    pct_from_pc = (close - prev_close) / prev_close * 100.0
+    pct_rng = max(abs(float(pct_from_pc.min())), abs(float(pct_from_pc.max()))) * 1.15
+    pct_rng = max(pct_rng, 1.5)
+
     fig = make_subplots(
         rows=3,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.05,
         row_heights=[0.5, 0.22, 0.28],
-        subplot_titles=("分时（九转）", "成交量", "KDJ"),
+        subplot_titles=("分时图", "成交量", "KDJ"),
+        specs=[[{"secondary_y": True}], [{}], [{}]]
     )
 
     fig.add_trace(
@@ -525,8 +584,10 @@ def build_intraday_dashboard_figure(
             x=times,
             y=close,
             mode="lines",
-            name="分时",
+            name="价格",
             line=dict(color=line_color, width=2.2),
+            customdata=pct_from_pc,
+            hovertemplate="%{x}<br>价格: %{y:.2f}<br>涨跌: %{customdata:+.2f}%<extra></extra>",
         ),
         row=1,
         col=1,
@@ -534,13 +595,33 @@ def build_intraday_dashboard_figure(
     fig.add_trace(
         go.Scatter(
             x=times,
-            y=vwap,
+            y=avg_line,
             mode="lines",
-            name="VWAP",
-            line=dict(color="#0d9488", width=1.6, dash="dash"),
+            name="均线",
+            line=dict(color="#f59e0b", width=1.3),
+            hoverinfo="skip",
         ),
         row=1,
         col=1,
+    )
+
+    fig.add_hline(
+        y=prev_close,
+        line=dict(color="#94a3b8", width=1, dash="dash"),
+        row=1, col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[times[0], times[-1]],
+            y=[prev_close, prev_close],
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip",
+        ),
+        row=1, col=1,
+        secondary_y=True,
     )
 
     bx_buy, by_buy, bt_buy = [], [], []
@@ -675,6 +756,20 @@ def build_intraday_dashboard_figure(
             row=ri,
             col=1,
         )
+    fig.update_yaxes(
+        title_text="%",
+        range=[-pct_rng, pct_rng],
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor="#94a3b8",
+        zerolinewidth=1,
+        tickformat="+.2f",
+        ticksuffix="%",
+        dtick=pct_rng / 4,
+        tickfont=dict(size=9, color="#64748b"),
+        row=1, col=1,
+        secondary_y=True,
+    )
     fig.update_xaxes(showticklabels=True, row=3, col=1)
     return fig
 
