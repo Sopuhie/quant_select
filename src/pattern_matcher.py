@@ -36,6 +36,31 @@ def _row_minmax_norm(X: np.ndarray) -> np.ndarray:
     return out
 
 
+def _safe_vstack_rows(blocks: list[np.ndarray], *, expected_len: int | None = None) -> np.ndarray | None:
+    """
+    将等长一维序列堆叠为矩阵；空列表、不规则长度或 vstack 失败时返回 ``None``，
+    避免 ``ValueError: need at least one array to stack`` 导致全页崩溃。
+    """
+    if not blocks:
+        return None
+    cleaned: list[np.ndarray] = []
+    for b in blocks:
+        if b is None:
+            continue
+        arr = np.asarray(b, dtype=np.float64).ravel()
+        if arr.size == 0 or not np.all(np.isfinite(arr)):
+            continue
+        if expected_len is not None and arr.shape[0] != int(expected_len):
+            continue
+        cleaned.append(arr)
+    if not cleaned:
+        return None
+    try:
+        return np.vstack(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
 DEFAULT_DTW_SAKOE_CHIBA_RADIUS = 12
 
 
@@ -243,8 +268,19 @@ def find_similar_patterns(
     if not raw_blocks:
         return []
 
-    X_raw = np.vstack(raw_blocks)
-    X_vol_raw = np.vstack(raw_vol_blocks)
+    X_raw = _safe_vstack_rows(raw_blocks, expected_len=window_size)
+    X_vol_raw = _safe_vstack_rows(raw_vol_blocks, expected_len=window_size)
+    if X_raw is None or X_vol_raw is None:
+        return []
+    if X_raw.shape[0] != X_vol_raw.shape[0]:
+        n = min(X_raw.shape[0], X_vol_raw.shape[0])
+        X_raw = X_raw[:n]
+        X_vol_raw = X_vol_raw[:n]
+        stock_codes = stock_codes[:n]
+        stock_names = stock_names[:n]
+        dates_blocks = dates_blocks[:n]
+        raw_price_blocks = raw_price_blocks[:n]
+
     X_norm = _row_minmax_norm(X_raw)
     X_vol_norm = _row_minmax_norm(X_vol_raw)
     ref = np.asarray(target_series, dtype=np.float64)

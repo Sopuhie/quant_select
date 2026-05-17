@@ -20,6 +20,8 @@
   - 换仓时计入 **单边佣金**（默认万三）与 **卖出印花税**（默认千一），以及 **滑点**（默认见 ``config.py`` 的 ``BACKTEST_DEFAULT_SLIPPAGE_RATE`` / ``quant.backtest.slippage_rate``，可用 ``--slippage-rate`` 覆盖）。
   - **大盘择时熔断**（与 ``run_daily.py`` 一致）：逐日用 ``compute_market_regime_score`` 判断沪深300环境分；
     低于 ``MARKET_REGIME_MIN_SCORE``（默认 60）当日强制空仓、当日收益率为 0、不计佣金/印花税/滑点。
+  - **熔断复苏换仓**：环境分重新回到安全线以上的首个交易日，不受 ``holding_days`` 周期约束，
+    立即执行一轮 LTR 打分换仓，避免解除熔断后踏空至下一调仓日。
 """
 from __future__ import annotations
 
@@ -747,6 +749,7 @@ class BacktestEngine:
 
     cash: float = field(init=False)
     regime_fuse_days: int = field(default=0, init=False)
+    regime_recovery_rebalances: int = field(default=0, init=False)
     date_pos: dict[str, dict[str, int]] = field(default_factory=dict)
     by_code: dict[str, pd.DataFrame] = field(default_factory=dict)
     positions: list[HeldShare] = field(default_factory=list)
@@ -805,6 +808,8 @@ class BacktestEngine:
 
         **大盘风控卡口（循环体最前端）**：每个 ``trade_date`` 先算环境分；
         低于 ``regime_min_score``（默认 60）则熔断空仓并 ``continue``，跳过一切换仓摩擦。
+
+        **熔断复苏**：``need_rebalance_after_fuse`` 在解除熔断的首个交易日强制换仓（对齐实盘每日选股）。
         """
         self.by_code = {
             c: g.reset_index(drop=True)
@@ -819,6 +824,8 @@ class BacktestEngine:
         hd = max(1, int(self.holding_days))
         regime_min = int(self.regime_min_score)
         self.regime_fuse_days = 0
+        self.regime_recovery_rebalances = 0
+        need_rebalance_after_fuse = False
 
         for i, d in enumerate(self.trade_dates):
             # --- 大盘风控熔断卡口（必须在换仓/打分之前，与 run_daily 强一致）---
@@ -840,11 +847,22 @@ class BacktestEngine:
                         flush=True,
                     )
                 self._apply_market_regime_fuse_day(d, regime_score)
+                need_rebalance_after_fuse = True
                 continue
 
-            # 每 holding_days 个交易日全额换仓：T-1 收盘后信号 → T 日开盘先卖清再等额买入 TopN
-            if i >= 1 and (i - 1) % hd == 0:
-                sig_date = self.trade_dates[i - 1]
+            # 常规调仓日（T-1 信号 → T 开盘）或熔断解除后首个安全日立即补仓
+            is_scheduled_rebalance = i >= 1 and (i - 1) % hd == 0
+            if is_scheduled_rebalance or need_rebalance_after_fuse:
+                if need_rebalance_after_fuse:
+                    print(
+                        f"[熔断复苏换仓] {d} 环境分 {regime_score} ≥ {regime_min}，"
+                        "脱离熔断后首个安全交易日，立即执行 LTR 打分换仓建仓",
+                        flush=True,
+                    )
+                    need_rebalance_after_fuse = False
+                    self.regime_recovery_rebalances += 1
+
+                sig_date = self.trade_dates[i - 1] if i >= 1 else d
                 self._sell_all_open(d)
                 univ = self.get_universe(sig_date)
                 codes = _score_universe_for_date(
@@ -1366,6 +1384,11 @@ def main() -> None:
     if engine.regime_fuse_days > 0:
         print(
             f"回测期内大盘熔断空仓交易日: {engine.regime_fuse_days} 天",
+            flush=True,
+        )
+    if engine.regime_recovery_rebalances > 0:
+        print(
+            f"熔断解除后强制复苏换仓次数: {engine.regime_recovery_rebalances}",
             flush=True,
         )
 
