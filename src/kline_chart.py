@@ -611,10 +611,8 @@ def draw_tonghuashun_intraday(
     pct_y = (close - prev_close) / prev_close * 100.0
     pct_latest = (latest_price - prev_close) / prev_close * 100.0
 
-    theme_color = "#FF3333" if pct_latest >= 0 else "#00CC66"
-    fill_color = (
-        "rgba(255, 51, 51, 0.06)" if pct_latest >= 0 else "rgba(0, 204, 102, 0.06)"
-    )
+    theme_color = ASHARE_COLOR_UP if pct_latest >= 0 else ASHARE_COLOR_DOWN
+    fill_color = ASHARE_FILL_UP if pct_latest >= 0 else ASHARE_FILL_DOWN
 
     code_s = str(stock_code).strip().zfill(6)
     name_s = str(stock_name).strip()

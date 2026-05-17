@@ -28,12 +28,9 @@ MIN_INDUSTRY_GROUP_SIZE = 5
 MIN_SIZE_NEUTRAL_GROUP = 5
 
 SIZE_FACTOR_COL = "factor_size_mcap"
-HSGT_FLOW_INTERACT_COL = "factor_hsgt_flow_interact"
 
 # 规模因子 log10(市值) 全为缺失时的兜底（约 log10(100 亿元) 量级，仅作回归自变量中轴）
 SIZE_MCAP_LOG_FALLBACK = 10.0
-# 北向交互因子全缺失时的安全中轴（与 attach 失败置 0 一致）
-HSGT_FLOW_INTERACT_SAFE_CENTER = 0.0
 
 # 训练 / 推理共用：缺失或非字符串行业统一为该标签，便于行业内截面标准化成组
 DEFAULT_INDUSTRY_LABEL = "未知行业"
@@ -120,27 +117,6 @@ def assign_factor_size_mcap_from_mcap(feat_df: pd.DataFrame) -> pd.DataFrame:
     elif SIZE_FACTOR_COL not in out.columns:
         out[SIZE_FACTOR_COL] = np.nan
     return out
-
-
-def coerce_hsgt_flow_interact_finite(
-    feat_df: pd.DataFrame,
-    *,
-    col: str = HSGT_FLOW_INTERACT_COL,
-) -> pd.DataFrame:
-    """
-    北向交互 ``zv * r5`` 后的数值有限性强转：NaN/Inf 收敛为 0，防止诊股/截面打分爆破。
-    """
-    if feat_df.empty or col not in feat_df.columns:
-        return feat_df
-    out = feat_df.copy()
-    out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
-    vals = out[col].to_numpy(dtype=float)
-    out[col] = np.where(np.isfinite(vals), vals, 0.0)
-    return out
-
-
-# 兼容旧调用名
-sanitize_hsgt_flow_interact_column = coerce_hsgt_flow_interact_finite
 
 
 def sanitize_factor_size_mcap_column(feat_df: pd.DataFrame) -> pd.DataFrame:
@@ -273,72 +249,6 @@ def _roll_ewm_blend(s: pd.Series, window: int) -> pd.Series:
     return (1.0 - b) * roll + b * ewm
 
 
-def build_hsgt_net_zscore_by_trade_date(
-    dates: list[str],
-) -> dict[str, float]:
-    """
-    北向资金净流入（全市场日频）按日期映射为 Z-score；用于 ``factor_hsgt_flow_interact``。
-    仅从本地 SQLite ``market_hsgt_flow_daily`` 读取（网络同步见 ``market_hsgt_sync`` / 数据脚本）。
-    对每个交易日 T，仅用 T 及此前历史做累积均值/标准差，避免混入未来北向数据。
-    无本地数据时返回空字典（调用方填 0）。
-    """
-    if not dates:
-        return {}
-    ds = sorted({str(d).strip()[:10] for d in dates if d})
-    if not ds:
-        return {}
-    ds_set = set(ds)
-    try:
-        from .database import fetch_market_hsgt_net_flow_up_to
-
-        flow = fetch_market_hsgt_net_flow_up_to(ds[-1])
-    except Exception:
-        return {}
-    if not flow:
-        return {}
-    _std_eps = 1e-6
-    flow_df = pd.DataFrame(
-        sorted((str(k)[:10], float(v)) for k, v in flow.items()),
-        columns=["date", "net_inflow"],
-    )
-    mu = flow_df["net_inflow"].expanding(min_periods=1).mean()
-    sig = flow_df["net_inflow"].expanding(min_periods=2).std(ddof=1)
-    sig_safe = sig.clip(lower=_std_eps)
-    z = (flow_df["net_inflow"] - mu) / sig_safe
-    z = z.where(sig.notna(), 0.0)
-    z = z.where(np.isfinite(z), np.nan)
-    flow_df["z"] = z
-    sub = flow_df.loc[flow_df["date"].isin(ds_set), ["date", "z"]].dropna(subset=["z"])
-    if sub.empty:
-        return {}
-    return dict(zip(sub["date"].tolist(), sub["z"].astype(float).tolist()))
-
-
-def attach_hsgt_flow_interact(
-    panel: pd.DataFrame,
-    *,
-    date_col: str = "date",
-    ret_col: str = "factor_return_5d",
-    out_col: str = "factor_hsgt_flow_interact",
-) -> pd.DataFrame:
-    """按 ``date_col`` 将北向 Z 与 ``ret_col`` 相乘写入 ``out_col``；失败则置 0。"""
-    if panel.empty or date_col not in panel.columns:
-        return panel
-    work = panel.copy()
-    if ret_col not in work.columns:
-        work[out_col] = 0.0
-        return work
-    dates = work[date_col].astype(str).str[:10].tolist()
-    zmap = build_hsgt_net_zscore_by_trade_date(dates)
-    if not zmap:
-        work[out_col] = 0.0
-        return work
-    zv = work[date_col].astype(str).str[:10].map(zmap).astype(float)
-    r = pd.to_numeric(work[ret_col], errors="coerce").astype(float)
-    work[out_col] = zv * r
-    return coerce_hsgt_flow_interact_finite(work, col=out_col)
-
-
 def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
     """
     在 ``clean_cross_sectional_features`` 之前：按原始 ``factor_return_5d``、
@@ -370,119 +280,27 @@ def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
         return feat_df
 
 
-def merge_incremental_db_features(
-    panel: pd.DataFrame,
-    *,
-    date_col: str = "date",
-) -> pd.DataFrame:
-    """
-    将 SQLite 增量表中的资金流 / 北向持股变化左连接进面板；无键则保留原列（通常为 OHLCV 代理或 0）。
-    """
-    if panel.empty or date_col not in panel.columns or "stock_code" not in panel.columns:
-        return panel
-    try:
-        from .database import fetch_auxiliary_feature_frames
-    except Exception:
-        return panel
-    work = panel.copy()
-    dates_u = sorted({str(d)[:10] for d in work[date_col].astype(str).tolist() if d})
-    codes_u = sorted({str(c).strip().zfill(6) for c in work["stock_code"].tolist() if c})
-    try:
-        from .auxiliary_ak_sync import maybe_autofill_auxiliary_from_env
-
-        maybe_autofill_auxiliary_from_env(dates_u, codes_u, verbose=True)
-    except Exception as exc:
-        print(f"[merge_incremental_db_features] 自动补全跳过: {exc}", flush=True)
-    mf, nh = fetch_auxiliary_feature_frames(dates_u, codes_u)
-    work["_k_date"] = work[date_col].astype(str).str[:10]
-    work["_k_code"] = work["stock_code"].astype(str).str.zfill(6)
-    if mf is not None and not mf.empty and "big_net_ratio" in mf.columns:
-        work = work.merge(
-            mf,
-            on=["_k_date", "_k_code"],
-            how="left",
-        )
-        bn = pd.to_numeric(work["big_net_ratio"], errors="coerce")
-        if "factor_big_order_net_ratio" in work.columns:
-            base = pd.to_numeric(work["factor_big_order_net_ratio"], errors="coerce")
-            work["factor_big_order_net_ratio"] = bn.where(bn.notna(), base).fillna(0.0)
-        else:
-            work["factor_big_order_net_ratio"] = bn.fillna(0.0)
-        work = work.drop(columns=["big_net_ratio"], errors="ignore")
-    if nh is not None and not nh.empty and "hold_pct_chg" in nh.columns:
-        work = work.merge(
-            nh,
-            on=["_k_date", "_k_code"],
-            how="left",
-        )
-        hc = pd.to_numeric(work["hold_pct_chg"], errors="coerce")
-        if "factor_north_hold_ratio_chg" in work.columns:
-            base = pd.to_numeric(work["factor_north_hold_ratio_chg"], errors="coerce")
-            work["factor_north_hold_ratio_chg"] = hc.where(hc.notna(), base).fillna(0.0)
-        else:
-            work["factor_north_hold_ratio_chg"] = hc.fillna(0.0)
-        drop_nh = [c for c in ("hold_pct_chg", "hold_pct") if c in work.columns]
-        if drop_nh:
-            work = work.drop(columns=drop_nh, errors="ignore")
-    return work.drop(columns=["_k_date", "_k_code"], errors="ignore")
-
-
-def enrich_factors_with_incremental_db(
-    factors: pd.DataFrame,
-    hist: pd.DataFrame,
-    *,
-    stock_code: str | None = None,
-) -> pd.DataFrame:
-    """
-    单股/小样本因子面板：将 SQLite 增量表中的大单净占比、北向持股变化左连接进因子列，
-    避免 ``compute_factors_for_history`` 中 OHLCV 代理或 0 占位与训练截面脱节。
-    """
-    if factors is None or factors.empty or hist is None or hist.empty:
-        return factors
-    code = str(stock_code or "").strip().zfill(6)
-    if len(code) != 6 and "stock_code" in hist.columns:
-        code = str(hist.iloc[-1]["stock_code"]).strip().zfill(6)
-    if len(code) != 6:
-        return factors
-    panel = factors.copy()
-    panel["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    panel["stock_code"] = code
-    panel = merge_incremental_db_features(panel, date_col="date")
-    cols = [c for c in FEATURE_COLUMNS if c in panel.columns]
-    if len(cols) != len(FEATURE_COLUMNS):
-        for c in FEATURE_COLUMNS:
-            if c not in panel.columns:
-                panel[c] = factors[c] if c in factors.columns else 0.0
-    return panel[FEATURE_COLUMNS]
-
-
 def prepare_ranking_cross_section_pipeline(
     feat_df: pd.DataFrame,
     *,
     date_col: str = "trade_date",
 ) -> pd.DataFrame:
     """
-    训练 / 预测 / 回测共用的截面排序特征管道：
-    北向交互 → 增量库特征合并 → 截面分组用 ``date`` → 前期涨幅抑制 →
-    对数市值 ``factor_size_mcap`` → **截面中位数兜底** → 行业截面清洗。
-
-    当 ``date_col="trade_date"`` 时，会临时构造 ``date`` 供 ``clean_cross_sectional_features`` 分组，
-    结束后删除 ``date``，保留 ``trade_date``。当 ``date_col="date"``（训练面板）时**保留** ``date``。
+    训练 / 预测 / 回测共用的截面排序特征管道（轻量化纯净版）：
+    仅处理 13 个纯技术面量价因子，彻底移除大单、北向、资金流等外部增量库合并与冗余查库动作。
     """
     if feat_df.empty:
         return feat_df
     w = feat_df.copy()
-    if HSGT_FLOW_INTERACT_COL in FEATURE_COLUMNS:
-        w = attach_hsgt_flow_interact(w, date_col=date_col)
-    if "factor_big_order_net_ratio" in FEATURE_COLUMNS or "factor_north_hold_ratio_chg" in FEATURE_COLUMNS:
-        w = merge_incremental_db_features(w, date_col=date_col)
+
     if "date" not in w.columns:
         w["date"] = w[date_col].astype(str).str[:10]
     else:
         w["date"] = w["date"].astype(str).str[:10]
+
     w = suppress_high_recent_gains(w)
     w = assign_factor_size_mcap_from_mcap(w)
-    # 全市场截面中位数兜底安全锁（行业/市值截面归一化之前；严格按量化柜台规范）
+
     if "factor_size_mcap" in w.columns:
         w["factor_size_mcap"] = pd.to_numeric(
             w["factor_size_mcap"], errors="coerce"
@@ -491,7 +309,9 @@ def prepare_ranking_cross_section_pipeline(
             if not w["factor_size_mcap"].isna().all()
             else 10.0
         )
+
     w = clean_cross_sectional_features(w)
+
     if str(date_col) != "date":
         w = w.drop(columns=["date"], errors="ignore")
     return w

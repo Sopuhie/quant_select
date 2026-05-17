@@ -33,7 +33,6 @@ from .data_fetcher import (
 )
 from .database import (
     delete_daily_outputs_for_trade_date,
-    fetch_auxiliary_feature_frames,
     fetch_latest_industry_by_codes,
     fetch_latest_market_cap_by_codes,
     fetch_stock_daily_bars_until,
@@ -47,12 +46,8 @@ from .database import (
 from .factor_calculator import (
     DEFAULT_INDUSTRY_LABEL,
     _roll_ewm_blend,
-    attach_hsgt_flow_interact,
-    build_hsgt_net_zscore_by_trade_date,
     compute_factors_for_history,
-    enrich_factors_with_incremental_db,
     normalize_industry_label,
-    coerce_hsgt_flow_interact_finite,
     prepare_ranking_cross_section_pipeline,
 )
 from .model_trainer import (
@@ -842,60 +837,6 @@ def prune_zero_volume_rows(feat_df: pd.DataFrame) -> pd.DataFrame:
     return feat_df[v > 0].reset_index(drop=True)
 
 
-def _overlay_auxiliary_features_for_diagnose_anchor(
-    factors: pd.DataFrame,
-    *,
-    stock_code: str,
-    trade_date: str,
-    row_index: int,
-) -> pd.DataFrame:
-    """
-    锚定交易日显式 merge SQLite 增量表（``stock_money_flow_daily`` / ``stock_north_hold_daily``），
-    覆盖 ``compute_factors_for_history`` 中的 OHLCV 代理 / 0 占位，消除单股诊断分布偏移。
-    """
-    if factors is None or factors.empty:
-        return factors
-    out = factors.copy()
-    code = str(stock_code).strip().zfill(6)
-    td = str(trade_date).strip()[:10]
-    ri = int(row_index)
-    if ri < 0 or ri >= len(out):
-        return out
-
-    mf, nh = fetch_auxiliary_feature_frames([td], [code])
-    if mf is not None and not mf.empty and "big_net_ratio" in mf.columns:
-        sub = mf[(mf["_k_code"] == code) & (mf["_k_date"] == td)]
-        if not sub.empty:
-            v = pd.to_numeric(sub["big_net_ratio"].iloc[0], errors="coerce")
-            if pd.notna(v) and np.isfinite(float(v)):
-                out.loc[ri, "factor_big_order_net_ratio"] = float(v)
-    if nh is not None and not nh.empty and "hold_pct_chg" in nh.columns:
-        sub = nh[(nh["_k_code"] == code) & (nh["_k_date"] == td)]
-        if not sub.empty:
-            v = pd.to_numeric(sub["hold_pct_chg"].iloc[0], errors="coerce")
-            if pd.notna(v) and np.isfinite(float(v)):
-                out.loc[ri, "factor_north_hold_ratio_chg"] = float(v)
-
-    zmap = build_hsgt_net_zscore_by_trade_date([td])
-    zv_raw = zmap.get(td)
-    try:
-        zv = float(zv_raw) if zv_raw is not None and np.isfinite(float(zv_raw)) else 0.0
-    except (TypeError, ValueError):
-        zv = 0.0
-    r5_s = pd.to_numeric(out.loc[ri, "factor_return_5d"], errors="coerce")
-    r5 = float(r5_s) if pd.notna(r5_s) and np.isfinite(float(r5_s)) else 0.0
-    out.loc[ri, "factor_hsgt_flow_interact"] = zv * r5
-    out["factor_hsgt_flow_interact"] = pd.to_numeric(
-        out["factor_hsgt_flow_interact"], errors="coerce"
-    ).fillna(0.0)
-    out["factor_hsgt_flow_interact"] = np.where(
-        np.isfinite(out["factor_hsgt_flow_interact"]),
-        out["factor_hsgt_flow_interact"],
-        0.0,
-    )
-    return out
-
-
 def _diagnose_features_via_ranking_pipeline(
     code6: str,
     trade_date: str,
@@ -903,8 +844,8 @@ def _diagnose_features_via_ranking_pipeline(
     df_hist: pd.DataFrame,
 ) -> dict[str, float] | None:
     """
-    全市场截面池不可用时的单股兜底：增量库 merge + ``prepare_ranking_cross_section_pipeline``，
-    与 ``run_daily`` 训练/推理管道对齐。
+    全市场截面池不可用时的单股兜底：``prepare_ranking_cross_section_pipeline``，
+    与 ``run_daily`` 训练/推理管道对齐（13 维纯技术因子）。
     """
     if factors is None or factors.empty or df_hist is None or df_hist.empty:
         return None
@@ -1010,8 +951,6 @@ def latest_feature_row(
     _ = stock_code
     code6 = str(stock_code).strip().zfill(6) if stock_code else ""
     fac = compute_factors_for_history(df)
-    if not fac.empty and len(code6) == 6:
-        fac = enrich_factors_with_incremental_db(fac, df, stock_code=code6)
     if fac.empty:
         return None
     last_idx = len(df) - 1
@@ -1499,27 +1438,11 @@ def diagnose_single_stock(
         )
 
     factors = compute_factors_for_history(df_hist)
-    factors = enrich_factors_with_incremental_db(factors, df_hist, stock_code=code6)
     if factors.empty:
         return None, "因子计算结果为空。", "error"
 
     last_i = len(df_hist) - 1
     td = str(df_hist.iloc[last_i]["date"]).strip()[:10]
-    factors = _overlay_auxiliary_features_for_diagnose_anchor(
-        factors,
-        stock_code=code6,
-        trade_date=td,
-        row_index=last_i,
-    )
-    if "factor_hsgt_flow_interact" in factors.columns:
-        factors["factor_hsgt_flow_interact"] = pd.to_numeric(
-            factors["factor_hsgt_flow_interact"], errors="coerce"
-        ).fillna(0.0)
-        factors["factor_hsgt_flow_interact"] = np.where(
-            np.isfinite(factors["factor_hsgt_flow_interact"]),
-            factors["factor_hsgt_flow_interact"],
-            0.0,
-        )
     last_row = factors.iloc[last_i]
     if last_row[list(FEATURE_COLUMNS)].isna().any():
         return None, "最新一日因子存在缺失，无法诊断。", "warning"
@@ -1574,19 +1497,19 @@ def diagnose_single_stock(
         if solo_map is not None:
             feat_map = solo_map
             feature_alignment_note = (
-                "全市场截面池不可用，已对该股单独执行增量库合并与截面清洗管道。"
+                "全市场截面池不可用，已对该股单独执行 13 维技术面截面清洗管道。"
             )
         else:
             _hints: dict[str, str] = {
-                "empty_universe": "本地可预测股票池为空；已合并增量库特征，但未完成截面清洗，融合分仅供参考。",
-                "no_factor_rows": "未能算出全市场因子行；已合并增量库特征，截面清洗未执行。",
-                "empty_after_prune": "剔除无量样本后池为空；已合并增量库特征，截面清洗未执行。",
-                "suppressed_or_missing": "该标的未进入当日全市场因子池；已合并增量库特征，截面清洗未执行。",
-                "missing_after_clean": "截面清洗后未找到该股行；已合并增量库特征，融合分仅供参考。",
+                "empty_universe": "本地可预测股票池为空；未完成截面清洗，融合分仅供参考。",
+                "no_factor_rows": "未能算出全市场因子行；截面清洗未执行。",
+                "empty_after_prune": "剔除无量样本后池为空；截面清洗未执行。",
+                "suppressed_or_missing": "该标的未进入当日全市场因子池；截面清洗未执行。",
+                "missing_after_clean": "截面清洗后未找到该股行；融合分仅供参考。",
             }
             feature_alignment_note = _hints.get(
                 cs_err or "",
-                "截面因子对齐失败；已合并 SQLite 增量库特征，未完成截面清洗。",
+                "截面因子对齐失败；未完成截面清洗。",
             )
     if cs_td and str(cs_td)[:10] != str(td)[:10]:
         extra = (
@@ -1657,16 +1580,6 @@ def diagnose_single_stock(
         return None, f"无法加载模型：{exc}", "error"
 
     xgb_model = load_xgb_ranker_optional()
-    # 全市场截面成功时，北向交互已在 ``_cross_section_features_for_diagnose`` 中与因子一并清洗，勿重复覆盖。
-    if cs_map is None:
-        _hsgt_df = pd.DataFrame([feat_map])
-        _hsgt_df["trade_date"] = td
-        _hsgt_df = attach_hsgt_flow_interact(_hsgt_df, date_col="trade_date")
-        _hsgt_df = coerce_hsgt_flow_interact_finite(_hsgt_df)
-        feat_map = {c: float(_hsgt_df.iloc[0][c]) for c in FEATURE_COLUMNS}
-    else:
-        _fm = coerce_hsgt_flow_interact_finite(pd.DataFrame([feat_map]))
-        feat_map = {c: float(_fm.iloc[0][c]) for c in FEATURE_COLUMNS}
     X = pd.DataFrame([[feat_map[c] for c in FEATURE_COLUMNS]], columns=list(FEATURE_COLUMNS))
     X = X[list(FEATURE_COLUMNS)]
     cat_model = load_catboost_ranker_optional()
