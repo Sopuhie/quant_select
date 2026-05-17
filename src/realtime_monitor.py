@@ -41,6 +41,22 @@ SIGNAL_VWAP_SUPPORT = "VWAP_Support"
 SIGNAL_MACD_GOLDEN = "MACD_Golden_Cross"
 SIGNAL_VOL_PRICE = "Volume_Price_Resonance"
 
+_INTRADAY_SIGNAL_TYPES = frozenset(
+    {SIGNAL_VWAP_SUPPORT, SIGNAL_MACD_GOLDEN, SIGNAL_VOL_PRICE, "BUY"}
+)
+_SIGNAL_TYPE_LABELS: dict[str, str] = {
+    SIGNAL_VWAP_SUPPORT: "回踩 VWAP",
+    SIGNAL_MACD_GOLDEN: "MACD 金叉",
+    SIGNAL_VOL_PRICE: "量价共振",
+    "BUY": "买入信号",
+}
+
+
+def _signal_type_label(signal_type: str) -> str:
+    key = str(signal_type or "").strip()
+    return _SIGNAL_TYPE_LABELS.get(key, key or "—")
+
+
 _COLOR_BUY = "#16a34a"
 _COLOR_VOL_UP = "rgba(220, 38, 38, 0.72)"  # 上涨红
 _COLOR_VOL_DN = "rgba(22, 163, 74, 0.72)"  # 下跌绿
@@ -467,10 +483,10 @@ def persist_signals_for_stock(
     signals: list[dict[str, Any]],
     *,
     realtime_score: float | None = None,
-) -> int:
-    """去重入库；返回新写入条数。"""
+) -> list[dict[str, Any]]:
+    """去重入库；返回本次新写入的信号列表。"""
     code = str(stock_code).strip().zfill(6)
-    written = 0
+    written: list[dict[str, Any]] = []
     win = int(REALTIME_SIGNAL_DEDUP_WINDOW_MINUTES)
     for sig in signals:
         sig_type = str(sig["signal_type"])
@@ -497,8 +513,8 @@ def persist_signals_for_stock(
             reason=str(sig.get("reason") or ""),
             realtime_score=realtime_score,
         )
-        written += 1
-    if written > 0:
+        written.append(sig)
+    if written:
         invalidate_signal_history_cache(code)
     return written
 
@@ -509,34 +525,44 @@ def _push_signal_to_dingtalk(
     signals: list[dict[str, Any]],
     score: float | None,
 ) -> None:
-    """Push buy signal alert to DingTalk."""
-    buy_sigs = [s for s in signals if str(s.get("signal_type", "")).upper() == "BUY"]
-    if not buy_sigs:
+    """盘中买点入库成功后推送钉钉（与 detect_intraday_signals 信号类型一致）。"""
+    push_sigs = [
+        s
+        for s in signals
+        if str(s.get("signal_type", "")).strip() in _INTRADAY_SIGNAL_TYPES
+    ]
+    if not push_sigs:
         return
     from .config_manager import config_manager
     from .dingtalk_notifier import DingTalkNotifier
     config_manager.reload()
+    if not config_manager.is_dingtalk_enabled():
+        return
     wh = config_manager.get_dingtalk_webhook_url()
     if not wh:
         return
     try:
         notifier = DingTalkNotifier(wh, config_manager.get_dingtalk_secret() or None)
-    except Exception:
+    except Exception as exc:
+        logger.warning("钉钉通知器初始化失败: %s", exc)
         return
     code = str(stock_code).zfill(6)
     name = str(stock_name)
-    now_s = time.strftime("%H:%M:%S")
-    lines = [f"## 🟢 买入信号\n\n**{name}** ({code})\n\n"]
-    for s in buy_sigs:
+    lines = [f"## 🟢 盘中买点\n\n**{name}** ({code})\n\n"]
+    for s in push_sigs:
+        sig_type = str(s.get("signal_type", "")).strip()
+        label = _signal_type_label(sig_type)
         price = s.get("signal_price", "?")
         reason = str(s.get("reason", "")).strip()
         t = str(s.get("signal_time", ""))
-        lines.append(f"- ⏱ {t}  |  💰 {price}  |  {reason}\n")
+        lines.append(f"- ⏱ {t}  |  💰 {price}  |  **{label}**  {reason}\n")
     if score is not None:
         lines.append(f"\n📊 量化评分: {score:.1f}\n")
     lines.append("\n⚠️ 信号仅供参考，不构成投资建议")
     text = "".join(lines)
-    notifier.send_markdown(f"买入信号 {name}", text)
+    ok = notifier.send_markdown(f"盘中买点 {name}", text)
+    if not ok:
+        logger.warning("盘中买点钉钉推送失败 %s (%s)", code, name)
 
 
 def run_monitor_cycle_for_targets(
@@ -595,16 +621,16 @@ def run_monitor_cycle_for_targets(
             continue
         try:
             new_sigs = detect_intraday_signals(df)
-            n_written = 0
+            written_sigs: list[dict[str, Any]] = []
             if persist and new_sigs:
-                n_written = persist_signals_for_stock(
+                written_sigs = persist_signals_for_stock(
                     code, name, new_sigs, realtime_score=rt_score
                 )
-                if n_written > 0:
-                    _push_signal_to_dingtalk(code, name, new_sigs, rt_score)
+                if written_sigs:
+                    _push_signal_to_dingtalk(code, name, written_sigs, rt_score)
             today_sigs = fetch_signal_history_cached(
                 code,
-                force_refresh=n_written > 0,
+                force_refresh=bool(written_sigs),
             )
             last = df.iloc[-1]
             open_px = float(pd.to_numeric(df["open"].iloc[0], errors="coerce") or 0.0)
@@ -694,7 +720,7 @@ def signals_to_display_dataframe(signals: list[dict[str, Any]] | None) -> pd.Dat
                 if s.get("signal_price") is not None
                 and str(s.get("signal_price")).strip() != ""
                 else float("nan"),
-                "信号类型": str(s.get("signal_type") or ""),
+                "信号类型": _signal_type_label(str(s.get("signal_type") or "")),
                 "触发理由": str(s.get("reason") or ""),
             }
         )
