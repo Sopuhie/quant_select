@@ -63,17 +63,6 @@ PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
     "factor_return_1d",
     "factor_return_5d",
     "factor_momentum_10d",
-    "factor_amihud_20d",
-    "factor_bb_width_20d",
-    "factor_drawdown_60d",
-    "factor_hsgt_flow_interact",
-    "factor_big_order_net_ratio",
-    "factor_north_hold_ratio_chg",
-    "factor_chip_profit_ratio",
-    "factor_chip_concentration_width",
-    "factor_rsi_14",
-    "factor_kdj_j",
-    "factor_macd_hist",
 )
 
 # 波动 / 换手类：先截面相对尺度，再 RankGauss（在 ``clean_cross_sectional_features`` 内顺序执行）
@@ -87,12 +76,8 @@ RANK_GAUSS_AFTER_RANK_FEATURES: tuple[str, ...] = (
 # 截面相对波动率：当日个股时序波动 / 当日全市场截面中位数（RankGauss 之前）
 CROSS_SECTION_RELATIVE_VOL_FEATURES: tuple[str, ...] = RANK_GAUSS_AFTER_RANK_FEATURES
 
-# 技术指标：截面分位前做 ZCA 对称正交（无列顺序偏好）
-TECHNICAL_ORTHOGONAL_FEATURE_COLS: tuple[str, ...] = (
-    "factor_rsi_14",
-    "factor_kdj_j",
-    "factor_macd_hist",
-)
+# 13 项纯技术因子集不含 MACD/RSI/KDJ，截面 ZCA 正交块留空
+TECHNICAL_ORTHOGONAL_FEATURE_COLS: tuple[str, ...] = ()
 
 # 顺势强度因子：截面清洗时保留原尺度，不参与分位秩 / MAD-Z / 市值中性化
 PRESERVE_RAW_CROSS_SECTION_FEATURES: tuple[str, ...] = (
@@ -492,8 +477,10 @@ def prepare_ranking_cross_section_pipeline(
     if feat_df.empty:
         return feat_df
     w = feat_df.copy()
-    w = attach_hsgt_flow_interact(w, date_col=date_col)
-    w = merge_incremental_db_features(w, date_col=date_col)
+    if HSGT_FLOW_INTERACT_COL in FEATURE_COLUMNS:
+        w = attach_hsgt_flow_interact(w, date_col=date_col)
+    if "factor_big_order_net_ratio" in FEATURE_COLUMNS or "factor_north_hold_ratio_chg" in FEATURE_COLUMNS:
+        w = merge_incremental_db_features(w, date_col=date_col)
     if "date" not in w.columns:
         w["date"] = w[date_col].astype(str).str[:10]
     else:
@@ -563,92 +550,6 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     out["factor_volume_ratio"] = vol / (vol_ma5 + eps)
     out["factor_volume_position"] = vol_ma5 / (vol_ma20 + eps) - 1.0
 
-    high_low_ratio = (high - low) / (close + eps)
-    out["factor_volatility_5d"] = high_low_ratio.rolling(5).mean()
-    out["factor_volatility_20d"] = high_low_ratio.rolling(20).mean()
-
-    denom = high.astype(float) - low.astype(float)
-    l = low.astype(float)
-    c = close.astype(float)
-    d_np = denom.to_numpy(dtype=float)
-    safe_d = np.where(d_np < eps, eps, d_np)
-    out["factor_close_position"] = pd.Series(
-        (c.to_numpy(dtype=float) - l.to_numpy(dtype=float)) / safe_d,
-        index=work.index,
-        dtype=float,
-    ).clip(0.0, 1.0)
-
-    # --- 扩展因子（OHLCV；北向交互在面板层 ``attach_hsgt_flow_interact`` 填充）---
-    ret1 = close.pct_change(1)
-    dollar_vol = (close * vol).replace(0, np.nan)
-    out["factor_amihud_20d"] = (ret1.abs() / (dollar_vol + eps)).rolling(20, min_periods=5).mean()
-
-    dv = vol.pct_change(1).replace([np.inf, -np.inf], np.nan)
-    out["factor_pv_corr_10d"] = ret1.rolling(10, min_periods=5).corr(dv)
-
-    typical = (high + low + close) / 3.0
-    vwap_num = (typical * vol).rolling(20, min_periods=5).sum()
-    vwap_den = vol.rolling(20, min_periods=5).sum()
-    vwap20 = vwap_num / (vwap_den + eps)
-    out["factor_vwap_bias_20d"] = close / (vwap20 + eps) - 1.0
-
-    std20 = close.rolling(20, min_periods=5).std()
-    out["factor_bb_width_20d"] = (4.0 * std20) / (ma20 + eps)
-
-    roll_max60 = close.rolling(60, min_periods=20).max()
-    out["factor_drawdown_60d"] = close / (roll_max60 + eps) - 1.0
-
-    d1 = close.pct_change(1)
-    shrink_day = (d1 < 0) & (vol < vol_ma5)
-    out["factor_shrink_pullback_5d"] = shrink_day.astype(float).rolling(5, min_periods=1).mean()
-
-    # --- RSI / KDJ / MACD（时间序列；截面正交在 clean 内完成）---
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-    ag = gain.ewm(alpha=1.0 / 14.0, adjust=False).mean()
-    al = loss.ewm(alpha=1.0 / 14.0, adjust=False).mean()
-    rs = ag / (al + eps)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    out["factor_rsi_14"] = (rsi - 50.0) / 50.0
-
-    low9 = low.rolling(9, min_periods=5).min()
-    high9 = high.rolling(9, min_periods=5).max()
-    rsv = (close - low9) / (high9 - low9 + eps) * 100.0
-    rsv = rsv.clip(0.0, 100.0)
-    K = rsv.rolling(3, min_periods=1).mean()
-    D = K.rolling(3, min_periods=1).mean()
-    J = 3.0 * K - 2.0 * D
-    out["factor_kdj_j"] = (J - 50.0) / 50.0
-
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    dif = ema12 - ema26
-    dea = dif.ewm(span=9, adjust=False).mean()
-    out["factor_macd_hist"] = (dif - dea) / (close + eps)
-
-    vwap60_num = (typical * vol).rolling(60, min_periods=20).sum()
-    vwap60_den = vol.rolling(60, min_periods=20).sum()
-    vwap60 = vwap60_num / (vwap60_den + eps)
-    out["factor_chip_profit_ratio"] = (close - vwap60) / (close + eps)
-
-    w90 = close.rolling(60, min_periods=20).quantile(0.95) - close.rolling(
-        60, min_periods=20
-    ).quantile(0.05)
-    w70 = close.rolling(60, min_periods=20).quantile(0.85) - close.rolling(
-        60, min_periods=20
-    ).quantile(0.15)
-    out["factor_chip_concentration_width"] = (w90 - w70) / (close + eps)
-
-    r1 = close.pct_change(1).replace([np.inf, -np.inf], np.nan)
-    signed_amt = (close * vol) * np.sign(r1.fillna(0.0))
-    out["factor_big_order_net_ratio"] = signed_amt.rolling(5, min_periods=2).sum() / (
-        dollar_vol.rolling(5, min_periods=2).sum() + eps
-    )
-    out["factor_north_hold_ratio_chg"] = 0.0
-
-    out["factor_hsgt_flow_interact"] = 0.0
-
     out = out.replace([np.inf, -np.inf], np.nan)
     for c in FEATURE_COLUMNS:
         if c not in out.columns:
@@ -669,7 +570,7 @@ def clean_cross_sectional_features(
     截面清洗：
 
     - 按 ``date`` / ``trade_date`` 分组；
-    - 对 ``TECHNICAL_ORTHOGONAL_FEATURE_COLS`` 先做 ZCA 对称正交；
+    - 若配置 ``TECHNICAL_ORTHOGONAL_FEATURE_COLS`` 非空则先做 ZCA 对称正交（当前 13 因子集为空）；
     - 对波动/换手类先做截面相对波动率（/ 当日中位数），再 RankGauss；
     - 对 ``PERCENTILE_RANK_FEATURES`` 做 ``rank(pct=True) - 0.5``；
     - 对 ``RANK_GAUSS_AFTER_RANK_FEATURES`` 做截面 RankGauss；

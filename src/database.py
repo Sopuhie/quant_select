@@ -52,6 +52,9 @@ def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA cache_size=-64000;")
+    conn.execute("PRAGMA mmap_size=268435456;")
 
 
 SCHEMA_SQL = """
@@ -111,6 +114,9 @@ CREATE TABLE IF NOT EXISTS stock_daily_kline (
     UNIQUE(date, stock_code)
 );
 CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date);
+CREATE INDEX IF NOT EXISTS idx_kline_date ON stock_daily_kline(date);
+CREATE INDEX IF NOT EXISTS idx_daily_sel_date_rank ON daily_selections(trade_date, rank);
+CREATE INDEX IF NOT EXISTS idx_predict_date_code ON daily_predictions(trade_date, stock_code);
 
 CREATE TABLE IF NOT EXISTS stock_financial_data (
     stock_code TEXT NOT NULL,
@@ -232,6 +238,22 @@ def _ensure_market_hsgt_flow_daily(conn: sqlite3.Connection) -> None:
         """)
 
 
+def _ensure_performance_indexes(conn: sqlite3.Connection) -> None:
+    """旧库升级：补全 (code,date) 及跑批常用联合索引。"""
+    for ddl in (
+        "CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date)",
+        "CREATE INDEX IF NOT EXISTS idx_kline_date ON stock_daily_kline(date)",
+        "CREATE INDEX IF NOT EXISTS idx_daily_sel_date_rank ON daily_selections(trade_date, rank)",
+        "CREATE INDEX IF NOT EXISTS idx_predict_date_code ON daily_predictions(trade_date, stock_code)",
+        "CREATE INDEX IF NOT EXISTS idx_mf_code_date ON stock_money_flow_daily(stock_code, trade_date)",
+        "CREATE INDEX IF NOT EXISTS idx_nh_code_date ON stock_north_hold_daily(stock_code, trade_date)",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+
+
 def _ensure_stock_concept_boards(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_concept_boards'")
     if cur.fetchone() is None:
@@ -252,6 +274,7 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_daily_selections_selection_reason(conn)
         _ensure_stock_concept_boards(conn)
         _ensure_market_hsgt_flow_daily(conn)
+        _ensure_performance_indexes(conn)
         conn.commit()
     finally:
         conn.close()

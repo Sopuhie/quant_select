@@ -185,7 +185,7 @@ LGB_RANKER_DEFAULT_PARAMS: dict[str, Any] = {
     "seed": 42,
 }
 
-# 特征列：量价框架（在 14 项基础因子上扩展流动性/量价协同/分布类因子）
+# 特征列：13 项纯技术面因子（仅 OHLCV 派生；不含 MACD/RSI/KDJ/资金流/北向）
 FEATURE_COLUMNS = [
     "factor_bias_5",  # 5日均线乖离
     "factor_bias_10",  # 10日均线乖离
@@ -196,30 +196,10 @@ FEATURE_COLUMNS = [
     "factor_return_1d",  # 1日收益
     "factor_return_5d",  # 5日收益
     "factor_momentum_10d",  # 10日动量
-    "factor_ma_trend_score",  # 多头排列得分 [0,4]：ma5>ma10>ma20>ma60 与收盘>ma20
-    "factor_price_pos_250d",  # 现价在 250 日高低区间内的分位位置 [0,1]
+    "factor_ma_trend_score",  # 多头排列得分 [0,4]
+    "factor_price_pos_250d",  # 250 日价格分位 [0,1]
     "factor_volume_ratio",  # 量比（相对5日均量）
     "factor_volume_position",  # 量能位置（5日均量相对20日均量）
-    "factor_volatility_5d",  # 5日波动
-    "factor_volatility_20d",  # 20日波动
-    "factor_close_position",  # 收盘位置（资金承接代理）
-    # --- 扩展：筹码/流动性/量价结构代理（仍仅依赖 OHLCV；可叠加 config 资金流映射）---
-    "factor_amihud_20d",  # Amihud 非流动性（|收益|/成交额代理）
-    "factor_pv_corr_10d",  # 价量变化 10 日滚动相关（背离为负）
-    "factor_vwap_bias_20d",  # 相对 20 日 VWAP 的偏离（成本带代理）
-    "factor_bb_width_20d",  # 布林带宽（波动 regime）
-    "factor_drawdown_60d",  # 60 日高点回撤深度（套牢/获利结构代理）
-    "factor_shrink_pullback_5d",  # 近 5 日下跌中缩量程度（缩量回调为正）
-    # --- 深度优化：资金流 / 筹码 / 技术（正交在截面清洗内完成）---
-    "factor_big_order_net_ratio",  # 大单+超大单净流入占比（AkShare 增量库优先，缺省为 OHLCV 代理）
-    "factor_north_hold_ratio_chg",  # 北向持股占 A 股比例日变化（增量库；无则 0）
-    "factor_chip_profit_ratio",  # 获利盘代理：收盘相对 60 日 VWAP
-    "factor_chip_concentration_width",  # 筹码集中度：(95-5分位)-(85-15分位) 宽度 / 价
-    "factor_rsi_14",
-    "factor_kdj_j",
-    "factor_macd_hist",
-    # 北向净流入强度（按日全市场相同标量）与 5 日收益交互；无数据时为 0
-    "factor_hsgt_flow_interact",
 ]
 
 # 因子时间序列：EWM 与简单 rolling 的混合权重（越大越偏重近期）

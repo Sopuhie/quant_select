@@ -16,6 +16,12 @@ from .data_fetcher import fetch_daily_hist
 from .database import get_connection, upsert_stock_daily_klines
 from .utils import get_kline_incremental_end_trade_date
 
+# A 股配色：红涨绿跌（与通达信/同花顺一致）
+ASHARE_COLOR_UP = "#FF3333"
+ASHARE_COLOR_DOWN = "#00CC66"
+ASHARE_FILL_UP = "rgba(255, 51, 51, 0.05)"
+ASHARE_FILL_DOWN = "rgba(0, 204, 102, 0.05)"
+
 
 def lookup_stock_display_name(stock_code: object) -> str:
     """从本地 ``stock_daily_kline`` 取该股最新一条记录里的名称（使用统一标准连接池）。"""
@@ -188,8 +194,26 @@ def get_stock_kline_data(stock_code: object, days: int = 365):
     return None
 
 
+def _apply_trading_day_category_xaxis(fig, *, rows: tuple[int, ...] = (1, 2)) -> None:
+    """
+    日线 K 线：x 轴使用 category 仅含真实交易日字符串，彻底消除周末/节假日空隙。
+    """
+    color_grid = "rgba(15, 23, 42, 0.08)"
+    for r in rows:
+        fig.update_xaxes(
+            type="category",
+            tickangle=-45,
+            nticks=20,
+            showgrid=False,
+            linecolor=color_grid,
+            tickfont=dict(color="#475569"),
+            row=r,
+            col=1,
+        )
+
+
 def draw_candlestick(df, stock_code, stock_name):
-    """绘制无留白连续 K 线图。"""
+    """绘制无留白连续 K 线图（仅交易日 category 轴，红涨绿跌）。"""
     if df is None or len(df) == 0:
         return None
 
@@ -207,8 +231,8 @@ def draw_candlestick(df, stock_code, stock_name):
         row_heights=[0.75, 0.25],
     )
 
-    color_up = "#FF3333"
-    color_down = "#00CC66"
+    color_up = ASHARE_COLOR_UP
+    color_down = ASHARE_COLOR_DOWN
 
     ohlc_cd = df[["open", "high", "low", "close"]].to_numpy(dtype=float)
 
@@ -350,17 +374,8 @@ def draw_candlestick(df, stock_code, stock_name):
         ),
     )
 
+    _apply_trading_day_category_xaxis(fig, rows=(1, 2))
     for r in (1, 2):
-        fig.update_xaxes(
-            type="category",
-            tickangle=-45,
-            nticks=20,
-            showgrid=False,
-            linecolor=color_grid,
-            tickfont=dict(color="#475569"),
-            row=r,
-            col=1,
-        )
         fig.update_yaxes(
             showgrid=True,
             gridcolor=color_grid,
@@ -527,10 +542,8 @@ def draw_realtime_line_chart(
     latest_price = float(df["close"].iloc[-1])
     pct_chg = (latest_price / open_price - 1.0) * 100.0 if open_price > 0 else 0.0
 
-    theme_color = "#FF3333" if pct_chg >= 0 else "#00CC66"
-    fill_color = (
-        "rgba(255, 51, 51, 0.05)" if pct_chg >= 0 else "rgba(0, 204, 102, 0.05)"
-    )
+    theme_color = ASHARE_COLOR_UP if pct_chg >= 0 else ASHARE_COLOR_DOWN
+    fill_color = ASHARE_FILL_UP if pct_chg >= 0 else ASHARE_FILL_DOWN
 
     times = df["time"].dt.strftime("%H:%M").tolist()
     code_s = str(stock_code).strip().zfill(6)
@@ -597,10 +610,8 @@ def draw_tonghuashun_intraday(
     pct_y = (close - prev_close) / prev_close * 100.0
     pct_latest = (latest_price - prev_close) / prev_close * 100.0
 
-    theme_color = "#dc2626" if pct_latest >= 0 else "#16a34a"
-    fill_color = (
-        "rgba(220,38,38,0.06)" if pct_latest >= 0 else "rgba(22,163,74,0.06)"
-    )
+    theme_color = ASHARE_COLOR_UP if pct_latest >= 0 else ASHARE_COLOR_DOWN
+    fill_color = ASHARE_FILL_UP if pct_latest >= 0 else ASHARE_FILL_DOWN
 
     code_s = str(stock_code).strip().zfill(6)
     name_s = str(stock_name).strip()

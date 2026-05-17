@@ -441,10 +441,6 @@ def analyze_stock_reasons(
         "factor_north_hold_ratio_chg": "北向持股占 A 股比例的日度变化（增量库优先）",
         "factor_chip_profit_ratio": "获利盘代理：现价相对 60 日 VWAP 的偏离",
         "factor_chip_concentration_width": "筹码集中度代理：宽分位价差与窄分位价差之差",
-        "factor_rsi_14": "RSI 相对强弱经截面正交后的技术结构项",
-        "factor_kdj_j": "KDJ 的 J 经截面正交后的摆动项",
-        "factor_macd_hist": "MACD 柱经截面正交后的趋势动能项",
-        "factor_hsgt_flow_interact": "北向净流入强度与短期收益的交互项（市场资金面共振）",
         "factor_ma_trend_score": "多头排列得分越高，短中长期均线结构越健康，顺势强度越强",
         "factor_price_pos_250d": "现价处于一年高低区间中的相对位置，偏高表示中期趋势底色较强",
     }
