@@ -256,13 +256,10 @@ def _log_industry_cap_rank_alignment(top: pd.DataFrame, top_n: int) -> None:
     )
 
 
-def is_high_volume_price_stagnation(
-    stock_code: str,
-    as_of_date: str,
-) -> tuple[bool, str]:
+def is_high_volume_price_stagnation_from_bars(bars: pd.DataFrame) -> tuple[bool, str]:
     """
-    高位放量滞涨：近 3 日均量显著高于近 20 日均量，但近 3 日股价几乎不动。
-    返回 (是否命中, 说明文案)。
+    高位放量滞涨（与 run_daily / 诊股共用）：
+    近 3 日均量 > 近 20 日均量 × 2.5，且近 3 日股价波动 |涨跌幅| < 2%。
     """
     from .config import (
         VOLUME_STAGNATION_LONG_DAYS,
@@ -270,39 +267,86 @@ def is_high_volume_price_stagnation(
         VOLUME_STAGNATION_SHORT_DAYS,
         VOLUME_STAGNATION_VOL_RATIO,
     )
+
+    if bars is None or bars.empty or len(bars) < int(VOLUME_STAGNATION_LONG_DAYS):
+        return False, ""
+    vol = pd.to_numeric(bars["volume"], errors="coerce")
+    close = pd.to_numeric(bars["close"], errors="coerce")
+    if len(vol) < int(VOLUME_STAGNATION_LONG_DAYS) or len(close) < 3:
+        return False, ""
+    avg_vol_20 = float(vol.iloc[-VOLUME_STAGNATION_LONG_DAYS:].mean())
+    avg_vol_3 = float(vol.iloc[-VOLUME_STAGNATION_SHORT_DAYS:].mean())
+    if not np.isfinite(avg_vol_20) or not np.isfinite(avg_vol_3) or avg_vol_20 <= 0:
+        return False, ""
+    if avg_vol_3 <= float(VOLUME_STAGNATION_VOL_RATIO) * avg_vol_20:
+        return False, ""
+    c_end = float(close.iloc[-1])
+    c_ref = float(close.iloc[-3])
+    if not np.isfinite(c_end) or not np.isfinite(c_ref) or c_ref <= 0:
+        return False, ""
+    pct_chg_3 = c_end / c_ref - 1.0
+    if abs(pct_chg_3) >= float(VOLUME_STAGNATION_MAX_ABS_RET_3D):
+        return False, ""
+    detail = (
+        f"3日均量/20日均量={avg_vol_3 / avg_vol_20:.2f}倍，"
+        f"近3日涨跌幅={pct_chg_3 * 100:.2f}%"
+    )
+    return True, detail
+
+
+def is_high_volume_price_stagnation(
+    stock_code: str,
+    as_of_date: str,
+) -> tuple[bool, str]:
+    """读取本地日线后判定放量滞涨；供选股截面循环与 TopN 补位复用。"""
     from .database import fetch_stock_daily_bars_until
 
     code = str(stock_code).strip().zfill(6)
     end = str(as_of_date).strip()[:10]
-    long_n = max(VOLUME_STAGNATION_SHORT_DAYS + 1, int(VOLUME_STAGNATION_LONG_DAYS))
-    df = fetch_stock_daily_bars_until(code, end)
-    if df is None or len(df) < long_n:
+    bars = fetch_stock_daily_bars_until(code, end)
+    if bars is None or bars.empty:
         return False, ""
-    tail = df.tail(long_n)
-    vol = pd.to_numeric(tail["volume"], errors="coerce")
-    close = pd.to_numeric(tail["close"], errors="coerce")
-    if vol.isna().all() or close.isna().all():
-        return False, ""
-    avg_short = float(vol.tail(VOLUME_STAGNATION_SHORT_DAYS).mean())
-    avg_long = float(vol.mean())
-    if not np.isfinite(avg_short) or not np.isfinite(avg_long) or avg_long <= 0:
-        return False, ""
-    if avg_short <= float(VOLUME_STAGNATION_VOL_RATIO) * avg_long:
-        return False, ""
-    if len(close) < VOLUME_STAGNATION_SHORT_DAYS + 1:
-        return False, ""
-    c_end = float(close.iloc[-1])
-    c_start = float(close.iloc[-(VOLUME_STAGNATION_SHORT_DAYS + 1)])
-    if not np.isfinite(c_end) or not np.isfinite(c_start) or c_start <= 0:
-        return False, ""
-    cum_ret = c_end / c_start - 1.0
-    if abs(cum_ret) >= float(VOLUME_STAGNATION_MAX_ABS_RET_3D):
-        return False, ""
-    detail = (
-        f"3日均量/20日均量={avg_short / avg_long:.2f}倍，"
-        f"近{VOLUME_STAGNATION_SHORT_DAYS}日累计涨跌幅={cum_ret * 100:.2f}%"
-    )
-    return True, detail
+    return is_high_volume_price_stagnation_from_bars(bars)
+
+
+def apply_volume_stagnation_experience_filter(
+    scores_df: pd.DataFrame,
+    as_of_date: str,
+    *,
+    stock_code_col: str = "stock_code",
+    stock_name_col: str = "stock_name",
+) -> pd.DataFrame:
+    """
+    全市场打分截面：在取 Top N 前剔除放量滞涨标的（与 diagnose_single_stock 规则一致）。
+    """
+    if scores_df is None or scores_df.empty:
+        return scores_df
+    keep_rows: list[bool] = []
+    removed = 0
+    for _, row in scores_df.iterrows():
+        code = str(row.get(stock_code_col, "")).strip().zfill(6)
+        hit, detail = is_high_volume_price_stagnation(code, as_of_date)
+        if hit:
+            removed += 1
+            name = str(row.get(stock_name_col) or "").strip()
+            print(
+                f"[经验风控-放量滞涨] 剔除 {code} {name}：{detail}",
+                flush=True,
+            )
+            keep_rows.append(False)
+        else:
+            keep_rows.append(True)
+    if removed:
+        print(
+            f"[经验风控-放量滞涨] 截面共剔除 {removed} 只（锚定日 {as_of_date}）",
+            flush=True,
+        )
+    return scores_df.loc[keep_rows].reset_index(drop=True)
+
+
+VOLUME_STAGNATION_VIOLATION_MSG = (
+    "该股处于高位筹码松动期（放量滞涨），模型得分已失效"
+)
 
 
 def select_top_n_with_industry_cap(
@@ -1253,6 +1297,11 @@ def persist_predictions(
             "经验风控过滤后无剩余股票，请在 config.json 的 experience_filters 放宽阈值，"
             "或在 Streamlit「任务 C」展开面板中调整。"
         )
+    scores_df = apply_volume_stagnation_experience_filter(
+        scores_df, str(trade_date).strip()[:10]
+    )
+    if scores_df.empty:
+        raise RuntimeError("放量滞涨硬过滤后无剩余股票。")
     scores_df = scores_df.reset_index(drop=True)
     scores_df["rank_in_market"] = np.arange(1, len(scores_df) + 1)
     lgb_model = load_model()
@@ -1595,6 +1644,12 @@ def diagnose_single_stock(
     if max_to is not None and volume_ratio_raw > float(max_to) / 2.0:
         violated.append(
             f"量比代理 {volume_ratio_raw:.2f} 高于经验换手上限对应阈值（{float(max_to):.1f}%→量比≤{float(max_to)/2:.2f}）"
+        )
+
+    stag_hit, stag_detail = is_high_volume_price_stagnation_from_bars(df_hist)
+    if stag_hit:
+        violated.append(
+            f"{VOLUME_STAGNATION_VIOLATION_MSG}（{stag_detail}）"
         )
 
     try:

@@ -74,6 +74,7 @@ from src.model_trainer import (  # noqa: E402
 )
 from src.predictor import (  # noqa: E402
     apply_experience_trading_filters,
+    apply_volume_stagnation_experience_filter,
     blend_ranker_scores_with_optional_meta,
     filter_predictions,
     prune_zero_volume_rows,
@@ -603,6 +604,11 @@ def _score_universe_for_date(
         ["score", "stock_code"], ascending=[False, True]
     ).reset_index(drop=True)
     feat_df = apply_experience_trading_filters(feat_df)
+    if feat_df.empty:
+        return []
+    feat_df = apply_volume_stagnation_experience_filter(
+        feat_df, str(trade_date).strip()[:10]
+    )
     if feat_df.empty:
         return []
     top = select_top_n_with_industry_cap(

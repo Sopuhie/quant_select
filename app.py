@@ -934,6 +934,19 @@ with tab_advisor:
                 fv = res.get("features") or {}
                 st.json({k: round(float(fv[k]), 6) for k in FEATURE_COLUMNS if k in fv})
             vio = res.get("violated") or []
+            stag_vio = [
+                x
+                for x in vio
+                if "放量滞涨" in str(x) or "筹码松动" in str(x)
+            ]
+            if stag_vio:
+                st.error(
+                    "🚨 "
+                    + html.escape(
+                        "该股处于高位筹码松动期，模型得分已失效。"
+                        "请勿依据下方 AI 融合得分做买入决策。"
+                    )
+                )
             if vio:
                 with st.expander("已触发的硬过滤项", expanded=True):
                     for line in vio:

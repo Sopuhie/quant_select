@@ -67,6 +67,7 @@ from src.model_trainer import (
 from src.predictor import (
     analyze_stock_reasons,
     apply_experience_trading_filters,
+    apply_volume_stagnation_experience_filter,
     blend_ranker_scores_with_optional_meta,
     feature_importances_aligned,
     filter_predictions,
@@ -561,6 +562,16 @@ def predict_daily(
         print(
             "警告: 经验风控过滤后没有剩余的候选股票，请在 config.json 的 experience_filters 放宽阈值，"
             "或在 Streamlit「任务 C」展开面板中调整。"
+        )
+        sys.exit(1)
+
+    # 经验风控：全市场截面剔除放量滞涨（取 TopN 前，与智能诊股规则一致）
+    filtered_df = apply_volume_stagnation_experience_filter(
+        filtered_df, str(anchor_td)[:10]
+    )
+    if filtered_df.empty:
+        print(
+            "警告: 放量滞涨硬过滤后没有剩余的候选股票。"
         )
         sys.exit(1)
 
