@@ -47,6 +47,8 @@ from .factor_calculator import (
     DEFAULT_INDUSTRY_LABEL,
     _roll_ewm_blend,
     compute_factors_for_history,
+    is_bar_one_word_limit_up,
+    is_bar_suspended,
     normalize_industry_label,
     prepare_ranking_cross_section_pipeline,
 )
@@ -407,6 +409,29 @@ def select_top_n_with_industry_cap(
                         flush=True,
                     )
                 continue
+            bars = fetch_stock_daily_bars_until(code, as_of_date)
+            exec_row, prev_close, exec_date = resolve_execution_bar_for_filter(
+                bars, as_of_date
+            )
+            if exec_row is not None:
+                if is_bar_suspended(exec_row):
+                    if code in prelim_codes:
+                        print(
+                            f"[风控拒绝] 股票 {code} 在 {exec_date or as_of_date} "
+                            "停牌/无量，顺位递补",
+                            flush=True,
+                        )
+                    continue
+                if np.isfinite(prev_close) and prev_close > 0 and is_bar_one_word_limit_up(
+                    exec_row, prev_close, code
+                ):
+                    if code in prelim_codes:
+                        print(
+                            f"[风控拒绝] 股票 {code} 在 {exec_date or as_of_date} "
+                            "一字涨停，顺位递补",
+                            flush=True,
+                        )
+                    continue
         industry_counts[ind] = industry_counts.get(ind, 0) + 1
         picked_idx.append(idx)
     if not picked_idx:
@@ -798,6 +823,85 @@ def filter_downtrend_breakdown_hard(feat_df: pd.DataFrame) -> pd.DataFrame:
             flush=True,
         )
     return out
+
+
+def resolve_execution_bar_for_filter(
+    bars: pd.DataFrame,
+    anchor_date: str,
+) -> tuple[pd.Series | None, float, str]:
+    """
+    可成交性判定用 K 线：优先锚定日之后更新的 bar（盘前/当日开盘），否则用锚定日 bar。
+    返回 ``(执行 bar, 前收, 执行 bar 日期)``。
+    """
+    if bars is None or bars.empty:
+        return None, float("nan"), ""
+    b = bars.copy()
+    b["date"] = b["date"].astype(str).str[:10]
+    anchor = str(anchor_date).strip()[:10]
+    on_or_after = b[b["date"] >= anchor]
+    if on_or_after.empty:
+        return None, float("nan"), ""
+    exec_row = on_or_after.iloc[-1]
+    exec_date = str(exec_row["date"])[:10]
+    prior = b[b["date"] < exec_date]
+    if prior.empty:
+        prev_close = float("nan")
+    else:
+        prev_close = float(pd.to_numeric(prior.iloc[-1]["close"], errors="coerce"))
+    return exec_row, prev_close, exec_date
+
+
+def apply_buy_execution_safety_filters(
+    scores_df: pd.DataFrame,
+    as_of_date: str,
+    *,
+    stock_code_col: str = "stock_code",
+) -> pd.DataFrame:
+    """
+    模型打分后、Top N 前：剔除锚定日（或其后更新 bar）上一字涨停与停牌/无量标的。
+    与回测 T+1 买入日不可成交规则对齐，便于 Top 榜单顺位递补。
+    """
+    if scores_df is None or scores_df.empty:
+        return scores_df
+    anchor = str(as_of_date).strip()[:10]
+    keep: list[bool] = []
+    removed_suspend = 0
+    removed_limit = 0
+    for _, row in scores_df.iterrows():
+        code = str(row.get(stock_code_col, "")).strip().zfill(6)
+        bars = fetch_stock_daily_bars_until(code, anchor)
+        exec_row, prev_close, exec_date = resolve_execution_bar_for_filter(bars, anchor)
+        if exec_row is None:
+            keep.append(True)
+            continue
+        if is_bar_suspended(exec_row):
+            removed_suspend += 1
+            print(
+                f"[风控拒绝] 股票 {code} 在 {exec_date or anchor} 成交量为 0（停牌/无量），"
+                "无法买入，已移出今日推荐池",
+                flush=True,
+            )
+            keep.append(False)
+            continue
+        if np.isfinite(prev_close) and prev_close > 0 and is_bar_one_word_limit_up(
+            exec_row, prev_close, code
+        ):
+            removed_limit += 1
+            print(
+                f"[风控拒绝] 股票 {code} 在 {exec_date or anchor} 一字涨停（开≈高≈低≈涨停价），"
+                "无法买入，已移出今日推荐池",
+                flush=True,
+            )
+            keep.append(False)
+            continue
+        keep.append(True)
+    if removed_suspend or removed_limit:
+        print(
+            f"[风控拒绝] 可成交性硬过滤（锚定 {anchor}）："
+            f"停牌/无量 {removed_suspend} 只，一字涨停 {removed_limit} 只",
+            flush=True,
+        )
+    return scores_df.loc[keep].reset_index(drop=True)
 
 
 def filter_predictions(scores_df: pd.DataFrame) -> pd.DataFrame:
@@ -1240,6 +1344,11 @@ def persist_predictions(
     )
     if scores_df.empty:
         raise RuntimeError("放量滞涨硬过滤后无剩余股票。")
+    scores_df = apply_buy_execution_safety_filters(
+        scores_df, str(trade_date).strip()[:10]
+    )
+    if scores_df.empty:
+        raise RuntimeError("一字涨停/停牌可成交性过滤后无剩余股票。")
     scores_df = scores_df.reset_index(drop=True)
     scores_df["rank_in_market"] = np.arange(1, len(scores_df) + 1)
     lgb_model = load_model()

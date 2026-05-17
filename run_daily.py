@@ -67,6 +67,7 @@ from src.model_trainer import (
 from src.predictor import (
     analyze_stock_reasons,
     apply_experience_trading_filters,
+    apply_buy_execution_safety_filters,
     apply_volume_stagnation_experience_filter,
     is_high_volume_price_stagnation,
     blend_ranker_scores_with_optional_meta,
@@ -573,6 +574,15 @@ def predict_daily(
     if filtered_df.empty:
         print(
             "警告: 放量滞涨硬过滤后没有剩余的候选股票。"
+        )
+        sys.exit(1)
+
+    filtered_df = apply_buy_execution_safety_filters(
+        filtered_df, str(anchor_td)[:10]
+    )
+    if filtered_df.empty:
+        print(
+            "警告: 一字涨停/停牌可成交性过滤后没有剩余的候选股票。"
         )
         sys.exit(1)
 

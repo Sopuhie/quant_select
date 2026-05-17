@@ -64,6 +64,7 @@ from src.data_fetcher import fetch_daily_hist, get_stock_pool  # noqa: E402
 from src.database import get_active_model_version  # noqa: E402
 from src.factor_calculator import (  # noqa: E402
     compute_factors_for_history,
+    normalize_industry_label,
     prepare_ranking_cross_section_pipeline,
 )
 from src.model_trainer import (  # noqa: E402
@@ -73,12 +74,12 @@ from src.model_trainer import (  # noqa: E402
     load_xgb_ranker_optional,
 )
 from src.predictor import (  # noqa: E402
+    MAX_STOCKS_PER_INDUSTRY,
     apply_experience_trading_filters,
     apply_volume_stagnation_experience_filter,
     blend_ranker_scores_with_optional_meta,
     filter_predictions,
     prune_zero_volume_rows,
-    select_top_n_with_industry_cap,
 )
 
 PriceKind = Literal["open", "close"]
@@ -552,7 +553,7 @@ def _score_universe_for_date(
     *,
     include_300: bool = False,
     include_688: bool = False,
-) -> list[str]:
+) -> tuple[list[str], dict[str, str]]:
     rows: list[dict[str, Any]] = []
     for code, name in universe:
         hist = by_code.get(code)
@@ -562,16 +563,16 @@ def _score_universe_for_date(
         if r:
             rows.append(r)
     if not rows:
-        return []
+        return [], {}
     feat_df = pd.DataFrame(rows)
     feat_df = prune_zero_volume_rows(feat_df)
     feat_df = feat_df.drop(columns=["volume"], errors="ignore")
     if feat_df.empty:
-        return []
+        return [], {}
     feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
     feat_df = filter_predictions(feat_df)
     if feat_df.empty:
-        return []
+        return [], {}
     sc = feat_df["stock_code"].map(_normalize_stock_code)
     bmask = pd.Series(True, index=feat_df.index)
     if not include_300:
@@ -580,10 +581,10 @@ def _score_universe_for_date(
         bmask &= ~sc.str.startswith("688")
     feat_df = feat_df.loc[bmask].copy()
     if feat_df.empty:
-        return []
+        return [], {}
     feat_df = feat_df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLUMNS)
     if feat_df.empty:
-        return []
+        return [], {}
     X = feat_df[list(FEATURE_COLUMNS)].astype(np.float64)
     assert_feature_matrix_matches_rankers(
         X,
@@ -605,16 +606,19 @@ def _score_universe_for_date(
     ).reset_index(drop=True)
     feat_df = apply_experience_trading_filters(feat_df)
     if feat_df.empty:
-        return []
+        return [], {}
     feat_df = apply_volume_stagnation_experience_filter(
         feat_df, str(trade_date).strip()[:10]
     )
     if feat_df.empty:
-        return []
-    top = select_top_n_with_industry_cap(
-        feat_df, TOP_N_SELECTION, as_of_date=str(trade_date).strip()[:10]
-    )
-    return top["stock_code"].astype(str).tolist()
+        return [], {}
+    codes = feat_df["stock_code"].map(_normalize_stock_code).astype(str).tolist()
+    industry_by_code: dict[str, str] = {}
+    if "industry" in feat_df.columns:
+        for _, r in feat_df.iterrows():
+            c = _normalize_stock_code(str(r["stock_code"]))
+            industry_by_code[c] = normalize_industry_label(r.get("industry"))
+    return codes, industry_by_code
 
 
 def _price_on(
@@ -758,6 +762,9 @@ class BacktestEngine:
     cash: float = field(init=False)
     regime_fuse_days: int = field(default=0, init=False)
     regime_recovery_rebalances: int = field(default=0, init=False)
+    buy_fill_attempts: int = field(default=0, init=False)
+    buy_fill_successes: int = field(default=0, init=False)
+    buy_skip_limit_suspend: int = field(default=0, init=False)
     date_pos: dict[str, dict[str, int]] = field(default_factory=dict)
     by_code: dict[str, pd.DataFrame] = field(default_factory=dict)
     positions: list[HeldShare] = field(default_factory=list)
@@ -873,7 +880,7 @@ class BacktestEngine:
                 sig_date = self.trade_dates[i - 1] if i >= 1 else d
                 self._sell_all_open(d)
                 univ = self.get_universe(sig_date)
-                codes = _score_universe_for_date(
+                candidates, industry_by_code = _score_universe_for_date(
                     sig_date,
                     self.by_code,
                     univ,
@@ -883,7 +890,12 @@ class BacktestEngine:
                     include_300=self.include_300,
                     include_688=self.include_688,
                 )
-                self._buy_equal_open(d, codes)
+                self._buy_equal_open(
+                    d,
+                    candidates,
+                    target_n=TOP_N_SELECTION,
+                    industry_by_code=industry_by_code,
+                )
 
             self._mark_to_market_close(d, regime_score=regime_score)
 
@@ -936,23 +948,45 @@ class BacktestEngine:
         self.cash += proceeds_sum
         self.positions = remaining
 
-    def _buy_equal_open(self, d: str, codes: list[str]) -> None:
-        codes = [c for c in codes if c in self.by_code]
-        if not codes or self.cash <= 0:
+    def _buy_equal_open(
+        self,
+        d: str,
+        candidates: list[str],
+        *,
+        target_n: int = TOP_N_SELECTION,
+        industry_by_code: dict[str, str] | None = None,
+        max_per_industry: int = MAX_STOCKS_PER_INDUSTRY,
+    ) -> None:
+        """
+        按打分顺位尝试买入，一字涨停/停牌不计成交；顺延备选股直至凑满 target_n 或候选耗尽。
+        """
+        candidates = [c for c in candidates if c in self.by_code]
+        target_n = max(0, int(target_n))
+        if not candidates or self.cash <= 0 or target_n <= 0:
             return
-        per = self.cash / len(codes)
+        industry_by_code = industry_by_code or {}
+        per = self.cash / target_n
         spent_total = 0.0
         new_holdings: list[HeldShare] = []
         slip = max(0.0, float(self.slippage_rate))
         comm_r = max(0.0, float(self.commission_rate))
         eps = float(self.limit_price_eps_yuan)
         exp_prev = _prev_trading_date(self.trade_dates, d)
-        for code in codes:
+        industry_counts: dict[str, int] = {}
+        fills = 0
+        for code in candidates:
+            if fills >= target_n:
+                break
+            ind = normalize_industry_label(industry_by_code.get(code))
+            if industry_counts.get(ind, 0) >= max_per_industry:
+                continue
+            self.buy_fill_attempts += 1
             row = self._row(d, code)
             if row is None or _is_suspended_row(row):
+                self.buy_skip_limit_suspend += 1
                 if row is not None:
                     print(
-                        f"[回测] {d} {code} 跳过买入: 当日停牌或零成交量",
+                        f"[回测] {d} {code} 跳过买入: 当日停牌或零成交量，顺延备选股",
                         flush=True,
                     )
                 continue
@@ -965,28 +999,34 @@ class BacktestEngine:
                 exp_prev,
                 max_calendar_gap_days=int(self.max_calendar_gap_days),
             ):
+                self.buy_skip_limit_suspend += 1
                 print(
-                    f"[回测] {d} {code} 跳过买入: K 线不连续或相对上一交易日缺口（停牌/数据缺失）",
+                    f"[回测] {d} {code} 跳过买入: K 线不连续或相对上一交易日缺口（停牌/数据缺失），顺延备选股",
                     flush=True,
                 )
                 continue
             if np.isfinite(prev_c) and _is_strict_one_word_limit_up(
                 row, code, prev_c, eps=eps
             ):
+                self.buy_skip_limit_suspend += 1
                 lim_up, _ = _theoretical_limit_prices(prev_c, code)
                 print(
-                    f"[回测] {d} {code} 跳过买入: 一字涨停 O≈H≈L≈涨停价 {lim_up:.2f}，本笔视为无法成交",
+                    f"[回测] {d} {code} 跳过买入: 一字涨停 O≈H≈L≈涨停价 {lim_up:.2f}，"
+                    "本笔未成交、顺延备选股",
                     flush=True,
                 )
                 continue
             px = _price_on(row, self.buy_price)
             if not np.isfinite(px) or px <= 0:
+                self.buy_skip_limit_suspend += 1
                 continue
             px_eff = px * (1.0 + slip)
             if px_eff <= 0:
+                self.buy_skip_limit_suspend += 1
                 continue
             denom = px_eff * (1.0 + comm_r)
             if denom <= 1e-15:
+                self.buy_skip_limit_suspend += 1
                 continue
             alloc = min(per, max(0.0, self.cash - spent_total))
             if alloc <= 0:
@@ -996,11 +1036,15 @@ class BacktestEngine:
             fee = gross * comm_r
             cash_use = gross + fee
             if cash_use > self.cash - spent_total + 1e-9:
+                self.buy_skip_limit_suspend += 1
                 continue
             spent_total += cash_use
             new_holdings.append(
                 HeldShare(code=code, shares=float(shares), cost_cash=float(cash_use))
             )
+            industry_counts[ind] = industry_counts.get(ind, 0) + 1
+            fills += 1
+            self.buy_fill_successes += 1
         self.cash -= spent_total
         self.positions.extend(new_holdings)
 
@@ -1397,6 +1441,16 @@ def main() -> None:
     if engine.regime_recovery_rebalances > 0:
         print(
             f"熔断解除后强制复苏换仓次数: {engine.regime_recovery_rebalances}",
+            flush=True,
+        )
+    if engine.buy_fill_attempts > 0:
+        unfilled_ratio = float(engine.buy_skip_limit_suspend) / float(
+            engine.buy_fill_attempts
+        )
+        print(
+            f"买入撮合：尝试 {engine.buy_fill_attempts} 笔，成交 {engine.buy_fill_successes} 笔，"
+            f"因涨停/停牌未成交 {engine.buy_skip_limit_suspend} 笔，"
+            f"未成交比例 Unfilled Ratio = {unfilled_ratio:.2%}",
             flush=True,
         )
 

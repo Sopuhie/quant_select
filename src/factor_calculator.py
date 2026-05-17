@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import numpy as np
 import pandas as pd
 
@@ -35,6 +37,9 @@ SIZE_MCAP_LOG_FALLBACK = 10.0
 # 训练 / 推理共用：缺失或非字符串行业统一为该标签，便于行业内截面标准化成组
 DEFAULT_INDUSTRY_LABEL = "未知行业"
 
+# 数据库与 K 线均无有效行业时的兜底（与截面清洗同源，避免 NaN 丢行）
+CANONICAL_INDUSTRY_FALLBACK_LABEL = "综合"
+
 
 def normalize_industry_label(val: object) -> str:
     """将单行行业字段规范为字符串；空值与空白视为默认标签。"""
@@ -53,6 +58,66 @@ def normalize_industry_column(series: pd.Series) -> pd.Series:
     t = series.fillna("").astype(str).str.strip()
     t = t.replace("", DEFAULT_INDUSTRY_LABEL).replace("nan", DEFAULT_INDUSTRY_LABEL)
     return t
+
+
+def fetch_canonical_industry_map(
+    stock_codes: Iterable[str],
+) -> dict[str, str]:
+    """
+    训练 / 预测共用：从 ``stock_daily_kline`` 取各股最新非空行业（与 ``fetch_latest_industry_by_codes`` 同源）。
+    """
+    from .database import fetch_latest_industry_by_codes
+
+    uniq = sorted(
+        {
+            str(c).strip().zfill(6)
+            for c in stock_codes
+            if len(str(c).strip().zfill(6)) == 6
+        }
+    )
+    if not uniq:
+        return {}
+    raw = fetch_latest_industry_by_codes(uniq)
+    out: dict[str, str] = {}
+    for code in uniq:
+        label = normalize_industry_label(raw.get(code))
+        if label == DEFAULT_INDUSTRY_LABEL:
+            out[code] = CANONICAL_INDUSTRY_FALLBACK_LABEL
+        else:
+            out[code] = label
+    return out
+
+
+def attach_canonical_industry_labels(
+    feat_df: pd.DataFrame,
+    *,
+    stock_code_col: str = "stock_code",
+    industry_col: str = "industry",
+) -> pd.DataFrame:
+    """
+    在截面清洗前统一行业列：优先 SQLite 最新行业快照，其次 K 线行内 industry，最后「综合」。
+  训练与 ``run_daily`` / 回测均经 ``prepare_ranking_cross_section_pipeline`` 调用，保证同源。
+    """
+    if feat_df.empty or stock_code_col not in feat_df.columns:
+        return feat_df
+    w = feat_df.copy()
+    codes = w[stock_code_col].astype(str).str.zfill(6)
+    imap = fetch_canonical_industry_map(codes.unique().tolist())
+    resolved: list[str] = []
+    for _, row in w.iterrows():
+        code = str(row[stock_code_col]).strip().zfill(6)
+        db_label = imap.get(code, CANONICAL_INDUSTRY_FALLBACK_LABEL)
+        if db_label not in (DEFAULT_INDUSTRY_LABEL, CANONICAL_INDUSTRY_FALLBACK_LABEL):
+            resolved.append(db_label)
+            continue
+        if industry_col in w.columns:
+            kline_label = normalize_industry_label(row.get(industry_col))
+            if kline_label != DEFAULT_INDUSTRY_LABEL:
+                resolved.append(kline_label)
+                continue
+        resolved.append(CANONICAL_INDUSTRY_FALLBACK_LABEL)
+    w[industry_col] = normalize_industry_column(pd.Series(resolved, index=w.index))
+    return w
 
 
 # 高波动 / 重尾因子：先做截面分位秩 [-0.5, 0.5]，再参与行业内标准化
@@ -206,6 +271,31 @@ def _limit_move_ratio(stock_code: str | None) -> float:
     return 0.10
 
 
+def is_bar_suspended(row: pd.Series) -> bool:
+    """成交量为 0 或无效 → 停牌/无量，不可成交。"""
+    try:
+        v = float(row.get("volume", 0) or 0)
+    except (TypeError, ValueError):
+        return True
+    return not (np.isfinite(v) and v > 0)
+
+
+def is_bar_one_word_limit_up(
+    row: pd.Series,
+    prev_close: float,
+    stock_code: str,
+) -> bool:
+    """一字涨停：开高低收贴涨停价且无量价波动，开盘价无法买入。"""
+    if is_bar_suspended(row):
+        return False
+    return _bar_one_word_limit_locked(
+        row,
+        prev_close,
+        limit_ratio=_limit_move_ratio(stock_code),
+        direction="up",
+    )
+
+
 def _bar_one_word_limit_locked(
     row: pd.Series,
     prev_close: float,
@@ -298,6 +388,7 @@ def prepare_ranking_cross_section_pipeline(
     else:
         w["date"] = w["date"].astype(str).str[:10]
 
+    w = attach_canonical_industry_labels(w)
     w = suppress_high_recent_gains(w)
     w = assign_factor_size_mcap_from_mcap(w)
 
