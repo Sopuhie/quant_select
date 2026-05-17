@@ -33,6 +33,7 @@ from .data_fetcher import (
 )
 from .database import (
     delete_daily_outputs_for_trade_date,
+    fetch_auxiliary_feature_frames,
     fetch_latest_industry_by_codes,
     fetch_latest_market_cap_by_codes,
     fetch_stock_daily_bars_until,
@@ -47,6 +48,7 @@ from .factor_calculator import (
     DEFAULT_INDUSTRY_LABEL,
     _roll_ewm_blend,
     attach_hsgt_flow_interact,
+    build_hsgt_net_zscore_by_trade_date,
     compute_factors_for_history,
     enrich_factors_with_incremental_db,
     normalize_industry_label,
@@ -711,6 +713,47 @@ def prune_zero_volume_rows(feat_df: pd.DataFrame) -> pd.DataFrame:
     return feat_df[v > 0].reset_index(drop=True)
 
 
+def _overlay_auxiliary_features_for_diagnose_anchor(
+    factors: pd.DataFrame,
+    *,
+    stock_code: str,
+    trade_date: str,
+    row_index: int,
+) -> pd.DataFrame:
+    """
+    锚定交易日显式 merge SQLite 增量表（``stock_money_flow_daily`` / ``stock_north_hold_daily``），
+    覆盖 ``compute_factors_for_history`` 中的 OHLCV 代理 / 0 占位，消除单股诊断分布偏移。
+    """
+    if factors is None or factors.empty:
+        return factors
+    out = factors.copy()
+    code = str(stock_code).strip().zfill(6)
+    td = str(trade_date).strip()[:10]
+    ri = int(row_index)
+    if ri < 0 or ri >= len(out):
+        return out
+
+    mf, nh = fetch_auxiliary_feature_frames([td], [code])
+    if mf is not None and not mf.empty and "big_net_ratio" in mf.columns:
+        sub = mf[(mf["_k_code"] == code) & (mf["_k_date"] == td)]
+        if not sub.empty:
+            v = pd.to_numeric(sub["big_net_ratio"].iloc[0], errors="coerce")
+            if pd.notna(v) and np.isfinite(float(v)):
+                out.loc[ri, "factor_big_order_net_ratio"] = float(v)
+    if nh is not None and not nh.empty and "hold_pct_chg" in nh.columns:
+        sub = nh[(nh["_k_code"] == code) & (nh["_k_date"] == td)]
+        if not sub.empty:
+            v = pd.to_numeric(sub["hold_pct_chg"].iloc[0], errors="coerce")
+            if pd.notna(v) and np.isfinite(float(v)):
+                out.loc[ri, "factor_north_hold_ratio_chg"] = float(v)
+
+    zmap = build_hsgt_net_zscore_by_trade_date([td])
+    zv = float(zmap.get(td, 0.0))
+    r5 = float(pd.to_numeric(out.loc[ri, "factor_return_5d"], errors="coerce") or 0.0)
+    out.loc[ri, "factor_hsgt_flow_interact"] = zv * r5
+    return out
+
+
 def _diagnose_features_via_ranking_pipeline(
     code6: str,
     trade_date: str,
@@ -1313,6 +1356,12 @@ def diagnose_single_stock(
 
     last_i = len(df_hist) - 1
     td = str(df_hist.iloc[last_i]["date"]).strip()[:10]
+    factors = _overlay_auxiliary_features_for_diagnose_anchor(
+        factors,
+        stock_code=code6,
+        trade_date=td,
+        row_index=last_i,
+    )
     last_row = factors.iloc[last_i]
     if last_row[list(FEATURE_COLUMNS)].isna().any():
         return None, "最新一日因子存在缺失，无法诊断。", "warning"

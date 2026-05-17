@@ -154,27 +154,25 @@ def _minute_macd_kdj(close: pd.Series) -> pd.DataFrame:
 
 def _sanitize_minute_frame(df: pd.DataFrame) -> pd.DataFrame:
     """
-    分钟线防御性清洗：核心 OHLCV 链式填充；``amount`` 缺失时用 close×volume 代理。
+    实盘防御舱：核心 OHLCV ``ffill().bfill().fillna(0)``；
+    ``amount`` 用 ``close * volume`` 自适应代理（与 modify 规范一致）。
     """
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
     if "close" not in out.columns:
         return pd.DataFrame()
-    for col in ("open", "close", "high", "low", "volume"):
-        if col not in out.columns:
-            out[col] = out["close"] if col != "volume" else 0.0
-        out[col] = (
-            pd.to_numeric(out[col], errors="coerce").ffill().bfill().fillna(0.0)
-        )
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.ffill().bfill().fillna(0.0)
     close = out["close"].astype(float)
-    vol = out["volume"].astype(float)
+    vol = out["volume"].astype(float) if "volume" in out.columns else pd.Series(0.0, index=out.index)
     amt_proxy = close * vol
-    if "amount" in out.columns:
-        amt = pd.to_numeric(out["amount"], errors="coerce")
-        out["amount"] = amt.where(amt.notna() & (amt > 0), amt_proxy)
-    else:
+    if "amount" not in out.columns:
         out["amount"] = amt_proxy
+    else:
+        out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(amt_proxy)
     out["amount"] = out["amount"].ffill().bfill().fillna(0.0)
     return out
 
@@ -545,15 +543,36 @@ def run_top3_monitor_cycle(
     persist: bool = True,
     allow_off_session_display: bool = False,
 ) -> list[dict[str, Any]]:
-    """从 daily_selections 取当日 Top3 并执行监控（默认仅交易时段写库）。"""
+    """
+    从 daily_selections 取当日 Top3 并执行监控。
+    分钟线经 ``_sanitize_minute_frame`` 防御清洗，off-session / 缺额字段不导致界面崩溃。
+    """
     targets = fetch_top3_selections_for_monitor()
     if not targets:
         return []
-    return run_monitor_cycle_for_targets(
-        targets,
-        persist=persist,
-        allow_off_session_display=allow_off_session_display,
-    )
+    try:
+        return run_monitor_cycle_for_targets(
+            targets,
+            persist=persist,
+            allow_off_session_display=allow_off_session_display,
+        )
+    except Exception as exc:
+        logger.error("run_top3_monitor_cycle 顶层异常已捕获: %s", exc)
+        out: list[dict[str, Any]] = []
+        for t in targets[:TOP_N_SELECTION]:
+            code = str(t.get("stock_code", "")).strip().zfill(6)
+            out.append(
+                {
+                    "stock_code": code,
+                    "stock_name": str(t.get("stock_name") or ""),
+                    "rank": t.get("rank"),
+                    "realtime_score": t.get("score"),
+                    "minute_df": None,
+                    "signals_today": fetch_signal_history_for_stock_on_date(code),
+                    "error": str(exc)[:120],
+                }
+            )
+        return out
 
 
 def signals_to_display_dataframe(signals: list[dict[str, Any]] | None) -> pd.DataFrame:

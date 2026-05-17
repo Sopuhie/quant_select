@@ -50,6 +50,14 @@ def get_hs300_market_environment_score(
     return score_out
 
 
+def compute_market_regime_score(
+    target_date: str,
+    db_path=None,
+) -> int:
+    """``run_daily`` / 题材模块统一入口：沪深300 大盘多头环境分（0~100）。"""
+    return get_hs300_market_environment_score(target_date, db_path=db_path)
+
+
 def market_environment_allows_trading(
     target_date: str,
     *,

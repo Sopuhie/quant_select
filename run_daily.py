@@ -52,7 +52,7 @@ from src.database import (
     stock_codes_with_local_bars,
 )
 from src.dingtalk_notifier import maybe_push_daily_selections
-from src.market_regime import get_hs300_market_environment_score
+from src.market_regime import compute_market_regime_score
 from src.factor_calculator import (
     compute_factors_for_history,
     normalize_industry_label,
@@ -377,15 +377,43 @@ def predict_daily(
         )
         return
 
-    mkt_score = get_hs300_market_environment_score(anchor_td)
+    print("[风控阀门] 正在提取沪深300指数计算当日大盘多头环境分...", flush=True)
+    mkt_score = compute_market_regime_score(anchor_td)
+    print(
+        f"[风控阀门] 当前大盘择时多头得分: {mkt_score} 分（风控阈值: {MARKET_REGIME_MIN_SCORE} 分）",
+        flush=True,
+    )
     if mkt_score < int(MARKET_REGIME_MIN_SCORE):
         breaker_msg = (
-            f"🛡️ 大盘择时熔断：沪深300 环境分 {mkt_score} 低于阈值 {MARKET_REGIME_MIN_SCORE}，"
-            f"本日（{anchor_td}）进入风控空仓防御，不产出 Top{TOP_N_SELECTION} 推荐。"
-            "（与题材选股环境分规则一致：指数收盘需站稳 20 日均线。）"
+            f"🚨 大盘熔断触发：交易日 {anchor_td} 沪深300 环境分 {mkt_score} 低于 "
+            f"{MARKET_REGIME_MIN_SCORE}，判定为极端空头/破位 Regime；"
+            f"本日强制空仓持币，不执行全市场个股筛选与 Top{TOP_N_SELECTION} 推荐。"
         )
         print(breaker_msg, flush=True)
         delete_daily_outputs_for_trade_date(anchor_td)
+        fuse_reason = (
+            f"大盘熔断空仓防御：本日沪深300大盘多头环境分仅为 {mkt_score} 分，"
+            f"低于系统安全阈值 {MARKET_REGIME_MIN_SCORE} 分，不执行选股。"
+        )
+        insert_daily_selections(
+            [
+                {
+                    "trade_date": str(anchor_td)[:10],
+                    "stock_code": "000000",
+                    "stock_name": "大盘风控熔断",
+                    "rank": 1,
+                    "score": 0.0,
+                    "close_price": 0.0,
+                    "next_day_return": None,
+                    "hold_5d_return": None,
+                    "selection_reason": fuse_reason,
+                }
+            ]
+        )
+        print(
+            "[每日选股] 大盘安全空仓熔断记录已写入 SQLite daily_selections。",
+            flush=True,
+        )
         write_today_json(ROOT, trade_date=anchor_td, selection_rows=[])
         print(f"已写入空仓占位 {ROOT / 'today.json'}", flush=True)
         try:
@@ -398,7 +426,7 @@ def predict_daily(
                         "trade_date": str(anchor_td)[:10],
                         "hs300_env_score": mkt_score,
                         "min_score": int(MARKET_REGIME_MIN_SCORE),
-                        "action": "empty_selection",
+                        "action": "fuse_selection_row",
                     },
                     ensure_ascii=False,
                 ),
