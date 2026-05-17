@@ -29,6 +29,9 @@ MIN_SIZE_NEUTRAL_GROUP = 5
 
 SIZE_FACTOR_COL = "factor_size_mcap"
 
+# 规模因子 log10(市值) 全为缺失时的兜底（约 log10(100 亿元) 量级，仅作回归自变量中轴）
+SIZE_MCAP_LOG_FALLBACK = 10.0
+
 # 训练 / 推理共用：缺失或非字符串行业统一为该标签，便于行业内截面标准化成组
 DEFAULT_INDUSTRY_LABEL = "未知行业"
 
@@ -117,6 +120,45 @@ def _mad_clip_zscore(series: pd.Series) -> pd.Series:
     return pd.Series(0.0, index=idx)
 
 
+def assign_factor_size_mcap_from_mcap(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """由 ``mcap``（总市值，元）推导 ``factor_size_mcap`` = log10(mcap)；非正或缺失为 NaN。"""
+    if feat_df.empty:
+        return feat_df
+    out = feat_df.copy()
+    if "mcap" in out.columns:
+        mcap_s = pd.to_numeric(out["mcap"], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
+        out[SIZE_FACTOR_COL] = np.where(
+            mcap_s.notna() & (mcap_s > 0),
+            np.log10(mcap_s.astype(float)),
+            np.nan,
+        )
+    elif SIZE_FACTOR_COL not in out.columns:
+        out[SIZE_FACTOR_COL] = np.nan
+    return out
+
+
+def sanitize_factor_size_mcap_column(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    规模特征清洗边界：将 ``factor_size_mcap`` 数值化后，用当前截面/面板中位数兜底，
+    避免新股或同步缺失导致 NaN 在行业内市值回归与 MAD-Z 中扩散。
+    """
+    if feat_df.empty or SIZE_FACTOR_COL not in feat_df.columns:
+        return feat_df
+    out = feat_df.copy()
+    sz = pd.to_numeric(out[SIZE_FACTOR_COL], errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
+    fill_val = (
+        float(sz.median())
+        if not sz.isna().all()
+        else float(SIZE_MCAP_LOG_FALLBACK)
+    )
+    out[SIZE_FACTOR_COL] = sz.fillna(fill_val)
+    return out
+
+
 def _apply_size_residual_regression(sub_df: pd.DataFrame) -> pd.DataFrame:
     """
     行业内：对每个因子（除 SIZE_FACTOR_COL）做 y ~ 1 + factor_size_mcap 的 OLS，
@@ -125,6 +167,7 @@ def _apply_size_residual_regression(sub_df: pd.DataFrame) -> pd.DataFrame:
     sub_df = sub_df.copy()
     if SIZE_FACTOR_COL not in sub_df.columns:
         return sub_df
+    sub_df = sanitize_factor_size_mcap_column(sub_df)
     sz = pd.to_numeric(sub_df[SIZE_FACTOR_COL], errors="coerce")
     if int(sz.notna().sum()) < MIN_SIZE_NEUTRAL_GROUP:
         return sub_df
@@ -429,16 +472,8 @@ def prepare_ranking_cross_section_pipeline(
     else:
         w["date"] = w["date"].astype(str).str[:10]
     w = suppress_high_recent_gains(w)
-    # Compute factor_size_mcap = log10(total_market_cap_in_yuan) for size neutralization
-    if "mcap" in w.columns:
-        mcap_s = pd.to_numeric(w["mcap"], errors="coerce")
-        w[SIZE_FACTOR_COL] = np.where(
-            mcap_s.notna() & (mcap_s > 0),
-            np.log10(mcap_s) * 1.0,
-            np.nan,
-        )
-    else:
-        w[SIZE_FACTOR_COL] = np.nan
+    w = assign_factor_size_mcap_from_mcap(w)
+    w = sanitize_factor_size_mcap_column(w)
     w = clean_cross_sectional_features(w)
     if str(date_col) != "date":
         w = w.drop(columns=["date"], errors="ignore")
@@ -617,6 +652,8 @@ def clean_cross_sectional_features(
 
     for _date, day_df in df.groupby(group_key, sort=False):
         day_df = day_df.copy()
+        day_df = assign_factor_size_mcap_from_mcap(day_df)
+        day_df = sanitize_factor_size_mcap_column(day_df)
 
         og_ok = all(c in day_df.columns for c in TECHNICAL_ORTHOGONAL_FEATURE_COLS)
         if og_ok:
