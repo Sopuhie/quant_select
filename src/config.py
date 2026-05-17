@@ -185,20 +185,19 @@ LGB_RANKER_DEFAULT_PARAMS: dict[str, Any] = {
     "seed": 42,
 }
 
-# 特征列：13 项纯技术面因子（仅 OHLCV 派生；不含 MACD/RSI/KDJ/资金流/北向）
 FEATURE_COLUMNS = [
-    "factor_bias_5",  # 5日均线乖离
-    "factor_bias_10",  # 10日均线乖离
-    "factor_bias_20",  # 20日均线乖离（生命线）
-    "factor_bias_60",  # 60日均线乖离（牛熊线）
-    "factor_ratio_5_20",  # 5日/20日均线距离比
-    "factor_ratio_10_60",  # 10日/60日均线距离比
-    "factor_return_1d",  # 1日收益
-    "factor_return_5d",  # 5日收益
-    "factor_momentum_10d",  # 10日动量
+    "factor_bias_5",          # 5日均线乖离
+    "factor_bias_10",         # 10日均线乖离
+    "factor_bias_20",         # 20日均线乖离（生命线）
+    "factor_bias_60",         # 60日均线乖离（牛熊线）
+    "factor_ratio_5_20",      # 5日/20日均线距离比
+    "factor_ratio_10_60",     # 10日/60日均线距离比
+    "factor_return_1d",       # 1日收益率
+    "factor_return_5d",       # 5日收益率
+    "factor_momentum_10d",    # 10日动量指标
     "factor_ma_trend_score",  # 多头排列得分 [0,4]
-    "factor_price_pos_250d",  # 250 日价格分位 [0,1]
-    "factor_volume_ratio",  # 量比（相对5日均量）
+    "factor_price_pos_250d",  # 现价在250日高低区间内的分位位置
+    "factor_volume_ratio",    # 量比（当前成交量相对5日均量）
     "factor_volume_position",  # 量能位置（5日均量相对20日均量）
 ]
 

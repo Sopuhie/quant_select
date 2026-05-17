@@ -97,6 +97,9 @@ CREATE TABLE IF NOT EXISTS model_versions (
 CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_selections(trade_date);
 CREATE INDEX IF NOT EXISTS idx_predict_date ON daily_predictions(trade_date);
 CREATE INDEX IF NOT EXISTS idx_predict_rank ON daily_predictions(rank_in_market);
+-- 跑批 / Streamlit 高频查询联合索引（任务 4）
+CREATE INDEX IF NOT EXISTS idx_daily_sel_date_rank ON daily_selections(trade_date, rank);
+CREATE INDEX IF NOT EXISTS idx_predict_date_code ON daily_predictions(trade_date, stock_code);
 
 CREATE TABLE IF NOT EXISTS stock_daily_kline (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,8 +118,6 @@ CREATE TABLE IF NOT EXISTS stock_daily_kline (
 );
 CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date);
 CREATE INDEX IF NOT EXISTS idx_kline_date ON stock_daily_kline(date);
-CREATE INDEX IF NOT EXISTS idx_daily_sel_date_rank ON daily_selections(trade_date, rank);
-CREATE INDEX IF NOT EXISTS idx_predict_date_code ON daily_predictions(trade_date, stock_code);
 
 CREATE TABLE IF NOT EXISTS stock_financial_data (
     stock_code TEXT NOT NULL,
@@ -239,12 +240,15 @@ def _ensure_market_hsgt_flow_daily(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_performance_indexes(conn: sqlite3.Connection) -> None:
-    """旧库升级：补全 (code,date) 及跑批常用联合索引。"""
+    """
+    旧库升级：补全 SCHEMA 之后新增的联合索引与 K 线 (code,date) 索引。
+    ``init_db`` 建库与每次连接前均会调用，避免仅依赖 executescript 时漏建。
+    """
     for ddl in (
-        "CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date)",
-        "CREATE INDEX IF NOT EXISTS idx_kline_date ON stock_daily_kline(date)",
         "CREATE INDEX IF NOT EXISTS idx_daily_sel_date_rank ON daily_selections(trade_date, rank)",
         "CREATE INDEX IF NOT EXISTS idx_predict_date_code ON daily_predictions(trade_date, stock_code)",
+        "CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date)",
+        "CREATE INDEX IF NOT EXISTS idx_kline_date ON stock_daily_kline(date)",
         "CREATE INDEX IF NOT EXISTS idx_mf_code_date ON stock_money_flow_daily(stock_code, trade_date)",
         "CREATE INDEX IF NOT EXISTS idx_nh_code_date ON stock_north_hold_daily(stock_code, trade_date)",
     ):

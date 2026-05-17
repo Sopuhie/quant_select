@@ -19,8 +19,9 @@ from .utils import get_kline_incremental_end_trade_date
 # A 股配色：红涨绿跌（与通达信/同花顺一致）
 ASHARE_COLOR_UP = "#FF3333"
 ASHARE_COLOR_DOWN = "#00CC66"
-ASHARE_FILL_UP = "rgba(255, 51, 51, 0.05)"
-ASHARE_FILL_DOWN = "rgba(0, 204, 102, 0.05)"
+ASHARE_FILL_UP = "rgba(255, 51, 51, 0.06)"
+ASHARE_FILL_DOWN = "rgba(0, 204, 102, 0.06)"
+ASHARE_AVG_LINE_COLOR = "#FF9900"
 
 
 def lookup_stock_display_name(stock_code: object) -> str:
@@ -610,8 +611,10 @@ def draw_tonghuashun_intraday(
     pct_y = (close - prev_close) / prev_close * 100.0
     pct_latest = (latest_price - prev_close) / prev_close * 100.0
 
-    theme_color = ASHARE_COLOR_UP if pct_latest >= 0 else ASHARE_COLOR_DOWN
-    fill_color = ASHARE_FILL_UP if pct_latest >= 0 else ASHARE_FILL_DOWN
+    theme_color = "#FF3333" if pct_latest >= 0 else "#00CC66"
+    fill_color = (
+        "rgba(255, 51, 51, 0.06)" if pct_latest >= 0 else "rgba(0, 204, 102, 0.06)"
+    )
 
     code_s = str(stock_code).strip().zfill(6)
     name_s = str(stock_name).strip()
@@ -641,7 +644,7 @@ def draw_tonghuashun_intraday(
             y=avg_price,
             mode="lines",
             name="均线",
-            line=dict(color="#f59e0b", width=1.2),
+            line=dict(color=ASHARE_AVG_LINE_COLOR, width=1.2),
             hoverinfo="skip",
         )
     )

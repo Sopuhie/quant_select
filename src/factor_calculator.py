@@ -19,7 +19,7 @@ from .config import (
     MAX_ALLOWED_20D_RETURN,
     MAX_ALLOWED_5D_RETURN,
 )
-from .utils import rank_gauss_cross_section, zca_whiten_columns_cross_section
+from .utils import rank_gauss_cross_section
 
 # 行业内样本过少时退回当日全截面 MAD+Z，避免行业组统计不稳
 MIN_INDUSTRY_GROUP_SIZE = 5
@@ -65,19 +65,14 @@ PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
     "factor_momentum_10d",
 )
 
-# 波动 / 换手类：先截面相对尺度，再 RankGauss（在 ``clean_cross_sectional_features`` 内顺序执行）
+# 量能类：先截面相对尺度，再 RankGauss（在 ``clean_cross_sectional_features`` 内顺序执行）
 RANK_GAUSS_AFTER_RANK_FEATURES: tuple[str, ...] = (
-    "factor_volatility_5d",
-    "factor_volatility_20d",
     "factor_volume_ratio",
     "factor_volume_position",
 )
 
-# 截面相对波动率：当日个股时序波动 / 当日全市场截面中位数（RankGauss 之前）
+# 截面相对波动率：当日个股值 / 当日全市场截面中位数（RankGauss 之前）
 CROSS_SECTION_RELATIVE_VOL_FEATURES: tuple[str, ...] = RANK_GAUSS_AFTER_RANK_FEATURES
-
-# 13 项纯技术因子集不含 MACD/RSI/KDJ，截面 ZCA 正交块留空
-TECHNICAL_ORTHOGONAL_FEATURE_COLS: tuple[str, ...] = ()
 
 # 顺势强度因子：截面清洗时保留原尺度，不参与分位秩 / MAD-Z / 市值中性化
 PRESERVE_RAW_CROSS_SECTION_FEATURES: tuple[str, ...] = (
@@ -567,11 +562,10 @@ def clean_cross_sectional_features(
     use_size_neutralization: bool = True,
 ) -> pd.DataFrame:
     """
-    截面清洗：
+    截面清洗（13 维纯技术因子，无 MACD/RSI/KDJ ZCA 正交）：
 
     - 按 ``date`` / ``trade_date`` 分组；
-    - 若配置 ``TECHNICAL_ORTHOGONAL_FEATURE_COLS`` 非空则先做 ZCA 对称正交（当前 13 因子集为空）；
-    - 对波动/换手类先做截面相对波动率（/ 当日中位数），再 RankGauss；
+    - 对量能类先做截面相对波动率（/ 当日中位数），再 RankGauss；
     - 对 ``PERCENTILE_RANK_FEATURES`` 做 ``rank(pct=True) - 0.5``；
     - 对 ``RANK_GAUSS_AFTER_RANK_FEATURES`` 做截面 RankGauss；
     - 可选：在每个行业组内对因子（除 ``factor_size_mcap``）相对市值对数做 OLS 残差提取；
@@ -590,17 +584,6 @@ def clean_cross_sectional_features(
         day_df = day_df.copy()
         day_df = assign_factor_size_mcap_from_mcap(day_df)
         day_df = sanitize_factor_size_mcap_column(day_df)
-
-        og_ok = all(c in day_df.columns for c in TECHNICAL_ORTHOGONAL_FEATURE_COLS)
-        if og_ok:
-            M = (
-                day_df.loc[:, list(TECHNICAL_ORTHOGONAL_FEATURE_COLS)]
-                .apply(pd.to_numeric, errors="coerce")
-                .to_numpy(dtype=float)
-            )
-            Q = zca_whiten_columns_cross_section(M)
-            for j, c in enumerate(TECHNICAL_ORTHOGONAL_FEATURE_COLS):
-                day_df[c] = Q[:, j]
 
         if use_percentile_rank_volatility:
             day_df = _apply_cross_section_relative_volatility(day_df)
