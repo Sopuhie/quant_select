@@ -141,21 +141,23 @@ def assign_factor_size_mcap_from_mcap(feat_df: pd.DataFrame) -> pd.DataFrame:
 
 def sanitize_factor_size_mcap_column(feat_df: pd.DataFrame) -> pd.DataFrame:
     """
-    规模特征清洗边界：将 ``factor_size_mcap`` 数值化后，用当前截面/面板中位数兜底，
-    避免新股或同步缺失导致 NaN 在行业内市值回归与 MAD-Z 中扩散。
+    全市场/截面 ``factor_size_mcap`` 中位数兜底安全锁（送入行业截面清洗器前调用）。
+
+    等价于::
+
+        feat_df['factor_size_mcap'] = pd.to_numeric(..., errors='coerce').fillna(
+            median if any valid else 10.0
+        )
+
+    中位数在 ``errors='coerce'`` 之后计算，避免脏字符串拉高统计量。
     """
     if feat_df.empty or SIZE_FACTOR_COL not in feat_df.columns:
         return feat_df
     out = feat_df.copy()
-    sz = pd.to_numeric(out[SIZE_FACTOR_COL], errors="coerce").replace(
-        [np.inf, -np.inf], np.nan
+    sz = pd.to_numeric(out[SIZE_FACTOR_COL], errors="coerce")
+    out[SIZE_FACTOR_COL] = sz.fillna(
+        float(sz.median()) if not sz.isna().all() else float(SIZE_MCAP_LOG_FALLBACK)
     )
-    fill_val = (
-        float(sz.median())
-        if not sz.isna().all()
-        else float(SIZE_MCAP_LOG_FALLBACK)
-    )
-    out[SIZE_FACTOR_COL] = sz.fillna(fill_val)
     return out
 
 
@@ -457,7 +459,8 @@ def prepare_ranking_cross_section_pipeline(
 ) -> pd.DataFrame:
     """
     训练 / 预测 / 回测共用的截面排序特征管道：
-    北向交互 → 增量库特征合并 → 截面分组用 ``date`` → 前期涨幅抑制 → 截面清洗。
+    北向交互 → 增量库特征合并 → 截面分组用 ``date`` → 前期涨幅抑制 →
+    对数市值 ``factor_size_mcap`` → **截面中位数兜底** → 行业截面清洗。
 
     当 ``date_col="trade_date"`` 时，会临时构造 ``date`` 供 ``clean_cross_sectional_features`` 分组，
     结束后删除 ``date``，保留 ``trade_date``。当 ``date_col="date"``（训练面板）时**保留** ``date``。
@@ -473,7 +476,12 @@ def prepare_ranking_cross_section_pipeline(
         w["date"] = w["date"].astype(str).str[:10]
     w = suppress_high_recent_gains(w)
     w = assign_factor_size_mcap_from_mcap(w)
-    w = sanitize_factor_size_mcap_column(w)
+    # 对数市值 → 全市场截面中位数兜底（行业归一化 / 市值中性化之前）
+    if SIZE_FACTOR_COL in w.columns:
+        _sz = pd.to_numeric(w[SIZE_FACTOR_COL], errors="coerce")
+        w[SIZE_FACTOR_COL] = _sz.fillna(
+            float(_sz.median()) if not _sz.isna().all() else float(SIZE_MCAP_LOG_FALLBACK)
+        )
     w = clean_cross_sectional_features(w)
     if str(date_col) != "date":
         w = w.drop(columns=["date"], errors="ignore")
