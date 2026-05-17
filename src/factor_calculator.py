@@ -248,25 +248,21 @@ def build_hsgt_net_zscore_by_trade_date(
     if not flow:
         return {}
     _std_eps = 1e-6
-    history: list[float] = []
-    out: dict[str, float] = {}
-    for d in sorted(flow.keys()):
-        v = float(flow[d])
-        history.append(v)
-        if d not in ds_set:
-            continue
-        arr = np.asarray(history, dtype=float)
-        mu = float(np.nanmean(arr))
-        if len(arr) < 2:
-            out[d] = 0.0
-            continue
-        sig = float(np.nanstd(arr, ddof=1))
-        if not np.isfinite(sig) or sig < _std_eps:
-            sig = _std_eps
-        z = (v - mu) / sig
-        if np.isfinite(z):
-            out[d] = float(z)
-    return out
+    flow_df = pd.DataFrame(
+        sorted((str(k)[:10], float(v)) for k, v in flow.items()),
+        columns=["date", "net_inflow"],
+    )
+    mu = flow_df["net_inflow"].expanding(min_periods=1).mean()
+    sig = flow_df["net_inflow"].expanding(min_periods=2).std(ddof=1)
+    sig_safe = sig.clip(lower=_std_eps)
+    z = (flow_df["net_inflow"] - mu) / sig_safe
+    z = z.where(sig.notna(), 0.0)
+    z = z.where(np.isfinite(z), np.nan)
+    flow_df["z"] = z
+    sub = flow_df.loc[flow_df["date"].isin(ds_set), ["date", "z"]].dropna(subset=["z"])
+    if sub.empty:
+        return {}
+    return dict(zip(sub["date"].tolist(), sub["z"].astype(float).tolist()))
 
 
 def attach_hsgt_flow_interact(
@@ -776,4 +772,7 @@ def build_stock_panel_features(
     merged["label_ret"] = lab.values
     merged = merged.replace([np.inf, -np.inf], np.nan)
     merged = merged.dropna(subset=FEATURE_COLUMNS + ["label_ret"])
+    _f32_cols = [c for c in FEATURE_COLUMNS + ["label_ret"] if c in merged.columns]
+    if _f32_cols:
+        merged[_f32_cols] = merged[_f32_cols].astype(np.float32)
     return merged
