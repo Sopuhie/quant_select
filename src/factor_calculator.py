@@ -378,6 +378,35 @@ def merge_incremental_db_features(
     return work.drop(columns=["_k_date", "_k_code"], errors="ignore")
 
 
+def enrich_factors_with_incremental_db(
+    factors: pd.DataFrame,
+    hist: pd.DataFrame,
+    *,
+    stock_code: str | None = None,
+) -> pd.DataFrame:
+    """
+    单股/小样本因子面板：将 SQLite 增量表中的大单净占比、北向持股变化左连接进因子列，
+    避免 ``compute_factors_for_history`` 中 OHLCV 代理或 0 占位与训练截面脱节。
+    """
+    if factors is None or factors.empty or hist is None or hist.empty:
+        return factors
+    code = str(stock_code or "").strip().zfill(6)
+    if len(code) != 6 and "stock_code" in hist.columns:
+        code = str(hist.iloc[-1]["stock_code"]).strip().zfill(6)
+    if len(code) != 6:
+        return factors
+    panel = factors.copy()
+    panel["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    panel["stock_code"] = code
+    panel = merge_incremental_db_features(panel, date_col="date")
+    cols = [c for c in FEATURE_COLUMNS if c in panel.columns]
+    if len(cols) != len(FEATURE_COLUMNS):
+        for c in FEATURE_COLUMNS:
+            if c not in panel.columns:
+                panel[c] = factors[c] if c in factors.columns else 0.0
+    return panel[FEATURE_COLUMNS]
+
+
 def prepare_ranking_cross_section_pipeline(
     feat_df: pd.DataFrame,
     *,

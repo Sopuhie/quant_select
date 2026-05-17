@@ -38,7 +38,6 @@ import pandas as pd
 
 from src.config import DB_PATH, ensure_eastmoney_no_proxy_if_configured
 from src.database import (
-    bulk_set_stock_daily_industry_by_code,
     fetch_stock_code_max_dates,
     get_connection,
     init_db,
@@ -57,10 +56,43 @@ from src.data_fetcher import (
 from src.utils import get_kline_incremental_end_trade_date
 
 DEFAULT_WORKERS = max(1, int(os.environ.get("QUANT_UPDATE_WORKERS", "4")))
-# 主线程单次 executemany 行数上限（过大易占用内存；过小则事务开销大）
-UPSERT_FLUSH_ROWS = max(1000, int(os.environ.get("QUANT_UPSERT_FLUSH_ROWS", "8000")))
+# 主线程单次 executemany 行数（300~500 降低 WAL 长事务锁竞争）
+_raw_flush = int(os.environ.get("QUANT_UPSERT_FLUSH_ROWS", "400"))
+UPSERT_FLUSH_ROWS = max(300, min(500, _raw_flush))
 COMMIT_EVERY_FLUSHES = max(1, int(os.environ.get("QUANT_COMMIT_EVERY_FLUSHES", "3")))
+DB_WRITE_BATCH_SIZE = max(300, min(500, int(os.environ.get("QUANT_DB_WRITE_BATCH", "400"))))
+DB_WRITE_YIELD_SEC = float(os.environ.get("QUANT_DB_WRITE_YIELD_SEC", "0.01"))
 DEFAULT_INDUSTRY_BOARD_SLEEP = float(os.environ.get("QUANT_INDUSTRY_BOARD_SLEEP", "0.2"))
+
+
+def _db_write_yield() -> None:
+    if DB_WRITE_YIELD_SEC > 0:
+        time.sleep(DB_WRITE_YIELD_SEC)
+
+
+def _chunked_executemany(
+    conn,
+    sql: str,
+    rows: list,
+    *,
+    batch_size: int | None = None,
+    commit_every: int = 1,
+) -> int:
+    """分批 executemany + 微休眠，减轻与 Streamlit 前台写入的锁竞争。"""
+    if not rows:
+        return 0
+    bs = batch_size or DB_WRITE_BATCH_SIZE
+    n_batches = 0
+    for i in range(0, len(rows), bs):
+        chunk = rows[i : i + bs]
+        conn.executemany(sql, chunk)
+        n_batches += 1
+        if n_batches % commit_every == 0:
+            conn.commit()
+        _db_write_yield()
+    if n_batches % commit_every != 0:
+        conn.commit()
+    return n_batches
 
 
 def sync_stock_industries(
@@ -100,7 +132,24 @@ def sync_stock_industries(
             flush=True,
         )
 
-    rows_updated = bulk_set_stock_daily_industry_by_code(code_to_industry, db_path=path)
+    industry_pairs = [
+        (str(ind).strip(), str(code).strip().zfill(6))
+        for code, ind in code_to_industry.items()
+        if len(str(code).strip().zfill(6)) == 6
+    ]
+    rows_updated = 0
+    conn_ind = open_sqlite_connection(path)
+    try:
+        before = conn_ind.total_changes
+        _chunked_executemany(
+            conn_ind,
+            "UPDATE stock_daily_kline SET industry = ? WHERE stock_code = ?",
+            industry_pairs,
+            batch_size=DB_WRITE_BATCH_SIZE,
+        )
+        rows_updated = int(conn_ind.total_changes - before)
+    finally:
+        conn_ind.close()
 
     with get_connection(path) as conn:
         total_rows = int(
@@ -352,11 +401,13 @@ def update_database_kline(
                         f"（约每批 {UPSERT_FLUSH_ROWS} 行）…",
                         flush=True,
                     )
+                _db_write_yield()
 
         if buf:
             upsert_stock_daily_klines(buf, connection=conn)
             flush_ops += 1
         conn.commit()
+        _db_write_yield()
     finally:
         conn.close()
 
@@ -434,15 +485,16 @@ def sync_market_cap_batch(
     conn = open_sqlite_connection(path)
     try:
         pairs = [(float(code_to_mcap[c]), c) for c in code_to_mcap]
-        conn.executemany(
+        _chunked_executemany(
+            conn,
             """
             UPDATE stock_daily_kline
             SET market_cap = ?
             WHERE stock_code = ?
             """,
             pairs,
+            batch_size=DB_WRITE_BATCH_SIZE,
         )
-        conn.commit()
         updated = int(
             conn.execute(
                 "SELECT COUNT(*) FROM stock_daily_kline WHERE market_cap IS NOT NULL AND market_cap > 0"

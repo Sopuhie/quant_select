@@ -48,6 +48,7 @@ from .factor_calculator import (
     _roll_ewm_blend,
     attach_hsgt_flow_interact,
     compute_factors_for_history,
+    enrich_factors_with_incremental_db,
     normalize_industry_label,
     prepare_ranking_cross_section_pipeline,
 )
@@ -777,7 +778,10 @@ def latest_feature_row(
     if df.empty or len(df) < 30:
         return None
     _ = stock_code
+    code6 = str(stock_code).strip().zfill(6) if stock_code else ""
     fac = compute_factors_for_history(df)
+    if not fac.empty and len(code6) == 6:
+        fac = enrich_factors_with_incremental_db(fac, df, stock_code=code6)
     if fac.empty:
         return None
     last_idx = len(df) - 1
@@ -1258,6 +1262,7 @@ def diagnose_single_stock(
         )
 
     factors = compute_factors_for_history(df_hist)
+    factors = enrich_factors_with_incremental_db(factors, df_hist, stock_code=code6)
     if factors.empty:
         return None, "因子计算结果为空。", "error"
 

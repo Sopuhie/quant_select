@@ -160,44 +160,60 @@ def enrich_minute_bars(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
-    vol = pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
+    if "close" not in out.columns:
+        return pd.DataFrame()
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in out.columns:
+            out[col] = out["close"] if col != "volume" else 0.0
+        out[col] = (
+            pd.to_numeric(out[col], errors="coerce").ffill().bfill().fillna(0.0)
+        )
+    close = out["close"].astype(float)
+    vol = out["volume"].astype(float)
     if "amount" in out.columns:
-        amt = pd.to_numeric(out["amount"], errors="coerce").fillna(0.0)
+        amt = pd.to_numeric(out["amount"], errors="coerce")
+        proxy = close * vol
+        out["amount"] = amt.where(amt.notna() & (amt > 0), proxy)
     else:
         typical = (
-            pd.to_numeric(out.get("high", out["close"]), errors="coerce")
-            + pd.to_numeric(out.get("low", out["close"]), errors="coerce")
-            + pd.to_numeric(out["close"], errors="coerce")
+            pd.to_numeric(out.get("high", close), errors="coerce")
+            + pd.to_numeric(out.get("low", close), errors="coerce")
+            + close
         ) / 3.0
-        amt = typical * vol
-    out["amount"] = amt
+        out["amount"] = typical * vol
+    out["amount"] = out["amount"].ffill().bfill().fillna(0.0)
     out["volume"] = vol
     cum_amt = out["amount"].cumsum()
     cum_vol = out["volume"].cumsum().replace(0, np.nan)
-    out["vwap"] = cum_amt / cum_vol
-    out["vwap"] = out["vwap"].ffill().bfill()
-    tk = _minute_macd_kdj(out["close"])
-    for col in tk.columns:
-        out[col] = tk[col].values
+    out["vwap"] = (cum_amt / cum_vol).ffill().bfill()
+    try:
+        tk = _minute_macd_kdj(out["close"])
+        for col in tk.columns:
+            out[col] = tk[col].values
+    except Exception as exc:
+        logger.warning("分钟 MACD/KDJ 计算失败，跳过指标列: %s", exc)
     return out
 
 
 def fetch_today_minute_bars(stock_code: str) -> pd.DataFrame | None:
-    """拉取当日 1 分钟线并 enrich；失败返回 None。"""
-    raw = get_realtime_min_data(stock_code)
-    if raw is None or raw.empty:
+    """拉取当日 1 分钟线并 enrich；失败返回 None（不向外抛异常）。"""
+    try:
+        raw = get_realtime_min_data(stock_code)
+        if raw is None or raw.empty:
+            return None
+        raw = raw.tail(240).reset_index(drop=True)
+        rename_extra = {}
+        for c in raw.columns:
+            sc = str(c)
+            if sc in ("成交额", "amount"):
+                rename_extra[c] = "amount"
+        if rename_extra:
+            raw = raw.rename(columns=rename_extra)
+        enriched = enrich_minute_bars(raw)
+        return enriched if enriched is not None and not enriched.empty else None
+    except Exception as exc:
+        logger.warning("fetch_today_minute_bars(%s) 失败: %s", stock_code, exc)
         return None
-    # 仅保留当天开盘以来的分钟线（或最多保留最近 240 个分钟节点）
-    raw = raw.tail(240).reset_index(drop=True)
-    rename_extra = {}
-    for c in raw.columns:
-        sc = str(c)
-        if sc in ("成交额", "amount"):
-            rename_extra[c] = "amount"
-    if rename_extra:
-        raw = raw.rename(columns=rename_extra)
-    enriched = enrich_minute_bars(raw)
-    return enriched if not enriched.empty else None
 
 
 def _detect_vwap_support(df: pd.DataFrame) -> tuple[str, float, str] | None:

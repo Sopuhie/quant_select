@@ -433,6 +433,31 @@ def _fetch_tencent_minute_data(stock_code: str):
         return None, None
 
 
+def _sanitize_minute_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """分钟线 OHLCV 防御性清洗：缺失列补齐、前后向填充，避免监控/信号层 KeyError。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "close" not in out.columns:
+        return pd.DataFrame()
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in out.columns:
+            out[col] = out["close"] if col != "volume" else 0.0
+        out[col] = (
+            pd.to_numeric(out[col], errors="coerce").ffill().bfill().fillna(0.0)
+        )
+    close = out["close"].astype(float)
+    vol = out["volume"].astype(float)
+    if "amount" in out.columns:
+        amt = pd.to_numeric(out["amount"], errors="coerce")
+        proxy = close * vol
+        out["amount"] = amt.where(amt.notna() & (amt > 0), proxy)
+    else:
+        out["amount"] = close * vol
+    out["amount"] = out["amount"].ffill().bfill().fillna(0.0)
+    return out
+
+
 def get_realtime_min_data(stock_code: object) -> pd.DataFrame | None:
     """获取当日（或最近交易日）1 分钟线；优先腾讯，失败则 AkShare。"""
     import akshare as ak
@@ -482,8 +507,11 @@ def get_realtime_min_data(stock_code: object) -> pd.DataFrame | None:
     df = df[df["time"].dt.strftime("%Y-%m-%d") == fetch_date_str].reset_index(drop=True)
     for c in ("open", "close", "high", "low", "volume"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["close"])
-    return df if not df.empty else None
+    df = df.dropna(subset=["time"])
+    df = _sanitize_minute_ohlcv(df)
+    if df.empty or df["close"].isna().all():
+        return None
+    return df
 
 
 def draw_realtime_line_chart(
