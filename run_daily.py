@@ -577,7 +577,11 @@ def predict_daily(
     print(f"已成功将全市场 {len(predict_rows)} 只股票打分数据写入 daily_predictions。")
 
     # 8. 行业集中度硬风控后取 Top N，写入 daily_selections 表
-    selections = select_top_n_with_industry_cap(filtered_df, TOP_N_SELECTION)
+    selections = select_top_n_with_industry_cap(
+        filtered_df,
+        TOP_N_SELECTION,
+        as_of_date=str(anchor_td)[:10],
+    )
     if selections.empty:
         print(
             f"警告: 行业集中度风控后无法凑满 Top{TOP_N_SELECTION}，"

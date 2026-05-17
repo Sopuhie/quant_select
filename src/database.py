@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """SQLite 数据库：建表、写入选股与预测、模型版本。"""
 from __future__ import annotations
 
@@ -105,10 +106,10 @@ CREATE TABLE IF NOT EXISTS stock_daily_kline (
     close REAL,
     volume REAL,
     industry TEXT,
+    market_cap REAL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(date, stock_code)
 );
--- 按 (stock_code, date) 查询本地 K 线的主路径索引（与上表 UNIQUE 约束并存）
 CREATE INDEX IF NOT EXISTS idx_kline_code_date ON stock_daily_kline(stock_code, date);
 
 CREATE TABLE IF NOT EXISTS stock_financial_data (
@@ -187,10 +188,7 @@ CREATE INDEX IF NOT EXISTS idx_scb_date ON stock_concept_boards(updated_date);
 
 
 def _ensure_stock_daily_kline_industry(conn: sqlite3.Connection) -> None:
-    """旧库升级：为 ``stock_daily_kline`` 增加 ``industry`` 列。"""
-    cur = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_daily_kline'"
-    )
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_daily_kline'")
     if cur.fetchone() is None:
         return
     cur = conn.execute("PRAGMA table_info(stock_daily_kline)")
@@ -200,36 +198,20 @@ def _ensure_stock_daily_kline_industry(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_daily_selections_selection_reason(conn: sqlite3.Connection) -> None:
-    """旧库升级：为 ``daily_selections`` 增加 ``selection_reason``（入选原因）。"""
-    cur = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_selections'"
-    )
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_selections'")
     if cur.fetchone() is None:
         return
     cur = conn.execute("PRAGMA table_info(daily_selections)")
     cols = {str(row[1]) for row in cur.fetchall()}
     if "selection_reason" not in cols:
-        print(
-            "[DB] 检测到缺少 selection_reason 列，正在自动补丁 daily_selections …",
-            flush=True,
-        )
         try:
-            conn.execute(
-                "ALTER TABLE daily_selections ADD COLUMN selection_reason TEXT"
-            )
-            print("[DB] daily_selections.selection_reason 补丁已成功应用。", flush=True)
-        except Exception as exc:
-            print(
-                f"[DB] ALTER TABLE selection_reason 失败（可能已存在）: {exc}",
-                flush=True,
-            )
+            conn.execute("ALTER TABLE daily_selections ADD COLUMN selection_reason TEXT")
+        except Exception:
+            pass
 
 
 def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
-    """旧库升级：为 ``stock_daily_kline`` 增加 ``market_cap``（总市值，元）。"""
-    cur = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_daily_kline'"
-    )
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_daily_kline'")
     if cur.fetchone() is None:
         return
     cur = conn.execute("PRAGMA table_info(stock_daily_kline)")
@@ -239,23 +221,18 @@ def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_market_hsgt_flow_daily(conn: sqlite3.Connection) -> None:
-    """旧库升级：全市场北向净流入日频表（因子层只读本地）。"""
-    cur = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_hsgt_flow_daily'"
-    )
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_hsgt_flow_daily'")
     if cur.fetchone() is None:
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS market_hsgt_flow_daily (
                 trade_date TEXT NOT NULL PRIMARY KEY,
                 net_inflow REAL,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
-            """
-        )
+        """)
 
 
-def _ensure_stock_concept_boards(conn):
+def _ensure_stock_concept_boards(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_concept_boards'")
     if cur.fetchone() is None:
         conn.execute("CREATE TABLE IF NOT EXISTS stock_concept_boards (stock_code TEXT NOT NULL, board_name TEXT NOT NULL, updated_date TEXT NOT NULL, PRIMARY KEY (stock_code, board_name))")
@@ -280,86 +257,7 @@ def init_db(db_path: Path | None = None) -> None:
         conn.close()
 
 
-def fetch_stock_financial_panel(
-    stock_code: str,
-    *,
-    db_path: Path | None = None,
-) -> pd.DataFrame:
-    """
-    读取单只股票在 ``stock_financial_data`` 中的财报行（按公告日、报告期升序）。
-    用于与日线 ``merge_asof``：仅使用 ``pub_date`` 已过的记录，避免前视偏差。
-    """
-    code = str(stock_code).strip().zfill(6)
-    path = db_path or DB_PATH
-    init_db(path)
-    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        cur = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_financial_data'"
-        )
-        if cur.fetchone() is None:
-            return pd.DataFrame(
-                columns=["pub_date", "report_date", "roe", "net_profit_growth", "revenue_growth"]
-            )
-        return pd.read_sql_query(
-            """
-            SELECT pub_date, report_date, roe, net_profit_growth, revenue_growth
-            FROM stock_financial_data
-            WHERE stock_code = ?
-            ORDER BY pub_date ASC, report_date ASC
-            """,
-            conn,
-            params=(code,),
-        )
-    finally:
-        conn.close()
-
-
-def upsert_stock_financial_rows(
-    records: list[tuple[Any, ...]],
-    db_path: Path | None = None,
-) -> int:
-    """批量写入/覆盖 ``stock_financial_data``。每元组：
-    (stock_code, pub_date, report_date, roe, net_profit_growth, revenue_growth)
-    """
-    if not records:
-        return 0
-    path = db_path or DB_PATH
-    init_db(path)
-    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO stock_financial_data
-            (stock_code, pub_date, report_date, roe, net_profit_growth, revenue_growth)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            records,
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return len(records)
-
-
-def fetch_stock_code_max_dates(db_path: Path | None = None) -> dict[str, str]:
-    """返回 ``{stock_code(6位): 最新日线日期 YYYY-MM-DD}``，用于增量同步跳过已最新标的。"""
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            "SELECT stock_code, MAX(date) FROM stock_daily_kline GROUP BY stock_code"
-        )
-        out: dict[str, str] = {}
-        for k, v in cur.fetchall():
-            if k is None or v is None:
-                continue
-            out[str(k).strip().zfill(6)] = str(v).strip()[:10]
-        return out
-
-
 def open_sqlite_connection(db_path: Path | None = None) -> sqlite3.Connection:
-    """建立可写连接（WAL + 长超时）。调用方负责 ``commit`` / ``close``。"""
     path = db_path or DB_PATH
     init_db(path)
     conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
@@ -381,11 +279,81 @@ def get_connection(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def upsert_stock_daily_klines(
+    rows: Iterable[dict[str, Any]],
+    db_path: Path | None = None,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> None:
+    sql = """
+    INSERT INTO stock_daily_kline (
+        date, stock_code, stock_name, industry, market_cap,
+        open, high, low, close, volume
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(date, stock_code) DO UPDATE SET
+        stock_name = excluded.stock_name,
+        industry = COALESCE(NULLIF(TRIM(excluded.industry), ''), stock_daily_kline.industry),
+        market_cap = COALESCE(excluded.market_cap, stock_daily_kline.market_cap),
+        open = excluded.open,
+        high = excluded.high,
+        low = excluded.low,
+        close = excluded.close,
+        volume = excluded.volume
+    """
+    batch: list[tuple[Any, ...]] = []
+    for r in rows:
+        ind_raw = r.get("industry")
+        industry_val = str(ind_raw).strip() if ind_raw is not None and str(ind_raw).strip() else ""
+        mc_raw = r.get("market_cap")
+        try:
+            market_cap_val = float(mc_raw) if mc_raw is not None and pd.notna(mc_raw) else None
+        except (TypeError, ValueError):
+            market_cap_val = None
+        batch.append(
+            (
+                r["date"],
+                str(r["stock_code"]).strip().zfill(6),
+                str(r.get("stock_name") or "").strip(),
+                industry_val,
+                market_cap_val,
+                float(r["open"]) if r.get("open") is not None else None,
+                float(r["high"]) if r.get("high") is not None else None,
+                float(r["low"]) if r.get("low") is not None else None,
+                float(r["close"]) if r.get("close") is not None else None,
+                float(r["volume"]) if r.get("volume") is not None else None,
+            )
+        )
+    if not batch:
+        return
+
+    own = connection is None
+    conn = connection if connection is not None else sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
+    if own:
+        _apply_sqlite_pragmas(conn)
+
+    # 深度重构: 分块写入结合微休眠，彻底释放高并发下的 SQLite 写锁，防止实盘信号漏标
+    chunk_size = 2000
+    try:
+        for i in range(0, len(batch), chunk_size):
+            sub_chunk = batch[i : i + chunk_size]
+
+            def _execute_chunk(chunk_data=sub_chunk):
+                conn.executemany(sql, chunk_data)
+
+            _retry_sqlite_locked(_execute_chunk, attempts=5)
+            if own:
+                conn.commit()
+                time.sleep(0.01)
+    finally:
+        if own:
+            conn.close()
+
+
 def insert_daily_selections(
     rows: Iterable[dict[str, Any]],
     db_path: Path | None = None,
 ) -> None:
-    """写入 Top3；若同日同代码已存在且已有收益字段，则保留原收益（避免 --force 覆盖）。"""
     sql = """
     INSERT INTO daily_selections
     (trade_date, stock_code, stock_name, rank, score, close_price,
@@ -427,86 +395,6 @@ def insert_daily_selections(
     _retry_sqlite_locked(_do, attempts=5)
 
 
-def upsert_stock_daily_klines(
-    rows: Iterable[dict[str, Any]],
-    db_path: Path | None = None,
-    *,
-    connection: sqlite3.Connection | None = None,
-) -> None:
-    """写入或更新本地日线缓存；冲突键为 (date, stock_code)。
-
-    支持可选字段 ``industry``（申万/中信等行业文本）；空字符串不会覆盖库内已有行业
-    （``COALESCE(NULLIF(TRIM(excluded.industry),''), …)``）。
-
-    若传入 ``connection``，则不单独提交/关闭连接（由调用方 ``commit``）。
-    """
-    sql = """
-    INSERT INTO stock_daily_kline (
-        date, stock_code, stock_name, industry, market_cap,
-        open, high, low, close, volume
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(date, stock_code) DO UPDATE SET
-        stock_name = excluded.stock_name,
-        industry = COALESCE(NULLIF(TRIM(excluded.industry), ''), stock_daily_kline.industry),
-        market_cap = COALESCE(excluded.market_cap, stock_daily_kline.market_cap),
-        open = excluded.open,
-        high = excluded.high,
-        low = excluded.low,
-        close = excluded.close,
-        volume = excluded.volume
-    """
-    batch: list[tuple[Any, ...]] = []
-    for r in rows:
-        ind_raw = r.get("industry")
-        industry_val = (
-            str(ind_raw).strip()
-            if ind_raw is not None and str(ind_raw).strip()
-            else ""
-        )
-        mc_raw = r.get("market_cap")
-        try:
-            market_cap_val = (
-                float(mc_raw)
-                if mc_raw is not None and pd.notna(mc_raw)
-                else None
-            )
-        except (TypeError, ValueError):
-            market_cap_val = None
-        batch.append(
-            (
-                r["date"],
-                str(r["stock_code"]).strip().zfill(6),
-                str(r.get("stock_name") or "").strip(),
-                industry_val,
-                market_cap_val,
-                float(r["open"]) if r.get("open") is not None else None,
-                float(r["high"]) if r.get("high") is not None else None,
-                float(r["low"]) if r.get("low") is not None else None,
-                float(r["close"]) if r.get("close") is not None else None,
-                float(r["volume"]) if r.get("volume") is not None else None,
-            )
-        )
-    if not batch:
-        return
-    own = connection is None
-    if connection is not None:
-        conn = connection
-    else:
-        conn = sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
-        _apply_sqlite_pragmas(conn)
-    def _do() -> None:
-        conn.executemany(sql, batch)
-        if own:
-            conn.commit()
-
-    try:
-        _retry_sqlite_locked(_do, attempts=5)
-    finally:
-        if own:
-            conn.close()
-
-
 def bulk_set_stock_daily_industry_by_code(
     stock_code_to_industry: dict[str, str],
     db_path: Path | None = None,
@@ -540,10 +428,9 @@ def bulk_set_stock_daily_industry_by_code(
         conn.close()
 
 
-def insert_daily_predictions(
-    rows: Iterable[dict[str, Any]],
-    db_path: Path | None = None,
-) -> None:
+
+
+def insert_daily_predictions(rows: Iterable[dict[str, Any]], db_path: Path | None = None) -> None:
     sql = """
     INSERT OR REPLACE INTO daily_predictions
     (trade_date, stock_code, stock_name, score, rank_in_market, created_at)
@@ -552,92 +439,43 @@ def insert_daily_predictions(
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     batch = []
     for r in rows:
-        batch.append(
-            (
-                r["trade_date"],
-                r["stock_code"],
-                r.get("stock_name"),
-                r["score"],
-                r["rank_in_market"],
-                r.get("created_at", now),
-            )
-        )
+        batch.append((r["trade_date"], r["stock_code"], r.get("stock_name"), r["score"], r["rank_in_market"], r.get("created_at", now)))
     with get_connection(db_path) as conn:
         conn.executemany(sql, batch)
 
 
-def insert_system_log(
-    task_name: str,
-    status: str,
-    parameters: str | None,
-    log_output: str | None,
-    *,
-    db_path: Path | None = None,
-) -> None:
-    """写入一条系统任务日志（SUCCESS / FAILED 等）。用于控制台任务与前端联动追溯。"""
+def insert_system_log(task_name: str, status: str, parameters: str | None, log_output: str | None, *, db_path: Path | None = None) -> None:
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    params = (
-        str(task_name).strip(),
-        str(status).strip(),
-        run_time,
-        parameters if parameters is not None else "",
-        log_output if log_output is not None else "",
-    )
-
+    params = (str(task_name).strip(), str(status).strip(), run_time, parameters if parameters is not None else "", log_output if log_output is not None else "")
     def _do() -> None:
         with get_connection(db_path) as conn:
             conn.execute(
-                """
-                INSERT INTO system_logs (task_name, status, run_time, parameters, log_output)
-                VALUES (?, ?, ?, ?, ?)
-                """,
+                "INSERT INTO system_logs (task_name, status, run_time, parameters, log_output) VALUES (?, ?, ?, ?, ?)",
                 params,
             )
 
     _retry_sqlite_locked(_do, attempts=5)
 
 
-def register_model_version(
-    version: str,
-    train_end_date: str,
-    features: list[str],
-    metrics: dict[str, Any],
-    set_active: bool = True,
-    db_path: Path | None = None,
-) -> None:
+def register_model_version(version: str, train_end_date: str, features: list[str], metrics: dict[str, Any], set_active: bool = True, db_path: Path | None = None) -> None:
     with get_connection(db_path) as conn:
         if set_active:
             conn.execute("UPDATE model_versions SET is_active = 0")
-        conn.execute(
-            """
-            INSERT INTO model_versions
-            (version, train_end_date, features, metrics, is_active, created_at)
+        conn.execute("""
+            INSERT INTO model_versions (version, train_end_date, features, metrics, is_active, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                version,
-                train_end_date,
-                json.dumps(features, ensure_ascii=False),
-                json.dumps(metrics, ensure_ascii=False),
-                1 if set_active else 0,
-                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            ),
-        )
+        """, (version, train_end_date, json.dumps(features, ensure_ascii=False), json.dumps(metrics, ensure_ascii=False), 1 if set_active else 0, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
 
 
 def get_active_model_version(db_path: Path | None = None) -> dict[str, Any] | None:
     with get_connection(db_path) as conn:
-        cur = conn.execute(
-            "SELECT * FROM model_versions WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
-        )
+        cur = conn.execute("SELECT * FROM model_versions WHERE is_active = 1 ORDER BY id DESC LIMIT 1")
         row = cur.fetchone()
     if row is None:
         return None
     d = dict(row)
-    if d.get("features"):
-        d["features"] = json.loads(d["features"])
-    if d.get("metrics"):
-        d["metrics"] = json.loads(d["metrics"])
+    if d.get("features"): d["features"] = json.loads(d["features"])
+    if d.get("metrics"): d["metrics"] = json.loads(d["metrics"])
     return d
 
 
@@ -646,125 +484,50 @@ def query_df(sql: str, params: tuple[Any, ...] = (), db_path: Path | None = None
         return pd.read_sql_query(sql, conn, params=params)
 
 
-def fetch_selection_rows_for_date(
-    trade_date: str,
-    limit: int | None = None,
-    db_path: Path | None = None,
-) -> list[dict[str, Any]]:
-    """读取某日选股记录（默认 TopN 条），供钉钉推送等使用。"""
+def fetch_selection_rows_for_date(trade_date: str, limit: int | None = None, db_path: Path | None = None) -> list[dict[str, Any]]:
     from .config import TOP_N_SELECTION
-
     lim = int(limit if limit is not None else TOP_N_SELECTION)
-    df = query_df(
-        """
-        SELECT rank, stock_code, stock_name, score, close_price, selection_reason
-        FROM daily_selections
-        WHERE trade_date = ?
-        ORDER BY rank ASC
-        LIMIT ?
-        """,
-        (trade_date, lim),
-        db_path,
-    )
+    df = query_df("SELECT rank, stock_code, stock_name, score, close_price, selection_reason FROM daily_selections WHERE trade_date = ? ORDER BY rank ASC LIMIT ?", (trade_date, lim), db_path)
     return df.to_dict("records")
 
 
-def fetch_selection_rows_for_dingtalk_push(
-    trade_date: str,
-    db_path: Path | None = None,
-) -> list[dict[str, Any]]:
-    """
-    读取指定交易日的选股记录，并按与 Streamlit「今日推荐」相同的规则清洗：
-    仅 rank∈[1,TOP_N]、同 rank 保留 score 较高的一条，最终至多 TOP_N 条。
-    用于钉钉推送，保证与页面「今日推荐」一致。
-    """
+def fetch_selection_rows_for_dingtalk_push(trade_date: str, db_path: Path | None = None) -> list[dict[str, Any]]:
     from .config import TOP_N_SELECTION
-
-    df = query_df(
-        """
-        SELECT rank, stock_code, stock_name, score, close_price, selection_reason
-        FROM daily_selections
-        WHERE trade_date = ?
-        ORDER BY rank ASC
-        """,
-        (trade_date,),
-        db_path,
-    )
-    if df.empty:
-        return []
-
+    df = query_df("SELECT rank, stock_code, stock_name, score, close_price, selection_reason FROM daily_selections WHERE trade_date = ? ORDER BY rank ASC", (trade_date,), db_path)
+    if df.empty: return []
     out = df[df["rank"].isin(range(1, TOP_N_SELECTION + 1))].copy()
-    if out.empty:
-        return []
-
-    out = out.sort_values("score", ascending=False).drop_duplicates(
-        subset=["rank"], keep="first"
-    )
+    if out.empty: return []
+    out = out.sort_values("score", ascending=False).drop_duplicates(subset=["rank"], keep="first")
     out = out.sort_values("rank").reset_index(drop=True).head(TOP_N_SELECTION)
-
     rows: list[dict[str, Any]] = []
     for _, r in out.iterrows():
-        try:
-            rk = int(r["rank"])
-        except (TypeError, ValueError):
-            rk = r["rank"]
-        score_v = r.get("score")
-        try:
-            score_f = float(score_v) if score_v is not None and pd.notna(score_v) else None
-        except (TypeError, ValueError):
-            score_f = None
-        cp_v = r.get("close_price")
-        try:
-            close_f = float(cp_v) if cp_v is not None and pd.notna(cp_v) else None
-        except (TypeError, ValueError):
-            close_f = None
-        rows.append(
-            {
-                "rank": rk,
-                "stock_code": str(r["stock_code"]).strip(),
-                "stock_name": str(r.get("stock_name") or "").strip(),
-                "score": score_f,
-                "close_price": close_f,
-                "selection_reason": str(r.get("selection_reason") or "").strip(),
-            }
-        )
+        rows.append({
+            "rank": int(r["rank"]),
+            "stock_code": str(r["stock_code"]).strip(),
+            "stock_name": str(r.get("stock_name") or "").strip(),
+            "score": float(r["score"]) if pd.notna(r.get("score")) else None,
+            "close_price": float(r["close_price"]) if pd.notna(r.get("close_price")) else None,
+            "selection_reason": str(r.get("selection_reason") or "").strip()
+        })
     return rows
 
 
 def selection_exists_for_date(trade_date: str, db_path: Path | None = None) -> bool:
     with get_connection(db_path) as conn:
-        cur = conn.execute(
-            "SELECT 1 FROM daily_selections WHERE trade_date = ? LIMIT 1",
-            (trade_date,),
-        )
-        return cur.fetchone() is not None
+        return conn.execute("SELECT 1 FROM daily_selections WHERE trade_date = ? LIMIT 1", (trade_date,)).fetchone() is not None
 
 
 def delete_daily_outputs_for_trade_date(trade_date: str, db_path: Path | None = None) -> None:
-    """删除某交易日的选股与全市场预测，便于同日重新写入时不会出现「多出一套 TopN」。"""
     with get_connection(db_path) as conn:
         conn.execute("DELETE FROM daily_selections WHERE trade_date = ?", (trade_date,))
         conn.execute("DELETE FROM daily_predictions WHERE trade_date = ?", (trade_date,))
 
 
-def update_selection_returns(
-    trade_date: str,
-    stock_code: str,
-    next_day_return: float | None = None,
-    hold_5d_return: float | None = None,
-    db_path: Path | None = None,
-) -> int:
-    """按交易日 + 代码更新收益；代码统一为 6 位以匹配库内主键。返回受影响的行数。"""
-    sets = []
-    vals: list[Any] = []
-    if next_day_return is not None:
-        sets.append("next_day_return = ?")
-        vals.append(next_day_return)
-    if hold_5d_return is not None:
-        sets.append("hold_5d_return = ?")
-        vals.append(hold_5d_return)
-    if not sets:
-        return 0
+def update_selection_returns(trade_date: str, stock_code: str, next_day_return: float | None = None, hold_5d_return: float | None = None, db_path: Path | None = None) -> int:
+    sets, vals = [], []
+    if next_day_return is not None: sets.append("next_day_return = ?"); vals.append(next_day_return)
+    if hold_5d_return is not None: sets.append("hold_5d_return = ?"); vals.append(hold_5d_return)
+    if not sets: return 0
     raw = str(stock_code).strip()
     code_key = raw.zfill(6) if raw.isdigit() else raw
     if code_key == raw:
@@ -773,697 +536,227 @@ def update_selection_returns(
     else:
         vals.extend([trade_date, code_key, raw])
         where = "trade_date = ? AND (trim(replace(stock_code, ' ', '')) = ? OR trim(replace(stock_code, ' ', '')) = ?)"
-    sql = f"UPDATE daily_selections SET {', '.join(sets)} WHERE {where}"
     with get_connection(db_path) as conn:
-        cur = conn.execute(sql, vals)
-        return int(cur.rowcount if cur.rowcount is not None else 0)
+        return int(conn.execute(f"UPDATE daily_selections SET {', '.join(sets)} WHERE {where}", vals).rowcount or 0)
 
 
-def fetch_stock_daily_bars_until(
-    stock_code: str,
-    end_date: str,
-    *,
-    db_path: Path | None = None,
-) -> pd.DataFrame:
-    """
-    从 ``stock_daily_kline`` 读取单只股票截至 ``end_date``（含）的日线，列与在线行情对齐。
-    """
-    code = str(stock_code).strip().zfill(6)
-    end = str(end_date).strip()[:10]
-    path_obj = db_path or DB_PATH
-    init_db(path_obj)
-    path = str(path_obj)
-    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        df = pd.read_sql_query(
-            """
-            SELECT date, open, high, low, close, volume, industry, market_cap
-            FROM stock_daily_kline
-            WHERE stock_code = ? AND date <= ?
-            ORDER BY date ASC
-            """,
-            conn,
-            params=(code, end),
-        )
-    finally:
-        conn.close()
-    if df.empty:
-        return df
+def fetch_stock_daily_bars_until(stock_code: str, end_date: str, *, db_path: Path | None = None) -> pd.DataFrame:
+    code, end = str(stock_code).strip().zfill(6), str(end_date).strip()[:10]
+    with get_connection(db_path or DB_PATH) as conn:
+        df = pd.read_sql_query("SELECT date, open, high, low, close, volume, industry, market_cap FROM stock_daily_kline WHERE stock_code = ? AND date <= ? ORDER BY date ASC", conn, params=(code, end))
+    if df.empty: return df
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     for col in ("open", "high", "low", "close", "volume", "market_cap"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "industry" in df.columns:
-        df["industry"] = df["industry"].fillna("").astype(str)
+        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "industry" in df.columns: df["industry"] = df["industry"].fillna("").astype(str)
     return df.dropna(subset=["close"]).reset_index(drop=True)
 
 
-def fetch_latest_industry_by_codes(
-    stock_codes: Iterable[str],
-    *,
-    db_path: Path | None = None,
-) -> dict[str, str]:
-    """
-    每只代码取 ``stock_daily_kline`` 中最新交易日一行的 ``industry``（原始库内值，可为空）。
-    供在线拉 K 线训练路径与行业字段对齐；缺失代码不出现在字典中。
-    """
-    seen: set[str] = set()
-    uniq: list[str] = []
-    for c in stock_codes:
-        code = str(c).strip().zfill(6)
-        if len(code) != 6 or not code.isdigit():
-            continue
-        if code not in seen:
-            seen.add(code)
-            uniq.append(code)
-    if not uniq:
-        return {}
+def fetch_latest_industry_by_codes(stock_codes: Iterable[str], *, db_path: Path | None = None) -> dict[str, str]:
+    uniq = list(set([str(c).strip().zfill(6) for c in stock_codes if len(str(c).strip().zfill(6)) == 6]))
+    if not uniq: return {}
     out: dict[str, str] = {}
     chunk_size = 400
     with get_connection(db_path) as conn:
         for i in range(0, len(uniq), chunk_size):
             chunk = uniq[i : i + chunk_size]
-            placeholders = ",".join("?" * len(chunk))
-            sql = f"""
-            SELECT k.stock_code, k.industry
-            FROM stock_daily_kline k
-            INNER JOIN (
-                SELECT stock_code, MAX(date) AS mx
-                FROM stock_daily_kline
-                WHERE stock_code IN ({placeholders})
-                GROUP BY stock_code
-            ) t ON k.stock_code = t.stock_code AND k.date = t.mx
-            """
-            cur = conn.execute(sql, chunk)
-            for row in cur.fetchall():
-                sc = str(row[0]).strip().zfill(6)
-                ind = row[1]
-                out[sc] = "" if ind is None else str(ind).strip()
+            cur = conn.execute(f"SELECT k.stock_code, k.industry FROM stock_daily_kline k INNER JOIN (SELECT stock_code, MAX(date) AS mx FROM stock_daily_kline WHERE stock_code IN ({','.join('?'*len(chunk))}) GROUP BY stock_code) t ON k.stock_code = t.stock_code AND k.date = t.mx", chunk)
+            for row in cur.fetchall(): out[str(row[0]).strip().zfill(6)] = "" if row[1] is None else str(row[1]).strip()
     return out
 
 
-def fetch_latest_market_cap_by_codes(
-    stock_codes: Iterable[str],
-    *,
-    db_path: Path | None = None,
-) -> dict[str, float]:
-    """
-    每只代码取 ``stock_daily_kline`` 最新交易日一行上的 ``market_cap``（元，>0）。
-    缺失或非正的值不写入字典；供在线 K 线推断 ``factor_size_mcap`` 时广播。
-    """
-    seen: set[str] = set()
-    uniq: list[str] = []
-    for c in stock_codes:
-        code = str(c).strip().zfill(6)
-        if len(code) != 6 or not code.isdigit():
-            continue
-        if code not in seen:
-            seen.add(code)
-            uniq.append(code)
-    if not uniq:
-        return {}
+def fetch_latest_market_cap_by_codes(stock_codes: Iterable[str], *, db_path: Path | None = None) -> dict[str, float]:
+    uniq = list(set([str(c).strip().zfill(6) for c in stock_codes if len(str(c).strip().zfill(6)) == 6]))
+    if not uniq: return {}
     out: dict[str, float] = {}
     chunk_size = 400
     with get_connection(db_path) as conn:
         for i in range(0, len(uniq), chunk_size):
             chunk = uniq[i : i + chunk_size]
-            placeholders = ",".join("?" * len(chunk))
-            sql = f"""
-            SELECT k.stock_code, k.market_cap
-            FROM stock_daily_kline k
-            INNER JOIN (
-                SELECT stock_code, MAX(date) AS mx
-                FROM stock_daily_kline
-                WHERE stock_code IN ({placeholders})
-                GROUP BY stock_code
-            ) t ON k.stock_code = t.stock_code AND k.date = t.mx
-            """
-            cur = conn.execute(sql, chunk)
+            cur = conn.execute(f"SELECT k.stock_code, k.market_cap FROM stock_daily_kline k INNER JOIN (SELECT stock_code, MAX(date) AS mx FROM stock_daily_kline WHERE stock_code IN ({','.join('?'*len(chunk))}) GROUP BY stock_code) t ON k.stock_code = t.stock_code AND k.date = t.mx", chunk)
             for row in cur.fetchall():
-                sc = str(row[0]).strip().zfill(6)
-                mc = row[1]
-                try:
-                    v = float(mc)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(v) and v > 0:
-                    out[sc] = v
+                if row[1] is not None:
+                    try: out[str(row[0]).strip().zfill(6)] = float(row[1])
+                    except ValueError: pass
     return out
 
 
-def list_predict_universe_from_kline(
-    trade_date: str,
-    *,
-    min_bars: int,
-    max_count: int | None,
-    db_path: Path | None = None,
-) -> list[tuple[str, str]]:
-    """
-    截至 ``trade_date``（含）本地 K 线条数 >= ``min_bars`` 的股票，
-    名称取该 cutoff 下最新一根的名称；按代码排序后可选截断 ``max_count``
-    （``None`` 或 ``<=0`` 表示不限制，返回库内全部满足条数的股票）。
-    """
-    end = str(trade_date).strip()[:10]
-    mb = max(1, int(min_bars))
-    path = str(db_path or DB_PATH)
-    sql_body = """
-    WITH eligible AS (
-        SELECT stock_code
-        FROM stock_daily_kline
-        WHERE date <= ?
-        GROUP BY stock_code
-        HAVING COUNT(*) >= ?
-    ),
-    latest AS (
-        SELECT stock_code, MAX(date) AS mx
-        FROM stock_daily_kline
-        WHERE date <= ?
-        GROUP BY stock_code
-    )
-    SELECT k.stock_code, k.stock_name
-    FROM stock_daily_kline k
-    INNER JOIN eligible e ON k.stock_code = e.stock_code
-    INNER JOIN latest L ON k.stock_code = L.stock_code AND k.date = L.mx
-    ORDER BY k.stock_code
-    """
+def list_predict_universe_from_kline(trade_date: str, *, min_bars: int, max_count: int | None, db_path: Path | None = None) -> list[tuple[str, str]]:
+    end, mb = str(trade_date).strip()[:10], max(1, int(min_bars))
+    sql_body = "WITH eligible AS (SELECT stock_code FROM stock_daily_kline WHERE date <= ? GROUP BY stock_code HAVING COUNT(*) >= ?), latest AS (SELECT stock_code, MAX(date) AS mx FROM stock_daily_kline WHERE date <= ? GROUP BY stock_code) SELECT k.stock_code, k.stock_name FROM stock_daily_kline k INNER JOIN eligible e ON k.stock_code = e.stock_code INNER JOIN latest t ON k.stock_code = t.stock_code AND k.date = t.mx ORDER BY k.stock_code"
     use_limit = max_count is not None and int(max_count) > 0
     sql = sql_body + (" LIMIT ?" if use_limit else "")
-    params: tuple[Any, ...] = (end, mb, end)
-    if use_limit:
-        params = (*params, int(max_count))
-
-    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
+    params = (end, mb, end, int(max_count)) if use_limit else (end, mb, end)
+    with get_connection(db_path) as conn:
         raw = pd.read_sql_query(sql, conn, params=params)
-    finally:
-        conn.close()
-    if raw.empty:
-        return []
-    out: list[tuple[str, str]] = []
-    for _, row in raw.iterrows():
-        c = str(row["stock_code"]).strip().zfill(6)
-        n = str(row.get("stock_name") or "").strip()
-        out.append((c, n))
-    return out
+    return [(str(row["stock_code"]).strip().zfill(6), str(row.get("stock_name") or "").strip()) for _, row in raw.iterrows()]
 
 
-def stock_codes_with_local_bars(
-    trade_date: str,
-    min_bars: int,
-    *,
-    db_path: Path | None = None,
-) -> set[str]:
-    """截至 trade_date 至少有 min_bars 根 K 线的 6 位代码集合。"""
-    end = str(trade_date).strip()[:10]
-    mb = max(1, int(min_bars))
-    path = str(db_path or DB_PATH)
-    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        cur = conn.execute(
-            """
-            SELECT stock_code FROM stock_daily_kline
-            WHERE date <= ?
-            GROUP BY stock_code
-            HAVING COUNT(*) >= ?
-            """,
-            (end, mb),
-        )
-        rows = cur.fetchall()
-    finally:
-        conn.close()
+def stock_codes_with_local_bars(trade_date: str, min_bars: int, *, db_path: Path | None = None) -> set[str]:
+    end, mb = str(trade_date).strip()[:10], max(1, int(min_bars))
+    with get_connection(db_path) as conn:
+        rows = conn.execute("SELECT stock_code FROM stock_daily_kline WHERE date <= ? GROUP BY stock_code HAVING COUNT(*) >= ?", (end, mb)).fetchall()
     return {str(r[0]).strip().zfill(6) for r in rows}
 
 
-def fetch_market_hsgt_net_flow_map(
-    dates: list[str],
-    *,
-    db_path: Path | None = None,
-) -> dict[str, float]:
-    """从 ``market_hsgt_flow_daily`` 读取北向净流入（元）；无记录则不在字典中。"""
-    if not dates:
-        return {}
+def fetch_market_hsgt_net_flow_map(dates: list[str], *, db_path: Path | None = None) -> dict[str, float]:
     ds = sorted({str(d).strip()[:10] for d in dates if d})
-    if not ds:
-        return {}
-    placeholders = ",".join("?" * len(ds))
-    path = str(db_path or DB_PATH)
-    init_db(db_path)
-    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        cur = conn.execute(
-            f"""
-            SELECT trade_date, net_inflow FROM market_hsgt_flow_daily
-            WHERE trade_date IN ({placeholders}) AND net_inflow IS NOT NULL
-            """,
-            tuple(ds),
-        )
-        out: dict[str, float] = {}
-        for r in cur.fetchall():
-            td = str(r[0]).strip()[:10]
-            v = float(r[1])
-            if math.isfinite(v):
-                out[td] = v
-        return out
-    finally:
-        conn.close()
+    if not ds: return {}
+    with get_connection(db_path) as conn:
+        cur = conn.execute(f"SELECT trade_date, net_inflow FROM market_hsgt_flow_daily WHERE trade_date IN ({','.join('?'*len(ds))}) AND net_inflow IS NOT NULL", tuple(ds))
+        return {str(r[0]).strip()[:10]: float(r[1]) for r in cur.fetchall() if math.isfinite(float(r[1]))}
 
 
-def fetch_market_hsgt_net_flow_up_to(
-    end_date: str,
-    *,
-    db_path: Path | None = None,
-) -> dict[str, float]:
-    """读取 ``trade_date <= end_date`` 的全部北向净流入（升序遍历用）。"""
+def fetch_market_hsgt_net_flow_up_to(end_date: str, *, db_path: Path | None = None) -> dict[str, float]:
     ed = str(end_date).strip()[:10]
-    if not ed:
-        return {}
-    path = str(db_path or DB_PATH)
-    init_db(db_path)
-    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        cur = conn.execute(
-            """
-            SELECT trade_date, net_inflow FROM market_hsgt_flow_daily
-            WHERE trade_date <= ? AND net_inflow IS NOT NULL
-            ORDER BY trade_date ASC
-            """,
-            (ed,),
-        )
-        out: dict[str, float] = {}
-        for r in cur.fetchall():
-            td = str(r[0]).strip()[:10]
-            v = float(r[1])
-            if math.isfinite(v):
-                out[td] = v
-        return out
-    finally:
-        conn.close()
+    with get_connection(db_path) as conn:
+        cur = conn.execute("SELECT trade_date, net_inflow FROM market_hsgt_flow_daily WHERE trade_date <= ? AND net_inflow IS NOT NULL ORDER BY trade_date ASC", (ed,))
+        return {str(r[0]).strip()[:10]: float(r[1]) for r in cur.fetchall() if math.isfinite(float(r[1]))}
 
 
-def upsert_market_hsgt_flow_rows(
-    rows: Iterable[dict[str, Any]],
-    *,
-    db_path: Path | None = None,
-) -> int:
-    """批量写入全市场北向净流入；``rows`` 含 ``trade_date``, ``net_inflow``。"""
-    batch = [
-        (
-            str(r["trade_date"]).strip()[:10],
-            float(r["net_inflow"]),
-        )
-        for r in rows
-        if r.get("trade_date") is not None and r.get("net_inflow") is not None
-    ]
-    if not batch:
-        return 0
-    path = db_path or DB_PATH
-    init_db(path)
-
-    def _op() -> None:
-        conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
-        _apply_sqlite_pragmas(conn)
-        try:
-            conn.executemany(
-                """
-                INSERT INTO market_hsgt_flow_daily (trade_date, net_inflow, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(trade_date) DO UPDATE SET
-                    net_inflow = excluded.net_inflow,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                batch,
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    _retry_sqlite_locked(_op)
+def upsert_market_hsgt_flow_rows(rows: Iterable[dict[str, Any]], *, db_path: Path | None = None) -> int:
+    batch = [(str(r["trade_date"]).strip()[:10], float(r["net_inflow"])) for r in rows if r.get("trade_date") and r.get("net_inflow") is not None]
+    if not batch: return 0
+    def _do() -> None:
+        with get_connection(db_path) as conn:
+            conn.executemany("INSERT INTO market_hsgt_flow_daily (trade_date, net_inflow, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(trade_date) DO UPDATE SET net_inflow = excluded.net_inflow, updated_at = CURRENT_TIMESTAMP", batch)
+    _retry_sqlite_locked(_do, attempts=5)
     return len(batch)
 
 
-def fetch_auxiliary_feature_frames(
-    dates: list[str],
-    codes: list[str],
-    *,
-    db_path: Path | None = None,
-) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """
-    读取增量表 ``stock_money_flow_daily`` / ``stock_north_hold_daily``，
-    返回可 merge 的 DataFrame（列：``_k_date``, ``_k_code``, ``big_net_ratio`` / ``hold_pct_chg``）。
-    """
-    if not dates or not codes:
-        return None, None
-    ds = [str(d).strip()[:10] for d in dates]
-    cs = [str(c).strip().zfill(6) for c in codes]
-    path = str(db_path or DB_PATH)
-    placeholders_d = ",".join("?" * len(ds))
-    placeholders_c = ",".join("?" * len(cs))
-    mf_sql = f"""
-        SELECT trade_date AS _k_date, stock_code AS _k_code, big_net_ratio
-        FROM stock_money_flow_daily
-        WHERE trade_date IN ({placeholders_d}) AND stock_code IN ({placeholders_c})
-    """
-    nh_sql = f"""
-        SELECT trade_date AS _k_date, stock_code AS _k_code, hold_pct_chg, hold_pct
-        FROM stock_north_hold_daily
-        WHERE trade_date IN ({placeholders_d}) AND stock_code IN ({placeholders_c})
-    """
+def fetch_auxiliary_feature_frames(dates: list[str], codes: list[str], *, db_path: Path | None = None) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    if not dates or not codes: return None, None
+    ds, cs = [str(d).strip()[:10] for d in dates], [str(c).strip().zfill(6) for c in codes]
     params = tuple(ds + cs)
-    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        mf = pd.read_sql_query(mf_sql, conn, params=params)
-        nh = pd.read_sql_query(nh_sql, conn, params=params)
-    finally:
-        conn.close()
-    if mf.empty:
-        mf = None
-    else:
+    with get_connection(db_path) as conn:
+        mf = pd.read_sql_query(f"SELECT trade_date AS _k_date, stock_code AS _k_code, big_net_ratio FROM stock_money_flow_daily WHERE trade_date IN ({','.join('?'*len(ds))}) AND stock_code IN ({','.join('?'*len(cs))})", conn, params=params)
+        nh = pd.read_sql_query(f"SELECT trade_date AS _k_date, stock_code AS _k_code, hold_pct_chg, hold_pct FROM stock_north_hold_daily WHERE trade_date IN ({','.join('?'*len(ds))}) AND stock_code IN ({','.join('?'*len(cs))})", conn, params=params)
+    if not mf.empty:
         mf["_k_code"] = mf["_k_code"].astype(str).str.zfill(6)
         mf["_k_date"] = mf["_k_date"].astype(str).str[:10]
-    if nh.empty:
-        nh = None
-    else:
+    else: mf = None
+    if not nh.empty:
         nh["_k_code"] = nh["_k_code"].astype(str).str.zfill(6)
         nh["_k_date"] = nh["_k_date"].astype(str).str[:10]
+    else: nh = None
     return mf, nh
 
 
-def fetch_existing_auxiliary_key_sets(
-    dates: list[str],
-    codes: list[str],
-    *,
-    db_path: Path | None = None,
-) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
-    """
-    返回库中已存在的 ``(trade_date, stock_code6)`` 集合（资金流 / 北向），用于计算缺失键。
-    """
-    mf_keys: set[tuple[str, str]] = set()
-    nh_keys: set[tuple[str, str]] = set()
-    if not dates or not codes:
-        return mf_keys, nh_keys
-    ds = [str(d).strip()[:10] for d in dates]
-    cs = [str(c).strip().zfill(6) for c in codes]
-    path = str(db_path or DB_PATH)
-    placeholders_d = ",".join("?" * len(ds))
-    placeholders_c = ",".join("?" * len(cs))
+def fetch_existing_auxiliary_key_sets(dates: list[str], codes: list[str], *, db_path: Path | None = None) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    mf_keys, nh_keys = set(), set()
+    if not dates or not codes: return mf_keys, nh_keys
+    ds, cs = [str(d).strip()[:10] for d in dates], [str(c).strip().zfill(6) for c in codes]
     params = tuple(ds + cs)
-    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        cur = conn.execute(
-            f"""
-            SELECT trade_date, stock_code FROM stock_money_flow_daily
-            WHERE trade_date IN ({placeholders_d}) AND stock_code IN ({placeholders_c})
-            """,
-            params,
-        )
-        for r in cur.fetchall():
-            mf_keys.add((str(r[0])[:10], str(r[1]).zfill(6)))
-        cur = conn.execute(
-            f"""
-            SELECT trade_date, stock_code FROM stock_north_hold_daily
-            WHERE trade_date IN ({placeholders_d}) AND stock_code IN ({placeholders_c})
-            """,
-            params,
-        )
-        for r in cur.fetchall():
-            nh_keys.add((str(r[0])[:10], str(r[1]).zfill(6)))
-    finally:
-        conn.close()
+    with get_connection(db_path) as conn:
+        cur1 = conn.execute(f"SELECT trade_date, stock_code FROM stock_money_flow_daily WHERE trade_date IN ({','.join('?'*len(ds))}) AND stock_code IN ({','.join('?'*len(cs))})", params)
+        for r in cur1.fetchall(): mf_keys.add((str(r[0])[:10], str(r[1]).zfill(6)))
+        cur2 = conn.execute(f"SELECT trade_date, stock_code FROM stock_north_hold_daily WHERE trade_date IN ({','.join('?'*len(ds))}) AND stock_code IN ({','.join('?'*len(cs))})", params)
+        for r in cur2.fetchall(): nh_keys.add((str(r[0])[:10], str(r[1]).zfill(6)))
     return mf_keys, nh_keys
 
 
-def upsert_stock_money_flow_rows(
-    rows: list[tuple[str, str, float]],
-    *,
-    db_path: Path | None = None,
-) -> None:
-    """rows: (trade_date YYYY-MM-DD, stock_code6, big_net_ratio)"""
-    if not rows:
-        return
+def upsert_stock_money_flow_rows(rows: list[tuple[str, str, float]], *, db_path: Path | None = None) -> None:
+    if not rows: return
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
     def _do() -> None:
         with get_connection(db_path) as conn:
-            conn.executemany(
-                """
-                INSERT INTO stock_money_flow_daily (trade_date, stock_code, big_net_ratio, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(trade_date, stock_code) DO UPDATE SET
-                  big_net_ratio=excluded.big_net_ratio,
-                  updated_at=excluded.updated_at
-                """,
-                [(a[0], a[1], float(a[2]), now) for a in rows],
-            )
-
+            conn.executemany("INSERT INTO stock_money_flow_daily (trade_date, stock_code, big_net_ratio, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(trade_date, stock_code) DO UPDATE SET big_net_ratio=excluded.big_net_ratio, updated_at=excluded.updated_at", [(a[0], a[1], float(a[2]), now) for a in rows])
     _retry_sqlite_locked(_do, attempts=5)
 
 
-def fetch_top3_selections_for_monitor(
-    trade_date: str | None = None,
-    db_path: Path | None = None,
-) -> list[dict[str, Any]]:
-    """读取指定或最近交易日的 rank 1–TOP_N 选股，供实盘监控模块使用。"""
+def fetch_top3_selections_for_monitor(trade_date: str | None = None, db_path: Path | None = None) -> list[dict[str, Any]]:
     from .config import TOP_N_SELECTION
-
-    if trade_date:
-        td = str(trade_date).strip()[:10]
+    if trade_date: td = str(trade_date).strip()[:10]
     else:
         with get_connection(db_path) as conn:
-            cur = conn.execute("SELECT MAX(trade_date) FROM daily_selections")
-            row = cur.fetchone()
-            if row is None or row[0] is None:
-                return []
+            row = conn.execute("SELECT MAX(trade_date) FROM daily_selections").fetchone()
+            if row is None or row[0] is None: return []
             td = str(row[0]).strip()[:10]
-    df = query_df(
-        """
-        SELECT rank, stock_code, stock_name, score, close_price
-        FROM daily_selections
-        WHERE trade_date = ? AND rank BETWEEN 1 AND ?
-        ORDER BY rank ASC
-        """,
-        (td, int(TOP_N_SELECTION)),
-        db_path,
-    )
-    if df.empty:
-        return []
+    df = query_df("SELECT rank, stock_code, stock_name, score, close_price FROM daily_selections WHERE trade_date = ? AND rank BETWEEN 1 AND ? ORDER BY rank ASC", (td, int(TOP_N_SELECTION)), db_path)
     return df.to_dict("records")
 
 
-def insert_signal_record(
-    *,
-    stock_code: str,
-    stock_name: str | None,
-    signal_time: str,
-    signal_price: float,
-    signal_type: str,
-    reason: str | None = None,
-    realtime_score: float | None = None,
-    db_path: Path | None = None,
-) -> None:
-    """写入盘中信号；多线程下通过 WAL + 重试保证安全。"""
-    code = str(stock_code).strip().zfill(6)
-    st_norm = str(signal_time).strip()[:19]
-    params = (
-        code,
-        stock_name,
-        st_norm,
-        float(signal_price),
-        str(signal_type).strip(),
-        reason,
-        float(realtime_score) if realtime_score is not None else None,
-        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-    )
-
+def insert_signal_record(*, stock_code: str, stock_name: str | None, signal_time: str, signal_price: float, signal_type: str, reason: str | None = None, realtime_score: float | None = None, db_path: Path | None = None) -> None:
+    params = (str(stock_code).strip().zfill(6), stock_name, str(signal_time).strip()[:19], float(signal_price), str(signal_type).strip(), reason, float(realtime_score) if realtime_score is not None else None, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     def _do() -> None:
         with get_connection(db_path) as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO signal_history
-                (stock_code, stock_name, signal_time, signal_price, signal_type,
-                 reason, realtime_score, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                params,
-            )
-
+            conn.execute("INSERT OR IGNORE INTO signal_history (stock_code, stock_name, signal_time, signal_price, signal_type, reason, realtime_score, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", params)
     _retry_sqlite_locked(_do, attempts=5)
 
 
-def signal_exists_in_minute(
-    stock_code: str,
-    signal_time_minute: str,
-    signal_type: str,
-    db_path: Path | None = None,
-) -> bool:
-    """同股、同分钟桶、同类型是否已存在（用于去重）。"""
-    code = str(stock_code).strip().zfill(6)
-    bucket = str(signal_time_minute).strip()[:16]
+def signal_exists_in_minute(stock_code: str, signal_time_minute: str, signal_type: str, db_path: Path | None = None) -> bool:
     with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            SELECT 1 FROM signal_history
-            WHERE stock_code = ? AND substr(signal_time, 1, 16) = ? AND signal_type = ?
-            LIMIT 1
-            """,
-            (code, bucket, str(signal_type).strip()),
-        )
-        return cur.fetchone() is not None
+        return conn.execute("SELECT 1 FROM signal_history WHERE stock_code = ? AND substr(signal_time, 1, 16) = ? AND signal_type = ? LIMIT 1", (str(stock_code).strip().zfill(6), str(signal_time_minute).strip()[:16], str(signal_type).strip())).fetchone() is not None
 
 
-def signal_exists_within_minutes(
-    stock_code: str,
-    signal_time: str,
-    signal_type: str,
-    window_minutes: int,
-    *,
-    db_path: Path | None = None,
-) -> bool:
-    """同股、同 signal_type 在 ``signal_time`` 之前 ``window_minutes`` 分钟内是否已有记录（防震荡重复入库）。"""
-    if window_minutes <= 0:
-        return False
-    code = str(stock_code).strip().zfill(6)
-    st = str(signal_time).strip()[:19]
-    w = max(1, int(window_minutes))
-    mod = f"-{w} minutes"
+def signal_exists_within_minutes(stock_code: str, signal_time: str, signal_type: str, window_minutes: int, *, db_path: Path | None = None) -> bool:
+    if window_minutes <= 0: return False
     with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            SELECT 1 FROM signal_history
-            WHERE stock_code = ?
-              AND signal_type = ?
-              AND datetime(signal_time) > datetime(?, ?)
-              AND datetime(signal_time) <= datetime(?)
-            LIMIT 1
-            """,
-            (code, str(signal_type).strip(), st, mod, st),
-        )
-        return cur.fetchone() is not None
+        return conn.execute("SELECT 1 FROM signal_history WHERE stock_code = ? AND signal_type = ? AND datetime(signal_time) > datetime(?, ?) AND datetime(signal_time) <= datetime(?) LIMIT 1", (str(stock_code).strip().zfill(6), str(signal_type).strip(), str(signal_time).strip()[:19], f"-{max(1, int(window_minutes))} minutes", str(signal_time).strip()[:19])).fetchone() is not None
 
 
-def fetch_signal_history_for_stock_on_date(
-    stock_code: str,
-    trade_date: str | None = None,
-    db_path: Path | None = None,
-) -> list[dict[str, Any]]:
-    """读取单只股票某日（默认今日）已触发的信号，供图表标注。"""
-    code = str(stock_code).strip().zfill(6)
-    day = (
-        str(trade_date).strip()[:10]
-        if trade_date
-        else datetime.now().strftime("%Y-%m-%d")
-    )
-    df = query_df(
-        """
-        SELECT signal_time, signal_price, signal_type, reason, realtime_score
-        FROM signal_history
-        WHERE stock_code = ? AND signal_time LIKE ?
-        ORDER BY signal_time ASC
-        """,
-        (code, f"{day}%"),
-        db_path,
-    )
-    if df.empty:
-        return []
+def fetch_signal_history_for_stock_on_date(stock_code: str, trade_date: str | None = None, db_path: Path | None = None) -> list[dict[str, Any]]:
+    day = str(trade_date).strip()[:10] if trade_date else datetime.now().strftime("%Y-%m-%d")
+    df = query_df("SELECT signal_time, signal_price, signal_type, reason, realtime_score FROM signal_history WHERE stock_code = ? AND signal_time LIKE ? ORDER BY signal_time ASC", (str(stock_code).strip().zfill(6), f"{day}%"), db_path)
     return df.to_dict("records")
 
 
-def upsert_stock_north_hold_rows(
-    rows: list[tuple[str, str, float, float]],
-    *,
-    db_path: Path | None = None,
-) -> None:
-    """rows: (trade_date, stock_code6, hold_pct, hold_pct_chg)"""
-    if not rows:
-        return
+def upsert_stock_north_hold_rows(rows: list[tuple[str, str, float, float]], *, db_path: Path | None = None) -> None:
+    if not rows: return
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
     def _do() -> None:
         with get_connection(db_path) as conn:
-            conn.executemany(
-                """
-                INSERT INTO stock_north_hold_daily
-                  (trade_date, stock_code, hold_pct, hold_pct_chg, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(trade_date, stock_code) DO UPDATE SET
-                  hold_pct=excluded.hold_pct,
-                  hold_pct_chg=excluded.hold_pct_chg,
-                  updated_at=excluded.updated_at
-                """,
-                [(a[0], a[1], float(a[2]), float(a[3]), now) for a in rows],
-            )
-
+            conn.executemany("INSERT INTO stock_north_hold_daily (trade_date, stock_code, hold_pct, hold_pct_chg, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(trade_date, stock_code) DO UPDATE SET hold_pct=excluded.hold_pct, hold_pct_chg=excluded.hold_pct_chg, updated_at=excluded.updated_at", [(a[0], a[1], float(a[2]), float(a[3]), now) for a in rows])
     _retry_sqlite_locked(_do, attempts=5)
 
 
 def sync_concept_boards_from_json(db_path=None) -> int:
-    import json
-    from datetime import datetime
     from .config import DATA_DIR
-
     json_path = DATA_DIR / "board_stocks.json"
-    if not json_path.exists():
-        return 0
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    stock_to_boards = data.get("stock_to_boards", {})
-    if not stock_to_boards:
-        return 0
+    if not json_path.exists(): return 0
+    with open(json_path, "r", encoding="utf-8") as f: data = json.load(f)
+    stb = data.get("stock_to_boards", {})
+    if not stb: return 0
     path = db_path or DB_PATH
-    if not path.parent.exists():
-        return 0
     init_db(path)
     conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
     _apply_sqlite_pragmas(conn)
-    today = datetime.now().strftime("%Y-%m-%d")
-    inserted = 0
+    today, inserted = datetime.now().strftime("%Y-%m-%d"), 0
     try:
         conn.execute("BEGIN")
-        for code, boards in stock_to_boards.items():
-            code6 = str(code).strip().zfill(6)
+        for code, boards in stb.items():
             for board in boards:
-                conn.execute(
-                    "INSERT OR REPLACE INTO stock_concept_boards"
-                    "(stock_code, board_name, updated_date)"
-                    "VALUES (?, ?, ?)",
-                    (code6, str(board).strip(), today),
-                )
+                conn.execute("INSERT OR REPLACE INTO stock_concept_boards (stock_code, board_name, updated_date) VALUES (?, ?, ?)", (str(code).strip().zfill(6), str(board).strip(), today))
                 inserted += 1
         conn.commit()
-    finally:
-        conn.close()
+    finally: conn.close()
     return inserted
 
 
 def fetch_concept_boards_by_stock(stock_code: str, db_path=None) -> list[str]:
-    init_db(db_path)
-    conn = sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        cur = conn.execute(
-            "SELECT DISTINCT board_name FROM stock_concept_boards WHERE stock_code = ?",
-            (str(stock_code).zfill(6),),
-        )
-        return [r[0] for r in cur.fetchall()]
-    finally:
-        conn.close()
+    with get_connection(db_path) as conn:
+        return [r[0] for r in conn.execute("SELECT DISTINCT board_name FROM stock_concept_boards WHERE stock_code = ?", (str(stock_code).zfill(6),)).fetchall()]
 
 
 def fetch_stocks_by_concept_board(board_name: str, db_path=None) -> list[str]:
-    init_db(db_path)
-    conn = sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
-    _apply_sqlite_pragmas(conn)
-    try:
-        cur = conn.execute(
-            "SELECT DISTINCT stock_code FROM stock_concept_boards WHERE board_name = ?",
-            (str(board_name),),
-        )
-        return [r[0] for r in cur.fetchall()]
-    finally:
-        conn.close()
+    with get_connection(db_path) as conn:
+        return [r[0] for r in conn.execute("SELECT DISTINCT stock_code FROM stock_concept_boards WHERE board_name = ?", (str(board_name),)).fetchall()]
+
+
+def fetch_stock_financial_panel(stock_code: str, *, db_path: Path | None = None) -> pd.DataFrame:
+    with get_connection(db_path) as conn:
+        return pd.read_sql_query("SELECT pub_date, report_date, roe, net_profit_growth, revenue_growth FROM stock_financial_data WHERE stock_code = ? ORDER BY pub_date ASC, report_date ASC", conn, params=(str(stock_code).strip().zfill(6),))
+
+
+def upsert_stock_financial_rows(records: list[tuple[Any, ...]], db_path: Path | None = None) -> int:
+    if not records: return 0
+    def _do() -> None:
+        with get_connection(db_path) as conn:
+            conn.executemany("INSERT OR REPLACE INTO stock_financial_data (stock_code, pub_date, report_date, roe, net_profit_growth, revenue_growth) VALUES (?, ?, ?, ?, ?, ?)", records)
+    _retry_sqlite_locked(_do, attempts=5)
+    return len(records)
+
+
+def fetch_stock_code_max_dates(db_path: Path | None = None) -> dict[str, str]:
+    with get_connection(db_path) as conn:
+        return {str(r[0]).strip().zfill(6): str(r[1]).strip()[:10] for r in conn.execute("SELECT stock_code, MAX(date) FROM stock_daily_kline GROUP BY stock_code").fetchall() if r[0] and r[1]}

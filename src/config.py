@@ -420,3 +420,22 @@ def get_quant_config_merged() -> dict[str, Any]:
         return out
     except Exception:
         return defaults
+
+
+# 子进程启动脚本路径（供 pipeline / Streamlit 统一引用，避免硬编码）
+SCRIPT_UPDATE_LOCAL_DATA = PROJECT_ROOT / "scripts" / "update_local_data.py"
+SCRIPT_SYNC_HOT_CONCEPT = PROJECT_ROOT / "scripts" / "sync_hot_concept_boards.py"
+SCRIPT_TRAIN_MODEL = PROJECT_ROOT / "train_model.py"
+SCRIPT_RUN_DAILY = PROJECT_ROOT / "run_daily.py"
+SCRIPT_BACKTEST = PROJECT_ROOT / "scripts" / "backtest.py"
+SCRIPT_UPDATE_RETURNS = PROJECT_ROOT / "update_returns.py"
+
+# 经验风控：高位放量滞涨（近 3 日均量 / 近 20 日均量、近 3 日累计涨跌幅）
+VOLUME_STAGNATION_VOL_RATIO = float(
+    os.environ.get("QUANT_VOL_STAGNATION_VOL_RATIO", "2.5")
+)
+VOLUME_STAGNATION_MAX_ABS_RET_3D = float(
+    os.environ.get("QUANT_VOL_STAGNATION_MAX_ABS_RET", "0.02")
+)
+VOLUME_STAGNATION_SHORT_DAYS = 3
+VOLUME_STAGNATION_LONG_DAYS = 20

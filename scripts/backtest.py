@@ -605,7 +605,9 @@ def _score_universe_for_date(
     feat_df = apply_experience_trading_filters(feat_df)
     if feat_df.empty:
         return []
-    top = select_top_n_with_industry_cap(feat_df, TOP_N_SELECTION)
+    top = select_top_n_with_industry_cap(
+        feat_df, TOP_N_SELECTION, as_of_date=str(trade_date).strip()[:10]
+    )
     return top["stock_code"].astype(str).tolist()
 
 

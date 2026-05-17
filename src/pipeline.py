@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 一键全套量化工作流：按顺序执行行情同步 → 训练 → 每日选股 → 滚动回测 → 收益回填。
 供 Streamlit「一键」按钮与定时调度调用；日志写入 ``system_logs``。
@@ -7,10 +8,19 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
+from src.config import (
+    SCRIPT_BACKTEST,
+    SCRIPT_RUN_DAILY,
+    SCRIPT_SYNC_HOT_CONCEPT,
+    SCRIPT_TRAIN_MODEL,
+    SCRIPT_UPDATE_LOCAL_DATA,
+    SCRIPT_UPDATE_RETURNS,
+)
 from src.database import get_connection, insert_system_log
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -77,36 +87,32 @@ def run_complete_pipeline(
 ) -> bool:
     """
     顺序执行 A→E；任一步非零退出码则中止。
-    ``log_consumer``：若提供则将每行输出回调（例如 Streamlit 占位符刷新）；否则打印到 stdout。
     """
     python_exe = sys.executable
     steps: list[dict[str, object]] = [
         {
             "name": "1. 增量行情与行业同步",
-            "args": [python_exe, str(PROJECT_ROOT / "scripts" / "update_local_data.py")],
+            "args": [python_exe, str(SCRIPT_UPDATE_LOCAL_DATA)],
         },
         {
             "name": "2. 热门概念题材与成份股同步",
-            "args": [
-                python_exe,
-                str(PROJECT_ROOT / "scripts" / "sync_hot_concept_boards.py"),
-            ],
+            "args": [python_exe, str(SCRIPT_SYNC_HOT_CONCEPT)],
         },
         {
             "name": "3. 双排序模型重训 (LGBM+XGB)",
-            "args": [python_exe, str(PROJECT_ROOT / "train_model.py")],
+            "args": [python_exe, str(SCRIPT_TRAIN_MODEL)],
         },
         {
             "name": "4. 每日智能选股",
-            "args": [python_exe, str(PROJECT_ROOT / "run_daily.py")],
+            "args": [python_exe, str(SCRIPT_RUN_DAILY)],
         },
         {
             "name": "5. 历史滚动回测",
-            "args": [python_exe, str(PROJECT_ROOT / "scripts" / "backtest.py")],
+            "args": [python_exe, str(SCRIPT_BACKTEST)],
         },
         {
             "name": "6. 历史选股收益率回填",
-            "args": [python_exe, str(PROJECT_ROOT / "scripts" / "update_returns.py")],
+            "args": [python_exe, str(SCRIPT_UPDATE_RETURNS)],
         },
     ]
 
@@ -139,13 +145,10 @@ def run_complete_pipeline(
         if (
             train_end
             and len(cmd) >= 2
-            and Path(cmd[1]).resolve() == (PROJECT_ROOT / "train_model.py").resolve()
+            and Path(cmd[1]).resolve() == SCRIPT_TRAIN_MODEL.resolve()
         ):
             cmd = [*cmd, "--train-end-date", train_end[:10]]
-        if (
-            len(cmd) >= 2
-            and Path(cmd[1]).resolve() == (PROJECT_ROOT / "run_daily.py").resolve()
-        ):
+        if len(cmd) >= 2 and Path(cmd[1]).resolve() == SCRIPT_RUN_DAILY.resolve():
             cmd = [*cmd, "--skip-dingtalk"]
 
         banner = f"\n—— 正在执行: {step_name} ——\n"
@@ -173,22 +176,29 @@ def run_complete_pipeline(
 
         assert proc.stdout is not None
         step_logs: list[str] = []
-        while True:
+
+        while proc.poll() is None:
             line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
             if line:
                 _emit(line)
                 step_logs.append(line)
+            else:
+                time.sleep(0.05)
+
+        remnants = proc.stdout.read()
+        if remnants:
+            _emit(remnants)
+            step_logs.append(remnants)
 
         returncode = proc.wait()
         step_log_str = "".join(step_logs)
         if (
             len(cmd) >= 2
-            and Path(cmd[1]).resolve() == (PROJECT_ROOT / "run_daily.py").resolve()
+            and Path(cmd[1]).resolve() == SCRIPT_RUN_DAILY.resolve()
             and "QUANT_RUN_DAILY_SKIPPED=non_trading_day" in step_log_str
         ):
             run_daily_skipped_non_trading = True
+
         summary = f"\n=== {step_name} 结束 (exit={returncode}) ===\n"
         full_log_accumulator.append(summary)
         full_log_accumulator.append(step_log_str)
@@ -200,6 +210,7 @@ def run_complete_pipeline(
             full_log_accumulator.append(fail)
             success = False
             break
+
         _emit(f"[Pipeline][OK] {step_name} 完成。\n")
 
     if success:
@@ -228,8 +239,9 @@ def run_complete_pipeline(
         try:
             from src.dingtalk_notifier import maybe_push_pipeline_failure_alert
 
-            excerpt = "".join(full_log_accumulator)
-            maybe_push_pipeline_failure_alert(task_name, excerpt)
+            maybe_push_pipeline_failure_alert(
+                task_name, "".join(full_log_accumulator)
+            )
         except Exception:
             pass
 

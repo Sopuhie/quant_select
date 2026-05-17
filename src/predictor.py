@@ -256,21 +256,95 @@ def _log_industry_cap_rank_alignment(top: pd.DataFrame, top_n: int) -> None:
     )
 
 
+def is_high_volume_price_stagnation(
+    stock_code: str,
+    as_of_date: str,
+) -> tuple[bool, str]:
+    """
+    高位放量滞涨：近 3 日均量显著高于近 20 日均量，但近 3 日股价几乎不动。
+    返回 (是否命中, 说明文案)。
+    """
+    from .config import (
+        VOLUME_STAGNATION_LONG_DAYS,
+        VOLUME_STAGNATION_MAX_ABS_RET_3D,
+        VOLUME_STAGNATION_SHORT_DAYS,
+        VOLUME_STAGNATION_VOL_RATIO,
+    )
+    from .database import fetch_stock_daily_bars_until
+
+    code = str(stock_code).strip().zfill(6)
+    end = str(as_of_date).strip()[:10]
+    long_n = max(VOLUME_STAGNATION_SHORT_DAYS + 1, int(VOLUME_STAGNATION_LONG_DAYS))
+    df = fetch_stock_daily_bars_until(code, end)
+    if df is None or len(df) < long_n:
+        return False, ""
+    tail = df.tail(long_n)
+    vol = pd.to_numeric(tail["volume"], errors="coerce")
+    close = pd.to_numeric(tail["close"], errors="coerce")
+    if vol.isna().all() or close.isna().all():
+        return False, ""
+    avg_short = float(vol.tail(VOLUME_STAGNATION_SHORT_DAYS).mean())
+    avg_long = float(vol.mean())
+    if not np.isfinite(avg_short) or not np.isfinite(avg_long) or avg_long <= 0:
+        return False, ""
+    if avg_short <= float(VOLUME_STAGNATION_VOL_RATIO) * avg_long:
+        return False, ""
+    if len(close) < VOLUME_STAGNATION_SHORT_DAYS + 1:
+        return False, ""
+    c_end = float(close.iloc[-1])
+    c_start = float(close.iloc[-(VOLUME_STAGNATION_SHORT_DAYS + 1)])
+    if not np.isfinite(c_end) or not np.isfinite(c_start) or c_start <= 0:
+        return False, ""
+    cum_ret = c_end / c_start - 1.0
+    if abs(cum_ret) >= float(VOLUME_STAGNATION_MAX_ABS_RET_3D):
+        return False, ""
+    detail = (
+        f"3日均量/20日均量={avg_short / avg_long:.2f}倍，"
+        f"近{VOLUME_STAGNATION_SHORT_DAYS}日累计涨跌幅={cum_ret * 100:.2f}%"
+    )
+    return True, detail
+
+
 def select_top_n_with_industry_cap(
     ranked_df: pd.DataFrame,
     top_n: int,
     *,
     industry_col: str = "industry",
     max_per_industry: int = MAX_STOCKS_PER_INDUSTRY,
+    as_of_date: str | None = None,
 ) -> pd.DataFrame:
     """
     按 score 已降序排列的截面中抽取 Top N；单行业最多 ``max_per_industry`` 只，
-    行业已满则静默跳过并继续向下选取。
+    行业已满则静默跳过并继续向下选取；并对「放量滞涨」做硬剔除后顺位补位。
     """
     if ranked_df.empty or top_n <= 0:
         return ranked_df.iloc[:0].copy()
-    picked_idx: list[Any] = []
+
+    if as_of_date is None and "trade_date" in ranked_df.columns:
+        try:
+            as_of_date = str(ranked_df.iloc[0]["trade_date"]).strip()[:10]
+        except Exception:
+            as_of_date = None
+
+    prelim_idx: list[Any] = []
     industry_counts: dict[str, int] = {}
+    for idx, row in ranked_df.iterrows():
+        if len(prelim_idx) >= top_n:
+            break
+        if industry_col in ranked_df.columns:
+            ind = normalize_industry_label(row.get(industry_col))
+        else:
+            ind = DEFAULT_INDUSTRY_LABEL
+        if industry_counts.get(ind, 0) >= max_per_industry:
+            continue
+        industry_counts[ind] = industry_counts.get(ind, 0) + 1
+        prelim_idx.append(idx)
+    prelim_codes = {
+        str(ranked_df.loc[i, "stock_code"]).strip().zfill(6) for i in prelim_idx
+    }
+
+    picked_idx: list[Any] = []
+    industry_counts = {}
     for idx, row in ranked_df.iterrows():
         if len(picked_idx) >= top_n:
             break
@@ -280,6 +354,17 @@ def select_top_n_with_industry_cap(
             ind = DEFAULT_INDUSTRY_LABEL
         if industry_counts.get(ind, 0) >= max_per_industry:
             continue
+        code = str(row.get("stock_code", "")).strip().zfill(6)
+        name = str(row.get("stock_name") or "").strip()
+        if as_of_date:
+            hit, detail = is_high_volume_price_stagnation(code, as_of_date)
+            if hit:
+                if code in prelim_codes:
+                    print(
+                        f"[经验风控-放量滞涨] 从 Top{top_n} 推荐池剔除 {code} {name}：{detail}",
+                        flush=True,
+                    )
+                continue
         industry_counts[ind] = industry_counts.get(ind, 0) + 1
         picked_idx.append(idx)
     if not picked_idx:
@@ -1185,7 +1270,9 @@ def persist_predictions(
             for r in pred_rows
         ]
     )
-    top = select_top_n_with_industry_cap(scores_df, top_n)
+    top = select_top_n_with_industry_cap(
+        scores_df, top_n, as_of_date=str(trade_date).strip()[:10]
+    )
     if len(top) < top_n:
         raise RuntimeError(
             f"行业集中度风控后仅选出 {len(top)} 只，不足 Top{top_n}；请扩大股票池或放宽经验过滤。"

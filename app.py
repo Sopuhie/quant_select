@@ -47,6 +47,11 @@ from src.config import (
     FEATURE_COLUMNS,
     MODEL_PATH,
     SCHEDULER_RUN_AT,
+    SCRIPT_BACKTEST,
+    SCRIPT_RUN_DAILY,
+    SCRIPT_TRAIN_MODEL,
+    SCRIPT_UPDATE_LOCAL_DATA,
+    SCRIPT_UPDATE_RETURNS,
     TOP_N_SELECTION,
     get_experience_thresholds,
 )
@@ -1227,16 +1232,17 @@ with tab_match:
                             if match_algo == "dtw"
                             else "正在扫描本地全市场行情，请稍候…"
                         )
-                        with st.spinner(_spin):
-                            st.session_state["pm_results"] = cached_find_similar_patterns(
-                                target_code=code_z,
-                                start_date=start_str,
-                                end_date=end_str,
-                                compare_days=int(compare_days_ui),
-                                limit_results=3,
-                                algorithm=str(match_algo),
-                            )
-                            st.session_state["pm_cached_params"] = params_now
+                        progress_bar = st.progress(0, text=_spin)
+                        st.session_state["pm_results"] = cached_find_similar_patterns(
+                            target_code=code_z,
+                            start_date=start_str,
+                            end_date=end_str,
+                            compare_days=int(compare_days_ui),
+                            limit_results=3,
+                            algorithm=str(match_algo),
+                        )
+                        progress_bar.progress(100, text="全市场形态扫描完成！")
+                        st.session_state["pm_cached_params"] = params_now
 
                     cached = st.session_state.get("pm_cached_params")
                     match_results = st.session_state.get("pm_results")
@@ -1736,10 +1742,7 @@ def _render_system_console_tab() -> None:
         )
         if data_btn:
             with st.spinner("正在下载日线并写入本地 SQLite..."):
-                data_cmd = [
-                    sys.executable,
-                    str(ROOT / "scripts" / "update_local_data.py"),
-                ]
+                data_cmd = [sys.executable, str(SCRIPT_UPDATE_LOCAL_DATA)]
                 if sync_full_a_market:
                     data_cmd.append("--all-stocks")
                 ret_code, _log = run_command_interactive(
@@ -1766,7 +1769,7 @@ def _render_system_console_tab() -> None:
         )
         if train_btn:
             with st.spinner("正在重新计算因子并重训模型..."):
-                train_cmd = [sys.executable, str(ROOT / "train_model.py")]
+                train_cmd = [sys.executable, str(SCRIPT_TRAIN_MODEL)]
                 if _QUANT_TRAIN_END_DATE_ENV:
                     train_cmd.extend(
                         ["--train-end-date", _QUANT_TRAIN_END_DATE_ENV[:10]]
@@ -1858,7 +1861,7 @@ def _render_system_console_tab() -> None:
                     st.error(f"❌ {err_ef}" if err_ef else "❌ 未启动选股。")
                     st.stop()
 
-                cmd = [sys.executable, str(ROOT / "run_daily.py")]
+                cmd = [sys.executable, str(SCRIPT_RUN_DAILY)]
                 if include_300:
                     cmd.append("--include-300")
                 if include_688:
@@ -1894,7 +1897,7 @@ def _render_system_console_tab() -> None:
                 if not save_bt:
                     st.error(f"❌ {err_bt}" if err_bt else "❌ 未启动回测。")
                     st.stop()
-                _bt_cmd = [sys.executable, str(ROOT / "scripts" / "backtest.py")]
+                _bt_cmd = [sys.executable, str(SCRIPT_BACKTEST)]
                 if include_300:
                     _bt_cmd.append("--include-300")
                 if include_688:
@@ -1928,7 +1931,7 @@ def _render_system_console_tab() -> None:
     if return_btn:
         with st.spinner("正在调取接口，更新并回填历史选股收益率数据..."):
             ret_code, _log = run_command_interactive(
-                [sys.executable, str(ROOT / "update_returns.py")],
+                [sys.executable, str(SCRIPT_UPDATE_RETURNS)],
                 task_name="历史收益回填",
             )
             if ret_code == 0:
