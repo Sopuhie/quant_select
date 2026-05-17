@@ -70,6 +70,8 @@ from src.predictor import (
     filter_predictions,
     prune_zero_volume_rows,
     select_top_n_with_industry_cap,
+    _log_industry_cap_rank_alignment,
+    _log_predict_bias_feature_stats,
 )
 from src.utils import get_last_trading_date, is_a_share_trading_day
 
@@ -423,6 +425,7 @@ def predict_daily(
         sys.exit(1)
 
     feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
+    _log_predict_bias_feature_stats(feat_df)
     if feat_df.empty:
         print(
             "警告: 前期涨幅压制后无剩余候选股票，可设置 QUANT_PREV_GAIN_SUPPRESSION=0 关闭，"
@@ -513,6 +516,7 @@ def predict_daily(
             "请扩大股票池或检查行业标签。"
         )
         sys.exit(1)
+    _log_industry_cap_rank_alignment(selections, TOP_N_SELECTION)
     selections["rank"] = range(1, len(selections) + 1)
     selections["next_day_return"] = None
     selections["hold_5d_return"] = None

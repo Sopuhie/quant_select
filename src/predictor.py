@@ -163,6 +163,97 @@ def _describe_bias_factor(factor_name: str, val: float) -> str:
     return f"{label}：均线乖离适度，处于温和蓄势或健康的趋势通道中"
 
 
+def _describe_conditional_factor(factor_name: str, val: float) -> str | None:
+    """核心量价因子：按清洗后数值分档，避免无视正负的硬编码乐观文案。"""
+    if factor_name == "factor_volume_ratio":
+        if val > 1.2:
+            return (
+                "今日成交量较5日均量显著放量，"
+                "增量资金正深度建仓或放量突破趋势"
+            )
+        if val < 0.8:
+            return (
+                "成交量呈现显著缩量形态，主力资金洗盘无量，"
+                "股价处于缩量蓄势回调阶段"
+            )
+        return "量能表现温和平衡，买卖盘力量处于良性交织状态"
+    if factor_name == "factor_return_1d":
+        if val > 0.03:
+            return "昨日收出强劲阳线，短线呈现高赚钱效应与猛烈的多头攻势"
+        if val < -0.03:
+            return (
+                "昨日经历空头砸盘，股价短线超跌严重，"
+                "技术面存在强烈的超跌反弹修复动力"
+            )
+        return "昨日股价宽幅震荡收平，多空双方在当前价位展开激烈博弈"
+    if factor_name == "factor_momentum_10d":
+        if val > 1.0:
+            return "10日截面动量效应爆发，顺势特征显著，属于典型的强者恒强趋势"
+        if val < -1.0:
+            return (
+                "中线陷入非理性超跌，价格处于相对底部区域，"
+                "具备较强的均值回归反弹潜力"
+            )
+        return "中线动量表现平稳，股价围绕中期成本中枢温和波动"
+    if factor_name == "factor_volatility_5d":
+        if val > 1.2:
+            return (
+                "短线历史波动率骤然放大，盘口多空分歧剧烈，"
+                "个股向上拉升弹性与爆发力极佳"
+            )
+        if val < 0.8:
+            return "短线波幅极度收敛，筹码锁定度高，个股正处于变盘临界点的前夕"
+        return "波动尺度维持正常中性水平"
+    if factor_name == "factor_amihud_20d":
+        if val > 1.0:
+            return (
+                "Amihud非流动性指标偏高，反映盘口封单或承接变薄，"
+                "容易以极小的资金撬动高弹性的涨幅"
+            )
+        if val < -1.0:
+            return (
+                "流动性充裕，冲击成本极低，"
+                "适合主力及机构大资金进行平稳的换手与建仓"
+            )
+        return "市场流动性维持在温和合理的均衡区间"
+    return None
+
+
+def _log_predict_bias_feature_stats(feat_df: pd.DataFrame) -> None:
+    """预测侧截面 bias 因子分布监控，便于对比训练集漂移。"""
+    for col in ("factor_bias_5", "factor_bias_20"):
+        if col not in feat_df.columns:
+            continue
+        s = pd.to_numeric(feat_df[col], errors="coerce").dropna()
+        if s.empty:
+            print(
+                f"[分布监控] 预测侧截面特征统计: {col} mean=nan, std=nan",
+                flush=True,
+            )
+            continue
+        print(
+            f"[分布监控] 预测侧截面特征统计: {col} "
+            f"mean={float(s.mean()):.4f}, std={float(s.std()):.4f}",
+            flush=True,
+        )
+
+
+def _log_industry_cap_rank_alignment(top: pd.DataFrame, top_n: int) -> None:
+    """说明入选组合 rank 与全市场绝对 rank_in_market 的对应关系。"""
+    if top.empty or "rank_in_market" not in top.columns:
+        return
+    ranks = pd.to_numeric(top["rank_in_market"], errors="coerce").dropna()
+    if ranks.empty:
+        return
+    max_abs_rank = int(ranks.max())
+    print(
+        "[行业风控对齐] 行业集中度硬隔离触发："
+        f"今日最终推荐 Top {top_n} 组合实际来自于全市场原始绝对排名"
+        f"（rank_in_market）的前 {max_abs_rank} 名。",
+        flush=True,
+    )
+
+
 def select_top_n_with_industry_cap(
     ranked_df: pd.DataFrame,
     top_n: int,
@@ -203,15 +294,10 @@ def analyze_stock_reasons(
     templates = {
         "factor_ratio_5_20": "短期与中期均线距离拉开，呈现健康的经典多头形态形态",
         "factor_ratio_10_60": "中长期均线系统发散向上，呈现典型的黄金多头排列形态",
-        "factor_return_1d": "昨日放量收出大阳线，日内多头动量和赚钱效应较强",
         "factor_return_5d": "近5个交易日表现温和、蓄势充分，并未透支暴涨，属于典型的安全低位起步拐点",
-        "factor_momentum_10d": "10日截面动量效应爆发，多头追涨及资金吸筹意愿高涨",
-        "factor_volume_ratio": "今日成交量较5日均量显著放量，增量资金正深度建仓突破",
         "factor_volume_position": "5日均量超越20日均量，量能温和交织放大，买盘换手充分",
-        "factor_volatility_5d": "短期历史波动率处于变盘临界点，个股向上拉升弹性极大",
         "factor_volatility_20d": "中期波幅收敛后重新发散，有望打开全新一轮上升主升浪",
         "factor_close_position": "收盘价几乎死死封在全天最高点，日内主力资金控盘和买入抢筹极其坚决",
-        "factor_amihud_20d": "Amihud 非流动性偏高，盘口承接变薄、冲击成本上升",
         "factor_pv_corr_10d": "近 10 日价量变化协同性（负值常对应量价背离）",
         "factor_vwap_bias_20d": "相对 20 日 VWAP 偏离，反映成本中枢与筹码重心",
         "factor_bb_width_20d": "布林带宽度扩张或收敛，波动 regime 切换信号",
@@ -253,7 +339,11 @@ def analyze_stock_reasons(
         if f in _BIAS_FACTOR_LABELS:
             desc = _describe_bias_factor(f, fval)
         else:
-            desc = templates.get(f, f"核心因子 [{f}] 处于截面优势地位")
+            cond_desc = _describe_conditional_factor(f, fval)
+            if cond_desc is not None:
+                desc = cond_desc
+            else:
+                desc = templates.get(f, f"核心因子 [{f}] 处于截面优势地位")
         reasons.append(f"{idx + 1}. {desc}")
 
     return "；".join(reasons) + "。"
@@ -867,6 +957,7 @@ def predict_universe_scores(
         raise RuntimeError("剔除停牌或锚定日零成交量标的后样本为空。")
 
     feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
+    _log_predict_bias_feature_stats(feat_df)
     if feat_df.empty:
         raise RuntimeError(
             "前期涨幅压制后无剩余候选股票，可设置 QUANT_PREV_GAIN_SUPPRESSION=0 关闭，"
@@ -998,6 +1089,7 @@ def persist_predictions(
         raise RuntimeError(
             f"行业集中度风控后仅选出 {len(top)} 只，不足 Top{top_n}；请扩大股票池或放宽经验过滤。"
         )
+    _log_industry_cap_rank_alignment(top, top_n)
     sel_rows = []
     for i, r in top.iterrows():
         reason = analyze_stock_reasons(r, imp_vec, FEATURE_COLUMNS)
