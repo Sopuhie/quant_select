@@ -259,7 +259,8 @@ def _log_industry_cap_rank_alignment(top: pd.DataFrame, top_n: int) -> None:
 def is_high_volume_price_stagnation_from_bars(bars: pd.DataFrame) -> tuple[bool, str]:
     """
     高位放量滞涨（与 run_daily / 诊股共用）：
-    近 3 日均量 > 近 20 日均量 × 2.5，且近 3 日股价波动 |涨跌幅| < 2%。
+    近 3 日均量 > 近 20 日均量 × 2.5，且近 3 日区间涨跌幅
+    |今日收盘/3日前收盘 - 1| < 2%。
     """
     from .config import (
         VOLUME_STAGNATION_LONG_DAYS,
@@ -272,7 +273,7 @@ def is_high_volume_price_stagnation_from_bars(bars: pd.DataFrame) -> tuple[bool,
         return False, ""
     vol = pd.to_numeric(bars["volume"], errors="coerce")
     close = pd.to_numeric(bars["close"], errors="coerce")
-    if len(vol) < int(VOLUME_STAGNATION_LONG_DAYS) or len(close) < 3:
+    if len(vol) < int(VOLUME_STAGNATION_LONG_DAYS) or len(close) < 4:
         return False, ""
     avg_vol_20 = float(vol.iloc[-VOLUME_STAGNATION_LONG_DAYS:].mean())
     avg_vol_3 = float(vol.iloc[-VOLUME_STAGNATION_SHORT_DAYS:].mean())
@@ -281,7 +282,7 @@ def is_high_volume_price_stagnation_from_bars(bars: pd.DataFrame) -> tuple[bool,
     if avg_vol_3 <= float(VOLUME_STAGNATION_VOL_RATIO) * avg_vol_20:
         return False, ""
     c_end = float(close.iloc[-1])
-    c_ref = float(close.iloc[-3])
+    c_ref = float(close.iloc[-4])
     if not np.isfinite(c_end) or not np.isfinite(c_ref) or c_ref <= 0:
         return False, ""
     pct_chg_3 = c_end / c_ref - 1.0
@@ -328,9 +329,9 @@ def apply_volume_stagnation_experience_filter(
         hit, detail = is_high_volume_price_stagnation(code, as_of_date)
         if hit:
             removed += 1
-            name = str(row.get(stock_name_col) or "").strip()
             print(
-                f"[经验风控-放量滞涨] 剔除 {code} {name}：{detail}",
+                f"[风控拒绝] 股票 {code} 触发高位放量滞涨，已被移出今日推荐池"
+                f"（{detail}）",
                 flush=True,
             )
             keep_rows.append(False)
@@ -338,14 +339,15 @@ def apply_volume_stagnation_experience_filter(
             keep_rows.append(True)
     if removed:
         print(
-            f"[经验风控-放量滞涨] 截面共剔除 {removed} 只（锚定日 {as_of_date}）",
+            f"[风控拒绝] 放量滞涨硬过滤：截面共剔除 {removed} 只（锚定日 {as_of_date}）",
             flush=True,
         )
     return scores_df.loc[keep_rows].reset_index(drop=True)
 
 
 VOLUME_STAGNATION_VIOLATION_MSG = (
-    "该股处于高位筹码松动期（放量滞涨），模型得分已失效"
+    "触发硬过滤：该股最近3日成交量达20日均量2.5倍以上，但股价几乎停滞不前，"
+    "存在严重的高位放量滞涨、主力派发风险！"
 )
 
 
@@ -405,7 +407,8 @@ def select_top_n_with_industry_cap(
             if hit:
                 if code in prelim_codes:
                     print(
-                        f"[经验风控-放量滞涨] 从 Top{top_n} 推荐池剔除 {code} {name}：{detail}",
+                        f"[风控拒绝] 股票 {code} 触发高位放量滞涨，已被移出今日推荐池"
+                        f"（{detail}）",
                         flush=True,
                     )
                 continue
@@ -1648,9 +1651,9 @@ def diagnose_single_stock(
 
     stag_hit, stag_detail = is_high_volume_price_stagnation_from_bars(df_hist)
     if stag_hit:
-        violated.append(
-            f"{VOLUME_STAGNATION_VIOLATION_MSG}（{stag_detail}）"
-        )
+        violated.append(VOLUME_STAGNATION_VIOLATION_MSG)
+        if stag_detail:
+            violated.append(f"量化佐证：{stag_detail}")
 
     try:
         lgb_model = load_model()

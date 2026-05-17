@@ -68,6 +68,7 @@ from src.predictor import (
     analyze_stock_reasons,
     apply_experience_trading_filters,
     apply_volume_stagnation_experience_filter,
+    is_high_volume_price_stagnation,
     blend_ranker_scores_with_optional_meta,
     feature_importances_aligned,
     filter_predictions,
@@ -607,6 +608,17 @@ def predict_daily(
     imp_vec = feature_importances_aligned(lgb_model)
     selection_rows: list[dict[str, object]] = []
     for _, row in selections.iterrows():
+        code = _normalize_stock_code(str(row["stock_code"]))
+        stag_hit, stag_detail = is_high_volume_price_stagnation(
+            code, str(anchor_td)[:10]
+        )
+        if stag_hit:
+            print(
+                f"[风控拒绝] 股票 {code} 触发高位放量滞涨，已被移出今日推荐池"
+                + (f"（{stag_detail}）" if stag_detail else ""),
+                flush=True,
+            )
+            continue
         selection_rows.append(
             {
                 "trade_date": row["trade_date"],
@@ -620,6 +632,14 @@ def predict_daily(
                 "selection_reason": analyze_stock_reasons(row, imp_vec, FEATURE_COLUMNS),
             }
         )
+    if len(selection_rows) < TOP_N_SELECTION:
+        print(
+            f"警告: Top{TOP_N_SELECTION} 写库前放量滞涨复核后仅余 {len(selection_rows)} 只，"
+            "请检查行情或扩大候选池。",
+            flush=True,
+        )
+        if not selection_rows:
+            sys.exit(1)
     insert_daily_selections(selection_rows)
     write_today_json(ROOT, trade_date=anchor_td, selection_rows=selection_rows)
     print(f"已写入 {ROOT / 'today.json'}", flush=True)
