@@ -230,6 +230,7 @@ def build_hsgt_net_zscore_by_trade_date(
     """
     北向资金净流入（全市场日频）按日期映射为 Z-score；用于 ``factor_hsgt_flow_interact``。
     仅从本地 SQLite ``market_hsgt_flow_daily`` 读取（网络同步见 ``market_hsgt_sync`` / 数据脚本）。
+    对每个交易日 T，仅用 T 及此前历史做累积均值/标准差，避免混入未来北向数据。
     无本地数据时返回空字典（调用方填 0）。
     """
     if not dates:
@@ -237,24 +238,34 @@ def build_hsgt_net_zscore_by_trade_date(
     ds = sorted({str(d).strip()[:10] for d in dates if d})
     if not ds:
         return {}
+    ds_set = set(ds)
     try:
-        from .database import fetch_market_hsgt_net_flow_map
+        from .database import fetch_market_hsgt_net_flow_up_to
 
-        flow = fetch_market_hsgt_net_flow_map(ds)
+        flow = fetch_market_hsgt_net_flow_up_to(ds[-1])
     except Exception:
         return {}
     if not flow:
         return {}
-    vals = np.asarray(list(flow.values()), dtype=float)
-    mu = float(np.nanmean(vals))
-    sig = float(np.nanstd(vals, ddof=0))
-    if not np.isfinite(mu) or not np.isfinite(sig) or sig < 1e-12:
-        return {}
+    _std_eps = 1e-6
+    history: list[float] = []
     out: dict[str, float] = {}
-    for d, v in flow.items():
-        z = (float(v) - mu) / sig
+    for d in sorted(flow.keys()):
+        v = float(flow[d])
+        history.append(v)
+        if d not in ds_set:
+            continue
+        arr = np.asarray(history, dtype=float)
+        mu = float(np.nanmean(arr))
+        if len(arr) < 2:
+            out[d] = 0.0
+            continue
+        sig = float(np.nanstd(arr, ddof=1))
+        if not np.isfinite(sig) or sig < _std_eps:
+            sig = _std_eps
+        z = (v - mu) / sig
         if np.isfinite(z):
-            out[str(d)[:10]] = float(z)
+            out[d] = float(z)
     return out
 
 
@@ -701,6 +712,7 @@ def label_forward_return(
         if buy_i >= n:
             break
         prev_buy = c0
+        # 一字涨停无法买入，顺延至可成交开放日；一字跌停在 sell_i 循环处理
         while buy_i < min(n, i + max_scan):
             row_b = work.iloc[buy_i]
             if _bar_one_word_limit_locked(

@@ -1032,6 +1032,39 @@ def fetch_market_hsgt_net_flow_map(
         conn.close()
 
 
+def fetch_market_hsgt_net_flow_up_to(
+    end_date: str,
+    *,
+    db_path: Path | None = None,
+) -> dict[str, float]:
+    """读取 ``trade_date <= end_date`` 的全部北向净流入（升序遍历用）。"""
+    ed = str(end_date).strip()[:10]
+    if not ed:
+        return {}
+    path = str(db_path or DB_PATH)
+    init_db(db_path)
+    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        cur = conn.execute(
+            """
+            SELECT trade_date, net_inflow FROM market_hsgt_flow_daily
+            WHERE trade_date <= ? AND net_inflow IS NOT NULL
+            ORDER BY trade_date ASC
+            """,
+            (ed,),
+        )
+        out: dict[str, float] = {}
+        for r in cur.fetchall():
+            td = str(r[0]).strip()[:10]
+            v = float(r[1])
+            if math.isfinite(v):
+                out[td] = v
+        return out
+    finally:
+        conn.close()
+
+
 def upsert_market_hsgt_flow_rows(
     rows: Iterable[dict[str, Any]],
     *,
