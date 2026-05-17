@@ -711,6 +711,51 @@ def prune_zero_volume_rows(feat_df: pd.DataFrame) -> pd.DataFrame:
     return feat_df[v > 0].reset_index(drop=True)
 
 
+def _diagnose_features_via_ranking_pipeline(
+    code6: str,
+    trade_date: str,
+    factors: pd.DataFrame,
+    df_hist: pd.DataFrame,
+) -> dict[str, float] | None:
+    """
+    全市场截面池不可用时的单股兜底：增量库 merge + ``prepare_ranking_cross_section_pipeline``，
+    与 ``run_daily`` 训练/推理管道对齐。
+    """
+    if factors is None or factors.empty or df_hist is None or df_hist.empty:
+        return None
+    from .kline_chart import lookup_stock_display_name
+
+    td = str(trade_date).strip()[:10]
+    panel = factors.copy()
+    panel["trade_date"] = td
+    panel["stock_code"] = code6
+    panel["stock_name"] = lookup_stock_display_name(code6) or "未知"
+    if "industry" in df_hist.columns:
+        panel["industry"] = normalize_industry_label(df_hist.iloc[-1].get("industry"))
+    else:
+        panel["industry"] = DEFAULT_INDUSTRY_LABEL
+    mc_raw = df_hist.iloc[-1].get("market_cap") if "market_cap" in df_hist.columns else None
+    try:
+        mc_f = float(mc_raw) if mc_raw is not None and pd.notna(mc_raw) else float("nan")
+    except (TypeError, ValueError):
+        mc_f = float("nan")
+    panel["mcap"] = mc_f
+    panel["volume"] = float(
+        pd.to_numeric(df_hist.iloc[-1]["volume"], errors="coerce") or 0.0
+    )
+    panel = panel.tail(1).reset_index(drop=True)
+    try:
+        cleaned = prepare_ranking_cross_section_pipeline(panel, date_col="trade_date")
+    except Exception:
+        return None
+    if cleaned.empty:
+        return None
+    row = cleaned.iloc[0]
+    if row[list(FEATURE_COLUMNS)].isna().any():
+        return None
+    return {c: float(row[c]) for c in FEATURE_COLUMNS}
+
+
 def _cross_section_features_for_diagnose(
     code6: str,
     anchor: str,
@@ -1316,16 +1361,26 @@ def diagnose_single_stock(
     if cs_map is not None:
         feat_map = cs_map
     else:
-        _hints: dict[str, str] = {
-            "empty_universe": "本地可预测股票池为空，融合模型输入暂用单股原始因子（未做全市场截面清洗）。",
-            "no_factor_rows": "未能算出全市场因子行，融合模型输入暂用单股原始因子。",
-            "empty_after_prune": "剔除无量样本后池为空，融合模型输入暂用单股原始因子。",
-            "suppressed_or_missing": "该标的未进入当日全市场因子池（可能因短期涨幅/动量压制），融合模型输入暂用单股原始因子。",
-            "missing_after_clean": "截面清洗后未找到该股行，融合模型输入暂用单股原始因子。",
-        }
-        feature_alignment_note = _hints.get(
-            cs_err or "", "截面因子对齐失败，融合模型输入暂用单股原始因子。"
+        solo_map = _diagnose_features_via_ranking_pipeline(
+            code6, td, factors, df_hist
         )
+        if solo_map is not None:
+            feat_map = solo_map
+            feature_alignment_note = (
+                "全市场截面池不可用，已对该股单独执行增量库合并与截面清洗管道。"
+            )
+        else:
+            _hints: dict[str, str] = {
+                "empty_universe": "本地可预测股票池为空；已合并增量库特征，但未完成截面清洗，融合分仅供参考。",
+                "no_factor_rows": "未能算出全市场因子行；已合并增量库特征，截面清洗未执行。",
+                "empty_after_prune": "剔除无量样本后池为空；已合并增量库特征，截面清洗未执行。",
+                "suppressed_or_missing": "该标的未进入当日全市场因子池；已合并增量库特征，截面清洗未执行。",
+                "missing_after_clean": "截面清洗后未找到该股行；已合并增量库特征，融合分仅供参考。",
+            }
+            feature_alignment_note = _hints.get(
+                cs_err or "",
+                "截面因子对齐失败；已合并 SQLite 增量库特征，未完成截面清洗。",
+            )
     if cs_td and str(cs_td)[:10] != str(td)[:10]:
         extra = (
             f"全市场锚定交易日为 {cs_td}，该股 K 线末日为 {td}；截面计算以 {cs_td} 为准。"

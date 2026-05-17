@@ -32,6 +32,7 @@ import pandas as pd
 
 from src.config import (
     FEATURE_COLUMNS,
+    MARKET_REGIME_MIN_SCORE,
     MIN_HISTORY_BARS,
     MODEL_PATH,
     PREDICT_FETCH_WORKERS,
@@ -51,6 +52,7 @@ from src.database import (
     stock_codes_with_local_bars,
 )
 from src.dingtalk_notifier import maybe_push_daily_selections
+from src.market_regime import get_hs300_market_environment_score
 from src.factor_calculator import (
     compute_factors_for_history,
     normalize_industry_label,
@@ -374,6 +376,44 @@ def predict_daily(
             f"提示: {anchor_td} 选股记录已存在，跳过（已使用 --skip-if-exists）。"
         )
         return
+
+    mkt_score = get_hs300_market_environment_score(anchor_td)
+    if mkt_score < int(MARKET_REGIME_MIN_SCORE):
+        breaker_msg = (
+            f"🛡️ 大盘择时熔断：沪深300 环境分 {mkt_score} 低于阈值 {MARKET_REGIME_MIN_SCORE}，"
+            f"本日（{anchor_td}）进入风控空仓防御，不产出 Top{TOP_N_SELECTION} 推荐。"
+            "（与题材选股环境分规则一致：指数收盘需站稳 20 日均线。）"
+        )
+        print(breaker_msg, flush=True)
+        delete_daily_outputs_for_trade_date(anchor_td)
+        write_today_json(ROOT, trade_date=anchor_td, selection_rows=[])
+        print(f"已写入空仓占位 {ROOT / 'today.json'}", flush=True)
+        try:
+            insert_system_log(
+                "market_regime_breaker",
+                "WARN",
+                breaker_msg,
+                json.dumps(
+                    {
+                        "trade_date": str(anchor_td)[:10],
+                        "hs300_env_score": mkt_score,
+                        "min_score": int(MARKET_REGIME_MIN_SCORE),
+                        "action": "empty_selection",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception:
+            pass
+        if not skip_dingtalk:
+            print("大盘熔断日跳过钉钉推送（无推荐标的）。", flush=True)
+        return
+
+    if verbose:
+        print(
+            f"大盘环境分 {mkt_score} ≥ {MARKET_REGIME_MIN_SCORE}，继续全市场选股流程。",
+            flush=True,
+        )
 
     workers = int(max_workers if max_workers is not None else PREDICT_FETCH_WORKERS)
     workers = max(1, min(workers, 32))

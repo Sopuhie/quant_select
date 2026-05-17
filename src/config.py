@@ -365,6 +365,11 @@ THEME_KDJ_J_SLOPE_MIN = 5.0
 THEME_KDJ_LEVEL_1 = 100.0
 THEME_KDJ_LEVEL_2 = 110.0
 
+# 沪深300 大盘环境分低于该阈值时 run_daily 熔断空仓（与题材 tab 60 分一致）
+MARKET_REGIME_MIN_SCORE = max(
+    0, min(100, int(os.environ.get("QUANT_MARKET_REGIME_MIN_SCORE", "60")))
+)
+
 
 def get_quant_config_merged() -> dict[str, Any]:
     """

@@ -152,17 +152,16 @@ def _minute_macd_kdj(close: pd.Series) -> pd.DataFrame:
     return pd.DataFrame({"dif": dif, "dea": dea, "hist": hist, "k": k, "d": d, "j": j})
 
 
-def enrich_minute_bars(df: pd.DataFrame) -> pd.DataFrame:
+def _sanitize_minute_frame(df: pd.DataFrame) -> pd.DataFrame:
     """
-    补充 VWAP、成交额列；VWAP = 累计成交额 / 累计成交量。
-    若无成交额列则用 typical_price * volume 近似。
+    分钟线防御性清洗：核心 OHLCV 链式填充；``amount`` 缺失时用 close×volume 代理。
     """
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
     if "close" not in out.columns:
         return pd.DataFrame()
-    for col in ("open", "high", "low", "close", "volume"):
+    for col in ("open", "close", "high", "low", "volume"):
         if col not in out.columns:
             out[col] = out["close"] if col != "volume" else 0.0
         out[col] = (
@@ -170,19 +169,28 @@ def enrich_minute_bars(df: pd.DataFrame) -> pd.DataFrame:
         )
     close = out["close"].astype(float)
     vol = out["volume"].astype(float)
+    amt_proxy = close * vol
     if "amount" in out.columns:
         amt = pd.to_numeric(out["amount"], errors="coerce")
-        proxy = close * vol
-        out["amount"] = amt.where(amt.notna() & (amt > 0), proxy)
+        out["amount"] = amt.where(amt.notna() & (amt > 0), amt_proxy)
     else:
-        typical = (
-            pd.to_numeric(out.get("high", close), errors="coerce")
-            + pd.to_numeric(out.get("low", close), errors="coerce")
-            + close
-        ) / 3.0
-        out["amount"] = typical * vol
+        out["amount"] = amt_proxy
     out["amount"] = out["amount"].ffill().bfill().fillna(0.0)
-    out["volume"] = vol
+    return out
+
+
+def enrich_minute_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    补充 VWAP、成交额列；VWAP = 累计成交额 / 累计成交量。
+    若无成交额列则用 typical_price * volume 近似。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = _sanitize_minute_frame(df)
+    if out.empty:
+        return out
+    close = out["close"].astype(float)
+    vol = out["volume"].astype(float)
     cum_amt = out["amount"].cumsum()
     cum_vol = out["volume"].cumsum().replace(0, np.nan)
     out["vwap"] = (cum_amt / cum_vol).ffill().bfill()
@@ -209,6 +217,9 @@ def fetch_today_minute_bars(stock_code: str) -> pd.DataFrame | None:
                 rename_extra[c] = "amount"
         if rename_extra:
             raw = raw.rename(columns=rename_extra)
+        raw = _sanitize_minute_frame(raw)
+        if raw.empty:
+            return None
         enriched = enrich_minute_bars(raw)
         return enriched if enriched is not None and not enriched.empty else None
     except Exception as exc:
@@ -308,18 +319,34 @@ def _detect_volume_price(df: pd.DataFrame) -> tuple[str, float, str] | None:
 
 
 def detect_intraday_signals(df: pd.DataFrame) -> list[dict[str, Any]]:
-    """对 enrich 后的分钟线运行全部检测器。"""
+    """对 enrich 后的分钟线运行全部检测器（单股异常不向外抛出）。"""
     out: list[dict[str, Any]] = []
+    if df is None or df.empty:
+        return out
+    try:
+        df = _sanitize_minute_frame(df)
+        if df.empty or "vwap" not in df.columns:
+            df = enrich_minute_bars(df)
+    except Exception as exc:
+        logger.warning("detect_intraday_signals 清洗失败: %s", exc)
+        return out
     if df is None or df.empty:
         return out
     detectors = (_detect_vwap_support, _detect_macd_kdj, _detect_volume_price)
     for fn in detectors:
-        hit = fn(df)
+        try:
+            hit = fn(df)
+        except Exception as exc:
+            logger.warning("信号检测器 %s 异常: %s", fn.__name__, exc)
+            continue
         if hit is None:
             continue
         sig_type, price, reason = hit
-        ts = df.iloc[-1]["time"]
-        sig_time = ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts)
+        try:
+            ts = df.iloc[-1]["time"]
+            sig_time = ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts)
+        except Exception:
+            sig_time = ""
         out.append(
             {
                 "signal_type": sig_type,
@@ -468,31 +495,48 @@ def run_monitor_cycle_for_targets(
                 }
             )
             continue
-        new_sigs = detect_intraday_signals(df)
-        if persist and new_sigs:
-            n_written = persist_signals_for_stock(code, name, new_sigs, realtime_score=rt_score)
-            if n_written > 0:
-                _push_signal_to_dingtalk(code, name, new_sigs, rt_score)
-        today_sigs = fetch_signal_history_for_stock_on_date(code)
-        last = df.iloc[-1]
-        open_px = float(df["open"].iloc[0])
-        last_px = float(last["close"])
-        pct = (last_px / open_px - 1.0) * 100.0 if open_px > 0 else 0.0
-        panels.append(
-            {
-                "stock_code": code,
-                "stock_name": name,
-                "rank": t.get("rank"),
-                "realtime_score": rt_score,
-                "minute_df": df,
-                "latest_price": last_px,
-                "pct_chg": pct,
-                "volume": float(last["volume"]),
-                "signals_today": today_sigs,
-                "new_signals": new_sigs,
-                "error": None,
-            }
-        )
+        try:
+            new_sigs = detect_intraday_signals(df)
+            if persist and new_sigs:
+                n_written = persist_signals_for_stock(
+                    code, name, new_sigs, realtime_score=rt_score
+                )
+                if n_written > 0:
+                    _push_signal_to_dingtalk(code, name, new_sigs, rt_score)
+            today_sigs = fetch_signal_history_for_stock_on_date(code)
+            last = df.iloc[-1]
+            open_px = float(pd.to_numeric(df["open"].iloc[0], errors="coerce") or 0.0)
+            last_px = float(pd.to_numeric(last["close"], errors="coerce") or 0.0)
+            pct = (last_px / open_px - 1.0) * 100.0 if open_px > 0 else 0.0
+            vol_last = float(pd.to_numeric(last.get("volume", 0), errors="coerce") or 0.0)
+            panels.append(
+                {
+                    "stock_code": code,
+                    "stock_name": name,
+                    "rank": t.get("rank"),
+                    "realtime_score": rt_score,
+                    "minute_df": df,
+                    "latest_price": last_px,
+                    "pct_chg": pct,
+                    "volume": vol_last,
+                    "signals_today": today_sigs,
+                    "new_signals": new_sigs,
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            logger.warning("监控面板组装失败 %s: %s", code, exc)
+            panels.append(
+                {
+                    "stock_code": code,
+                    "stock_name": name,
+                    "rank": t.get("rank"),
+                    "realtime_score": rt_score,
+                    "minute_df": None,
+                    "signals_today": fetch_signal_history_for_stock_on_date(code),
+                    "error": str(exc)[:120],
+                }
+            )
     return panels
 
 
