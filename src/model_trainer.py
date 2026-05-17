@@ -24,6 +24,7 @@ from .config import (
     BEST_LGB_PARAMS_JSON,
     CATBOOST_MODEL_PATH,
     FEATURE_COLUMNS,
+    LABEL_HORIZON_DAYS,
     LGB_PARAMS,
     LGB_RANKER_DEFAULT_PARAMS,
     META_STACKER_PATH,
@@ -240,6 +241,58 @@ def fit_meta_stacker_ridge(
     pred_va = ridge.predict(z_va)
     ic_meta = mean_cross_sectional_rank_ic(pred_va, dates_va, yv)
     return ridge, {"meta_mean_rank_ic_val": ic_meta, "meta_n_base": 2.0}
+
+
+def split_panel_train_val_purged(
+    panel: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    val_days: int = 60,
+    purge_days: int | None = None,
+    min_total_days: int = 90,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
+    """
+    按交易日切分训练/验证集，并在验证集起点前保留 ``purge_days`` 个交易日隔离带，
+    避免 ``label_ret`` 的 forward horizon 造成时序标签泄露。
+    """
+    if panel.empty:
+        raise ValueError("训练面板为空，无法划分训练/验证集。")
+    if purge_days is None:
+        purge_days = int(LABEL_HORIZON_DAYS)
+    unique_dates = sorted(panel[date_col].astype(str).str[:10].unique())
+    n_dates = len(unique_dates)
+    if n_dates < int(min_total_days):
+        raise ValueError(
+            f"全市场总交易天数 {n_dates} < {min_total_days}，拒绝重训以避免 train=val 过拟合；"
+            "请同步更多历史行情或放宽 --train-end-date。"
+        )
+    if n_dates < val_days + purge_days + 1:
+        raise ValueError(
+            f"交易天数 {n_dates} 不足以划分 {val_days} 日验证集与 {purge_days} 日隔离带，"
+            "请扩充历史样本。"
+        )
+    split_date = unique_dates[-val_days]
+    split_idx = unique_dates.index(split_date)
+    if split_idx < purge_days:
+        raise ValueError(
+            f"验证起点 {split_date} 之前不足 {purge_days} 个交易日，无法设置 Purging Gap。"
+        )
+    train_cutoff_date = unique_dates[split_idx - purge_days]
+    ds = panel[date_col].astype(str).str[:10]
+    train_df = panel.loc[ds <= train_cutoff_date].copy()
+    val_df = panel.loc[ds >= split_date].copy()
+    if train_df.empty or val_df.empty:
+        raise ValueError(
+            f"划分后训练或验证子集为空（train_cutoff={train_cutoff_date}, "
+            f"split_date={split_date}），请检查面板日期范围。"
+        )
+    meta = {
+        "split_date": split_date,
+        "train_cutoff_date": train_cutoff_date,
+        "purge_days": str(purge_days),
+        "val_days": str(val_days),
+    }
+    return train_df, val_df, meta
 
 
 def _tail_date_split(
@@ -1329,15 +1382,7 @@ def train_panel_and_register(
     work = panel_df.replace([np.inf, -np.inf], np.nan).dropna(
         subset=FEATURE_COLUMNS + ["label_ret", "date"]
     )
-    dates = sorted(work["date"].astype(str).unique())
-    if len(dates) < 30:
-        train_df, val_df = work.copy(), work.copy()
-    else:
-        split_date = dates[-max(1, len(dates) // 10)]
-        train_df = work[work["date"].astype(str) < split_date].copy()
-        val_df = work[work["date"].astype(str) >= split_date].copy()
-    if train_df.empty or val_df.empty:
-        train_df, val_df = work.copy(), work.copy()
+    train_df, val_df, _split_meta = split_panel_train_val_purged(work, date_col="date")
     params = merge_ranker_params(load_ranker_params_json())
     model, metrics = train_lgbm_ranker(
         train_df,

@@ -69,6 +69,7 @@ from src.predictor import (
     feature_importances_aligned,
     filter_predictions,
     prune_zero_volume_rows,
+    select_top_n_with_industry_cap,
 )
 from src.utils import get_last_trading_date, is_a_share_trading_day
 
@@ -504,8 +505,14 @@ def predict_daily(
     insert_daily_predictions(predict_rows)
     print(f"已成功将全市场 {len(predict_rows)} 只股票打分数据写入 daily_predictions。")
 
-    # 8. 筛选前 TOP_N_SELECTION（默认 3 只）作为今日推荐，写入 daily_selections 表
-    selections = filtered_df.head(TOP_N_SELECTION).copy()
+    # 8. 行业集中度硬风控后取 Top N，写入 daily_selections 表
+    selections = select_top_n_with_industry_cap(filtered_df, TOP_N_SELECTION)
+    if selections.empty:
+        print(
+            f"警告: 行业集中度风控后无法凑满 Top{TOP_N_SELECTION}，"
+            "请扩大股票池或检查行业标签。"
+        )
+        sys.exit(1)
     selections["rank"] = range(1, len(selections) + 1)
     selections["next_day_return"] = None
     selections["hold_5d_return"] = None

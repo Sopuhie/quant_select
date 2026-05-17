@@ -71,6 +71,7 @@ from src.predictor import (  # noqa: E402
     blend_ranker_scores_with_optional_meta,
     filter_predictions,
     prune_zero_volume_rows,
+    select_top_n_with_industry_cap,
 )
 
 PriceKind = Literal["open", "close"]
@@ -579,7 +580,8 @@ def _score_universe_for_date(
     feat_df = apply_experience_trading_filters(feat_df)
     if feat_df.empty:
         return []
-    return feat_df.head(TOP_N_SELECTION)["stock_code"].astype(str).tolist()
+    top = select_top_n_with_industry_cap(feat_df, TOP_N_SELECTION)
+    return top["stock_code"].astype(str).tolist()
 
 
 def _price_on(

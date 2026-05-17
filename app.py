@@ -149,6 +149,39 @@ def _persist_experience_filters_from_ui() -> tuple[bool, str | None]:
     return True, None
 
 
+_EF_WIDGET_FIELDS = (
+    ("task_c_ef_min_price", "min_price"),
+    ("task_c_ef_max_price", "max_price"),
+    ("task_c_ef_min_mcap", "min_mcap"),
+    ("task_c_ef_max_mcap", "max_mcap"),
+    ("task_c_ef_min_turnover", "min_turnover"),
+    ("task_c_ef_max_turnover", "max_turnover"),
+)
+
+
+def _experience_filter_cfg_mtime() -> float:
+    try:
+        return float(config_manager.config_path.stat().st_mtime)
+    except OSError:
+        return 0.0
+
+
+def _sync_experience_filter_widget_state(ef_ui: dict, cfg_mtime: float) -> None:
+    """
+    与 config.json 同步经验风控输入框的 session_state。
+    仅在配置文件变更时 pop 旧控件状态；禁止对已有控件 key 反复整体赋值（易触发 Streamlit 冲突）。
+    """
+    if st.session_state.get("_quant_ef_cfg_mtime") != cfg_mtime:
+        st.session_state["_quant_ef_cfg_mtime"] = cfg_mtime
+        for state_key, _ in _EF_WIDGET_FIELDS:
+            st.session_state.pop(state_key, None)
+    for state_key, cfg_key in _EF_WIDGET_FIELDS:
+        if state_key not in st.session_state:
+            st.session_state[state_key] = _experience_filter_display_str(
+                ef_ui, cfg_key
+            )
+
+
 # ================= 1. 全局页面配置 =================
 st.set_page_config(
     page_title="A-Quant Lite 控制台",
@@ -1914,20 +1947,17 @@ with tab_data:
             include_300 = st.checkbox(
                 "🟢 包含创业板 (300 / 301)",
                 value=False,
+                key="task_c_include_300",
                 help="未勾选时，选股池将排除代码以 300、301 开头的股票",
             )
         with col_cb2:
             include_688 = st.checkbox(
                 "🔵 包含科创板 (688)",
                 value=False,
+                key="task_c_include_688",
                 help="未勾选时，选股池将排除代码以 688 开头的股票",
             )
 
-        config_manager.reload()
-        try:
-            _ef_cfg_mtime = float(config_manager.config_path.stat().st_mtime)
-        except OSError:
-            _ef_cfg_mtime = 0.0
         _mp, _Mxp, _mm, _Mxm, _mt, _Mxt = get_experience_thresholds()
         _ef_ui = {
             "min_price": _mp,
@@ -1937,26 +1967,7 @@ with tab_data:
             "min_turnover": _mt,
             "max_turnover": _Mxt,
         }
-        _ef_widget_fields = (
-            ("task_c_ef_min_price", "min_price"),
-            ("task_c_ef_max_price", "max_price"),
-            ("task_c_ef_min_mcap", "min_mcap"),
-            ("task_c_ef_max_mcap", "max_mcap"),
-            ("task_c_ef_min_turnover", "min_turnover"),
-            ("task_c_ef_max_turnover", "max_turnover"),
-        )
-        if st.session_state.get("_quant_ef_cfg_mtime") != _ef_cfg_mtime:
-            st.session_state["_quant_ef_cfg_mtime"] = _ef_cfg_mtime
-            for _state_key, _cfg_key in _ef_widget_fields:
-                st.session_state[_state_key] = _experience_filter_display_str(
-                    _ef_ui, _cfg_key
-                )
-        else:
-            for _state_key, _cfg_key in _ef_widget_fields:
-                st.session_state.setdefault(
-                    _state_key,
-                    _experience_filter_display_str(_ef_ui, _cfg_key),
-                )
+        _sync_experience_filter_widget_state(_ef_ui, _experience_filter_cfg_mtime())
 
         with st.expander(
             "⚙️ 经验风控阈值（打分后、取 Top 前硬过滤；留空表示不限制）",

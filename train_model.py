@@ -74,6 +74,7 @@ from src.model_trainer import (
     save_meta_stacker,
     save_model,
     save_ranker_params_json,
+    split_panel_train_val_purged,
     train_catboost_ranker_optional,
     train_lgbm_ranker,
     train_xgb_ranker,
@@ -318,19 +319,19 @@ def main() -> None:
         subset=FEATURE_COLUMNS + ["label_ret"]
     )
 
-    unique_dates = sorted(panel["date"].astype(str).unique())
-    if len(unique_dates) < 30:
-        train_df = panel
-        val_df = panel
-        if verbose:
-            print("[划分] 交易日不足 30，训练集与验证集相同（仅拟合，慎用）。", flush=True)
-    else:
-        split_date = unique_dates[-20]
-        train_df = panel[panel["date"].astype(str) < split_date].copy()
-        val_df = panel[panel["date"].astype(str) >= split_date].copy()
-
-    if train_df.empty or val_df.empty:
-        raise SystemExit("训练或验证子集为空，请放宽 --train-end-date 或增大股票数量。")
+    unique_dates = sorted(panel["date"].astype(str).str[:10].unique())
+    try:
+        train_df, val_df, split_meta = split_panel_train_val_purged(panel, date_col="date")
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if verbose:
+        print(
+            "[划分] Purged 时序切分："
+            f"训练截止 {split_meta['train_cutoff_date']}，"
+            f"隔离带 {split_meta['purge_days']} 日，"
+            f"验证自 {split_meta['split_date']} 起共 {split_meta['val_days']} 个交易日。",
+            flush=True,
+        )
 
     x_tr = train_df[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
     y_tr = pd.to_numeric(train_df["label_ret"], errors="coerce").to_numpy()

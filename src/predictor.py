@@ -44,6 +44,7 @@ from .database import (
     selection_exists_for_date,
 )
 from .factor_calculator import (
+    DEFAULT_INDUSTRY_LABEL,
     _roll_ewm_blend,
     attach_hsgt_flow_interact,
     compute_factors_for_history,
@@ -136,6 +137,63 @@ def feature_importances_aligned(model: Any) -> list[float]:
     return arr.tolist()
 
 
+MAX_STOCKS_PER_INDUSTRY = 2
+
+_BIAS_FACTOR_LABELS: dict[str, str] = {
+    "factor_bias_5": "5日均线乖离",
+    "factor_bias_10": "10日均线乖离",
+    "factor_bias_20": "20日均线乖离",
+    "factor_bias_60": "60日均线乖离",
+}
+
+
+def _describe_bias_factor(factor_name: str, val: float) -> str:
+    """按截面清洗后的乖离因子数值分档生成技术面解读（防范一律正面叙事）。"""
+    label = _BIAS_FACTOR_LABELS.get(factor_name, "均线乖离")
+    if val > 1.5:
+        return (
+            f"{label}：短期涨幅过大，股价显著偏离均线，"
+            "存在高位超买与追高回撤风险，请谨慎关注"
+        )
+    if val < -1.5:
+        return (
+            f"{label}：短期价格遭遇非理性砸盘，股价严重超跌，"
+            "技术面呈现深幅负乖离，关注左侧超跌反弹机会"
+        )
+    return f"{label}：均线乖离适度，处于温和蓄势或健康的趋势通道中"
+
+
+def select_top_n_with_industry_cap(
+    ranked_df: pd.DataFrame,
+    top_n: int,
+    *,
+    industry_col: str = "industry",
+    max_per_industry: int = MAX_STOCKS_PER_INDUSTRY,
+) -> pd.DataFrame:
+    """
+    按 score 已降序排列的截面中抽取 Top N；单行业最多 ``max_per_industry`` 只，
+    行业已满则静默跳过并继续向下选取。
+    """
+    if ranked_df.empty or top_n <= 0:
+        return ranked_df.iloc[:0].copy()
+    picked_idx: list[Any] = []
+    industry_counts: dict[str, int] = {}
+    for idx, row in ranked_df.iterrows():
+        if len(picked_idx) >= top_n:
+            break
+        if industry_col in ranked_df.columns:
+            ind = normalize_industry_label(row.get(industry_col))
+        else:
+            ind = DEFAULT_INDUSTRY_LABEL
+        if industry_counts.get(ind, 0) >= max_per_industry:
+            continue
+        industry_counts[ind] = industry_counts.get(ind, 0) + 1
+        picked_idx.append(idx)
+    if not picked_idx:
+        return ranked_df.iloc[:0].copy()
+    return ranked_df.loc[picked_idx].reset_index(drop=True)
+
+
 def analyze_stock_reasons(
     row: Any,
     importances: list[float],
@@ -143,10 +201,6 @@ def analyze_stock_reasons(
 ) -> str:
     """按因子贡献 Top3 生成可读「入选原因」文案。"""
     templates = {
-        "factor_bias_5": "短期5日均线乖离温和，低位安全蓄势区，价格处于健康反弹或突破通道",
-        "factor_bias_10": "10日均线支撑扎实，低位换手充分，多头震荡上行形态保持良好",
-        "factor_bias_20": "运行在20日生命线之上，低位安全垫较厚，中线上行防守及承接结构优异",
-        "factor_bias_60": "站稳60日牛熊分界线，具备中长期大底部扎实换手筑底特征",
         "factor_ratio_5_20": "短期与中期均线距离拉开，呈现健康的经典多头形态形态",
         "factor_ratio_10_60": "中长期均线系统发散向上，呈现典型的黄金多头排列形态",
         "factor_return_1d": "昨日放量收出大阳线，日内多头动量和赚钱效应较强",
@@ -191,7 +245,15 @@ def analyze_stock_reasons(
 
     reasons: list[str] = []
     for idx, f in enumerate(top_feats):
-        desc = templates.get(f, f"核心因子 [{f}] 处于截面优势地位")
+        try:
+            raw = row.get(f, 0) if hasattr(row, "get") else row[f]
+            fval = float(raw)
+        except (TypeError, ValueError, KeyError):
+            fval = 0.0
+        if f in _BIAS_FACTOR_LABELS:
+            desc = _describe_bias_factor(f, fval)
+        else:
+            desc = templates.get(f, f"核心因子 [{f}] 处于截面优势地位")
         reasons.append(f"{idx + 1}. {desc}")
 
     return "；".join(reasons) + "。"
@@ -931,7 +993,11 @@ def persist_predictions(
             for r in pred_rows
         ]
     )
-    top = scores_df.head(top_n).reset_index(drop=True)
+    top = select_top_n_with_industry_cap(scores_df, top_n)
+    if len(top) < top_n:
+        raise RuntimeError(
+            f"行业集中度风控后仅选出 {len(top)} 只，不足 Top{top_n}；请扩大股票池或放宽经验过滤。"
+        )
     sel_rows = []
     for i, r in top.iterrows():
         reason = analyze_stock_reasons(r, imp_vec, FEATURE_COLUMNS)
