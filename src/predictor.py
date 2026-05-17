@@ -46,6 +46,7 @@ from .database import (
 )
 from .factor_calculator import (
     DEFAULT_INDUSTRY_LABEL,
+    HSGT_FLOW_INTERACT_COL,
     _roll_ewm_blend,
     attach_hsgt_flow_interact,
     build_hsgt_net_zscore_by_trade_date,
@@ -53,6 +54,7 @@ from .factor_calculator import (
     enrich_factors_with_incremental_db,
     normalize_industry_label,
     prepare_ranking_cross_section_pipeline,
+    sanitize_hsgt_flow_interact_column,
 )
 from .model_trainer import (
     assert_feature_matrix_matches_rankers,
@@ -748,10 +750,15 @@ def _overlay_auxiliary_features_for_diagnose_anchor(
                 out.loc[ri, "factor_north_hold_ratio_chg"] = float(v)
 
     zmap = build_hsgt_net_zscore_by_trade_date([td])
-    zv = float(zmap.get(td, 0.0))
-    r5 = float(pd.to_numeric(out.loc[ri, "factor_return_5d"], errors="coerce") or 0.0)
-    out.loc[ri, "factor_hsgt_flow_interact"] = zv * r5
-    return out
+    zv_raw = zmap.get(td)
+    try:
+        zv = float(zv_raw) if zv_raw is not None and np.isfinite(float(zv_raw)) else 0.0
+    except (TypeError, ValueError):
+        zv = 0.0
+    r5_s = pd.to_numeric(out.loc[ri, "factor_return_5d"], errors="coerce")
+    r5 = float(r5_s) if pd.notna(r5_s) and np.isfinite(float(r5_s)) else 0.0
+    out.loc[ri, HSGT_FLOW_INTERACT_COL] = zv * r5
+    return sanitize_hsgt_flow_interact_column(out)
 
 
 def _diagnose_features_via_ranking_pipeline(
@@ -1362,6 +1369,7 @@ def diagnose_single_stock(
         trade_date=td,
         row_index=last_i,
     )
+    factors = sanitize_hsgt_flow_interact_column(factors)
     last_row = factors.iloc[last_i]
     if last_row[list(FEATURE_COLUMNS)].isna().any():
         return None, "最新一日因子存在缺失，无法诊断。", "warning"
@@ -1498,7 +1506,12 @@ def diagnose_single_stock(
         _hsgt_df = pd.DataFrame([feat_map])
         _hsgt_df["trade_date"] = td
         _hsgt_df = attach_hsgt_flow_interact(_hsgt_df, date_col="trade_date")
+        _hsgt_df = sanitize_hsgt_flow_interact_column(_hsgt_df)
         feat_map = {c: float(_hsgt_df.iloc[0][c]) for c in FEATURE_COLUMNS}
+    else:
+        _fm = pd.DataFrame([feat_map])
+        _fm = sanitize_hsgt_flow_interact_column(_fm)
+        feat_map = {c: float(_fm.iloc[0][c]) for c in FEATURE_COLUMNS}
     X = pd.DataFrame([[feat_map[c] for c in FEATURE_COLUMNS]], columns=list(FEATURE_COLUMNS))
     X = X[list(FEATURE_COLUMNS)]
     cat_model = load_catboost_ranker_optional()

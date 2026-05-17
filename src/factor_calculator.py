@@ -28,9 +28,12 @@ MIN_INDUSTRY_GROUP_SIZE = 5
 MIN_SIZE_NEUTRAL_GROUP = 5
 
 SIZE_FACTOR_COL = "factor_size_mcap"
+HSGT_FLOW_INTERACT_COL = "factor_hsgt_flow_interact"
 
 # 规模因子 log10(市值) 全为缺失时的兜底（约 log10(100 亿元) 量级，仅作回归自变量中轴）
 SIZE_MCAP_LOG_FALLBACK = 10.0
+# 北向交互因子全缺失时的安全中轴（与 attach 失败置 0 一致）
+HSGT_FLOW_INTERACT_SAFE_CENTER = 0.0
 
 # 训练 / 推理共用：缺失或非字符串行业统一为该标签，便于行业内截面标准化成组
 DEFAULT_INDUSTRY_LABEL = "未知行业"
@@ -136,6 +139,30 @@ def assign_factor_size_mcap_from_mcap(feat_df: pd.DataFrame) -> pd.DataFrame:
         )
     elif SIZE_FACTOR_COL not in out.columns:
         out[SIZE_FACTOR_COL] = np.nan
+    return out
+
+
+def sanitize_hsgt_flow_interact_column(
+    feat_df: pd.DataFrame,
+    *,
+    col: str = HSGT_FLOW_INTERACT_COL,
+) -> pd.DataFrame:
+    """
+    北向交互因子安全收敛：``zv * r5`` 后因北向表缺失/次新股历史不足产生的
+    NaN/Inf 一律拉回序列中轴，避免 LGB/XGB/Cat 融合打分被污染。
+    """
+    if feat_df.empty or col not in feat_df.columns:
+        return feat_df
+    out = feat_df.copy()
+    s = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    center = (
+        float(s.median())
+        if not s.isna().all()
+        else float(HSGT_FLOW_INTERACT_SAFE_CENTER)
+    )
+    s = s.fillna(center)
+    s = s.where(np.isfinite(s), center)
+    out[col] = s.astype(np.float64)
     return out
 
 
@@ -331,8 +358,8 @@ def attach_hsgt_flow_interact(
         return work
     zv = work[date_col].astype(str).str[:10].map(zmap).astype(float)
     r = pd.to_numeric(work[ret_col], errors="coerce").astype(float)
-    work[out_col] = (zv.fillna(0.0) * r.fillna(0.0)).replace([np.inf, -np.inf], 0.0)
-    return work
+    work[out_col] = zv * r
+    return sanitize_hsgt_flow_interact_column(work, col=out_col)
 
 
 def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
@@ -476,12 +503,8 @@ def prepare_ranking_cross_section_pipeline(
         w["date"] = w["date"].astype(str).str[:10]
     w = suppress_high_recent_gains(w)
     w = assign_factor_size_mcap_from_mcap(w)
-    # 对数市值 → 全市场截面中位数兜底（行业归一化 / 市值中性化之前）
-    if SIZE_FACTOR_COL in w.columns:
-        _sz = pd.to_numeric(w[SIZE_FACTOR_COL], errors="coerce")
-        w[SIZE_FACTOR_COL] = _sz.fillna(
-            float(_sz.median()) if not _sz.isna().all() else float(SIZE_MCAP_LOG_FALLBACK)
-        )
+    # 对数市值 → 全市场截面中位数兜底安全锁（行业截面归一化之前）
+    w = sanitize_factor_size_mcap_column(w)
     w = clean_cross_sectional_features(w)
     if str(date_col) != "date":
         w = w.drop(columns=["date"], errors="ignore")
