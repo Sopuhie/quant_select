@@ -704,7 +704,7 @@ def label_forward_return(
         while buy_i < min(n, i + max_scan):
             row_b = work.iloc[buy_i]
             if _bar_one_word_limit_locked(
-                row_b, prev_buy, limit_ratio=limit_r, direction="down"
+                row_b, prev_buy, limit_ratio=limit_r, direction="up"
             ):
                 prev_buy = float(row_b["close"])
                 buy_i += 1

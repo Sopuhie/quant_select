@@ -47,7 +47,16 @@ def zca_whiten_columns_cross_section(X: np.ndarray, *, eps: float = 1e-5) -> np.
     out = np.zeros((n, k), dtype=float)
     m = np.isfinite(X).all(axis=1)
     if int(m.sum()) < max(k + 2, 4):
-        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        out = np.zeros((n, k), dtype=float)
+        if int(m.sum()) > 0:
+            Xv = X[m]
+            mu = np.nanmean(Xv, axis=0, keepdims=True)
+            Xc = Xv - mu
+            std = np.nanstd(Xv, axis=0, ddof=1, keepdims=True)
+            std = np.maximum(std, float(eps))
+            Y = Xc / std
+            out[m] = np.nan_to_num(Y, nan=0.0, posinf=0.0, neginf=0.0)
+        return out
     Xv = X[m]
     mu = Xv.mean(axis=0, keepdims=True)
     Xc = Xv - mu
