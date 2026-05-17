@@ -46,7 +46,6 @@ from .database import (
 )
 from .factor_calculator import (
     DEFAULT_INDUSTRY_LABEL,
-    HSGT_FLOW_INTERACT_COL,
     _roll_ewm_blend,
     attach_hsgt_flow_interact,
     build_hsgt_net_zscore_by_trade_date,
@@ -757,12 +756,15 @@ def _overlay_auxiliary_features_for_diagnose_anchor(
         zv = 0.0
     r5_s = pd.to_numeric(out.loc[ri, "factor_return_5d"], errors="coerce")
     r5 = float(r5_s) if pd.notna(r5_s) and np.isfinite(float(r5_s)) else 0.0
-    out.loc[ri, HSGT_FLOW_INTERACT_COL] = zv * r5
-    out[HSGT_FLOW_INTERACT_COL] = pd.to_numeric(
-        out[HSGT_FLOW_INTERACT_COL], errors="coerce"
+    out.loc[ri, "factor_hsgt_flow_interact"] = zv * r5
+    out["factor_hsgt_flow_interact"] = pd.to_numeric(
+        out["factor_hsgt_flow_interact"], errors="coerce"
     ).fillna(0.0)
-    _hi = out[HSGT_FLOW_INTERACT_COL].to_numpy(dtype=float)
-    out[HSGT_FLOW_INTERACT_COL] = np.where(np.isfinite(_hi), _hi, 0.0)
+    out["factor_hsgt_flow_interact"] = np.where(
+        np.isfinite(out["factor_hsgt_flow_interact"]),
+        out["factor_hsgt_flow_interact"],
+        0.0,
+    )
     return out
 
 
@@ -1374,7 +1376,15 @@ def diagnose_single_stock(
         trade_date=td,
         row_index=last_i,
     )
-    factors = coerce_hsgt_flow_interact_finite(factors)
+    if "factor_hsgt_flow_interact" in factors.columns:
+        factors["factor_hsgt_flow_interact"] = pd.to_numeric(
+            factors["factor_hsgt_flow_interact"], errors="coerce"
+        ).fillna(0.0)
+        factors["factor_hsgt_flow_interact"] = np.where(
+            np.isfinite(factors["factor_hsgt_flow_interact"]),
+            factors["factor_hsgt_flow_interact"],
+            0.0,
+        )
     last_row = factors.iloc[last_i]
     if last_row[list(FEATURE_COLUMNS)].isna().any():
         return None, "最新一日因子存在缺失，无法诊断。", "warning"

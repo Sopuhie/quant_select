@@ -500,11 +500,14 @@ def prepare_ranking_cross_section_pipeline(
         w["date"] = w["date"].astype(str).str[:10]
     w = suppress_high_recent_gains(w)
     w = assign_factor_size_mcap_from_mcap(w)
-    # 全市场截面中位数兜底安全锁（行业/市值截面归一化之前）
-    if SIZE_FACTOR_COL in w.columns:
-        _sz = pd.to_numeric(w[SIZE_FACTOR_COL], errors="coerce")
-        w[SIZE_FACTOR_COL] = _sz.fillna(
-            float(_sz.median()) if not _sz.isna().all() else float(SIZE_MCAP_LOG_FALLBACK)
+    # 全市场截面中位数兜底安全锁（行业/市值截面归一化之前；严格按量化柜台规范）
+    if "factor_size_mcap" in w.columns:
+        w["factor_size_mcap"] = pd.to_numeric(
+            w["factor_size_mcap"], errors="coerce"
+        ).fillna(
+            w["factor_size_mcap"].median()
+            if not w["factor_size_mcap"].isna().all()
+            else 10.0
         )
     w = clean_cross_sectional_features(w)
     if str(date_col) != "date":
