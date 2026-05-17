@@ -16,10 +16,9 @@
   - **阶段 2**：线程池结束后，由 **主线程** 将内存中的 K 线分批 ``UPSERT`` 并 ``commit``，避免多线程竞争连接导致锁等待或死锁。
 
 行业字段：
-  - K 线写入后默认调用 ``sync_stock_industries``：经 AkShare **东方财富行业板块** 拉取「板块—成份」，
-    生成 ``{stock_code: 行业名}``，再通过 ``database.bulk_set_stock_daily_industry_by_code`` 批量
-    ``UPDATE stock_daily_kline SET industry=? WHERE stock_code=?``（覆盖该股全部历史行）。
-  - 仅用东方财富接口（``stock_board_industry_name_em`` / ``stock_board_industry_cons_em``），需可用网络。
+  - K 线写入后默认调用 ``sync_stock_industries``，生成 ``{stock_code: 行业名}`` 并批量 UPDATE。
+  - 数据源（``QUANT_INDUSTRY_SOURCE``）：``auto`` 时先东方财富行业板块，失败则 **Baostock** 全市场行业表。
+  - 市值（``QUANT_MCAP_SOURCE``）：``auto`` 时先东财 push2，失败则用东财 datacenter ``stock_value_em``。
 """
 from __future__ import annotations
 
@@ -48,8 +47,11 @@ from src.database import (
     upsert_stock_financial_rows,
 )
 from src.data_fetcher import (
+    fetch_a_share_industry_map,
     fetch_daily_hist,
+    fetch_market_cap_map,
     get_stock_pool,
+    list_a_stock_codes,
     resolve_incremental_daily_fetch_window,
 )
 from src.utils import get_kline_incremental_end_trade_date
@@ -69,17 +71,13 @@ def sync_stock_industries(
     max_boards: int | None = None,
 ) -> dict[str, int | str]:
     """
-    从 AkShare（东方财富）拉取 A 股行业板块及成份，构造 ``代码→行业名称`` 映射，
-    并对 SQLite 中 ``stock_daily_kline`` 按 ``stock_code`` 批量写入 ``industry``。
+    拉取 A 股行业并写入 ``stock_daily_kline.industry``。
 
-    同一股票若属于多个板块，以**先遍历到的板块**为准（不再覆盖）。
+    默认 ``QUANT_INDUSTRY_SOURCE=auto``：东方财富行业板块 → Baostock 全市场行业表。
 
     Returns:
-        统计字典：``n_boards``, ``n_codes_mapped``, ``rows_updated``, ``labeled_rows``, ``total_rows`` 等。
+        统计字典：``n_codes_mapped``, ``rows_updated``, ``labeled_rows``, ``total_rows`` 等。
     """
-    import akshare as ak
-
-    ensure_eastmoney_no_proxy_if_configured()
     path = db_path or DB_PATH
     init_db(path)
     sleep_s = (
@@ -89,73 +87,16 @@ def sync_stock_industries(
     )
 
     if verbose:
-        print("正在从 AkShare 拉取东方财富行业板块列表…", flush=True)
-    try:
-        boards_df = ak.stock_board_industry_name_em()
-    except Exception as exc:
-        raise RuntimeError(
-            f"拉取行业板块列表失败（请检查网络/代理/akshare 版本）: {exc}"
-        ) from exc
-
-    if boards_df is None or boards_df.empty:
-        raise RuntimeError("行业板块列表为空，无法同步 industry。")
-
-    name_col = "板块名称"
-    if name_col not in boards_df.columns:
-        raise RuntimeError(
-            f"行业板块表缺少列「{name_col}」，当前列: {list(boards_df.columns)}"
-        )
-
-    code_to_industry: dict[str, str] = {}
-    boards_ok = 0
-    boards_fail = 0
-    n_loop = 0
-    for _, row in boards_df.iterrows():
-        if max_boards is not None and n_loop >= max_boards:
-            break
-        n_loop += 1
-        board_name = str(row[name_col]).strip()
-        if not board_name:
-            continue
-        try:
-            cons = ak.stock_board_industry_cons_em(symbol=board_name)
-        except Exception:
-            boards_fail += 1
-            time.sleep(sleep_s)
-            continue
-        if cons is None or cons.empty or "代码" not in cons.columns:
-            boards_fail += 1
-            time.sleep(sleep_s)
-            continue
-        boards_ok += 1
-        for _, crow in cons.iterrows():
-            raw = crow.get("代码")
-            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-                continue
-            c = str(raw).strip().zfill(6)
-            if len(c) != 6 or not c.isdigit():
-                continue
-            if c not in code_to_industry:
-                code_to_industry[c] = board_name
-        if verbose and boards_ok % 15 == 0:
-            print(
-                f"  [行业] 已处理板块 {n_loop} 个，"
-                f"成功 {boards_ok}，失败 {boards_fail}，"
-                f"已映射股票 {len(code_to_industry)} 只…",
-                flush=True,
-            )
-        time.sleep(sleep_s)
-
-    if not code_to_industry:
-        raise RuntimeError(
-            "未能从东方财富接口解析到任何「股票代码→行业」映射，"
-            "请检查网络或稍后重试。"
-        )
+        print("正在同步 A 股行业字段（东财板块 / Baostock 自动回退）…", flush=True)
+    code_to_industry = fetch_a_share_industry_map(
+        board_sleep_sec=sleep_s,
+        max_boards=max_boards,
+        verbose=verbose,
+    )
 
     if verbose:
         print(
-            f"行业映射构建完成：板块请求成功 {boards_ok}，失败 {boards_fail}，"
-            f"去重后股票 {len(code_to_industry)} 只；开始批量 UPDATE SQLite…",
+            f"行业映射构建完成：去重后股票 {len(code_to_industry)} 只；开始批量 UPDATE SQLite…",
             flush=True,
         )
 
@@ -191,9 +132,6 @@ def sync_stock_industries(
         )
 
     return {
-        "n_boards_requested": n_loop,
-        "n_boards_ok": boards_ok,
-        "n_boards_fail": boards_fail,
         "n_codes_mapped": len(code_to_industry),
         "rows_updated_reported": rows_updated,
         "total_kline_rows": total_rows,
@@ -455,67 +393,35 @@ def sync_market_cap_batch(
     sleep_sec: float = 1.5,
 ) -> dict[str, int | str]:
     """
-    使用 AkShare stock_individual_info_em 逐只获取总市值，
-    然后批量 UPDATE stock_daily_kline.market_cap（元）。
+    并发获取全 A 总市值（元）并 UPDATE ``stock_daily_kline.market_cap``。
 
-    采用多线程并发 + IPv4 强制 + 请求间短暂休眠以降低限流。
+    ``QUANT_MCAP_SOURCE=auto`` 时：东财 push2 → 东财 datacenter（``stock_value_em``）。
+    代码表优先 AkShare，失败时 Baostock。
     """
-    import akshare as ak
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    ensure_eastmoney_no_proxy_if_configured()
     path = db_path or DB_PATH
     init_db(path)
 
-    # Force IPv4
-    import socket as _socket
-    import urllib3.util.connection as _uconn
-    _uconn.allowed_gai_family = lambda: _socket.AF_INET
-
-    # Get all A-share codes
     if verbose:
         print("正在获取全 A 股代码列表...", flush=True)
-    try:
-        code_df = ak.stock_info_a_code_name()
-    except Exception as exc:
-        raise RuntimeError(f"获取股票代码列表失败: {exc}") from exc
-
-    codes = [str(c).strip().zfill(6) for c in code_df["code"].tolist()]
+    pairs = list_a_stock_codes()
+    if not pairs:
+        raise RuntimeError("获取股票代码列表失败（AkShare 与 Baostock 均无数据）")
+    codes = [c for c, _ in pairs]
     if verbose:
-        print(f"共 {len(codes)} 只 A 股，开始并发获取市值（线程={max_workers}，间隔={sleep_sec}s）...", flush=True)
+        print(
+            f"共 {len(codes)} 只 A 股，开始并发获取市值（线程={max_workers}，"
+            f"间隔={sleep_sec}s，push2 失败自动换 datacenter）…",
+            flush=True,
+        )
 
-    # Thread-safe collector
-    import threading
-    code_to_mcap: dict[str, float] = {}
-    _lock = threading.Lock()
-
-    def _fetch_one(code: str):
-        import time
-        for attempt in range(3):
-            try:
-                df = ak.stock_individual_info_em(symbol=code)
-                mc_col = df[df["item"] == "总市值"]
-                if not mc_col.empty:
-                    mc = float(mc_col.iloc[0]["value"])
-                    if np.isfinite(mc) and mc > 0:
-                        with _lock:
-                            code_to_mcap[code] = mc
-                        return
-            except Exception:
-                time.sleep(2 * (attempt + 1))
-        # silent fail for individual codes
-
-    workers_n = max(1, min(max_workers, 16))
-    total = len(codes)
-    done = 0
-    with ThreadPoolExecutor(max_workers=workers_n) as ex:
-        futs = [ex.submit(_fetch_one, c) for c in codes]
-        for fut in as_completed(futs):
-            done += 1
-            if verbose and done % 200 == 0:
-                print(f"  [市值] {done}/{total} 已完成，成功 {len(code_to_mcap)} 只...", flush=True)
-
+    code_to_mcap = fetch_market_cap_map(
+        codes,
+        max_workers=max_workers,
+        sleep_sec=sleep_sec,
+        verbose=verbose,
+    )
     n_got = len(code_to_mcap)
+    total = len(codes)
     if verbose:
         print(f"市值获取完成：{n_got}/{total} 只有效市值", flush=True)
 
@@ -702,7 +608,14 @@ def main() -> int:
     parser.add_argument(
         "--skip-industry-sync",
         action="store_true",
-        help="不同步 AkShare 行业板块到 stock_daily_kline.industry",
+        help="不同步行业字段到 stock_daily_kline.industry",
+    )
+    parser.add_argument(
+        "--industry-source",
+        type=str,
+        default="",
+        choices=["", "auto", "em", "baostock"],
+        help="行业数据源：auto=东财板块失败后 Baostock；baostock=仅 Baostock（东财不可用时推荐）",
     )
     parser.add_argument(
         "--skip-market-cap-sync",
@@ -731,6 +644,9 @@ def main() -> int:
         help="调试：最多遍历前 N 个行业板块（0 表示不限制）",
     )
     args = parser.parse_args()
+
+    if args.industry_source:
+        os.environ["QUANT_INDUSTRY_SOURCE"] = args.industry_source
 
     if args.only_industry_sync:
         init_db()

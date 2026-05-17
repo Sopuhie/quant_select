@@ -163,60 +163,58 @@ def _describe_bias_factor(factor_name: str, val: float) -> str:
     return f"{label}：均线乖离适度，处于温和蓄势或健康的趋势通道中"
 
 
-def _describe_conditional_factor(factor_name: str, val: float) -> str | None:
-    """核心量价因子：按清洗后数值分档，避免无视正负的硬编码乐观文案。"""
+def _describe_quant_量价_factor(
+    factor_name: str, val: float, default_template: str
+) -> str:
+    """核心量价因子分档文案；未命中分档时回退 templates 默认条目。"""
     if factor_name == "factor_volume_ratio":
         if val > 1.2:
-            return (
-                "今日成交量较5日均量显著放量，"
-                "增量资金正深度建仓或放量突破趋势"
-            )
-        if val < 0.8:
+            return "今日成交量较5日均量显著放量，增量资金正深度建仓突破"
+        if val < -0.8:
             return (
                 "成交量呈现显著缩量形态，主力资金洗盘无量，"
-                "股价处于缩量蓄势回调阶段"
+                "股价处于缩量阶段"
             )
         return "量能表现温和平衡，买卖盘力量处于良性交织状态"
     if factor_name == "factor_return_1d":
-        if val > 0.03:
+        if val > 1.0:
             return "昨日收出强劲阳线，短线呈现高赚钱效应与猛烈的多头攻势"
-        if val < -0.03:
+        if val < -1.0:
             return (
                 "昨日经历空头砸盘，股价短线超跌严重，"
-                "技术面存在强烈的超跌反弹修复动力"
+                "技术面存在超跌反弹动力"
             )
-        return "昨日股价宽幅震荡收平，多空双方在当前价位展开激烈博弈"
     if factor_name == "factor_momentum_10d":
         if val > 1.0:
-            return "10日截面动量效应爆发，顺势特征显著，属于典型的强者恒强趋势"
+            return "10日截面动量效应爆发，多头追涨及资金吸筹意愿高涨"
         if val < -1.0:
             return (
                 "中线陷入非理性超跌，价格处于相对底部区域，"
-                "具备较强的均值回归反弹潜力"
+                "具备中线超跌反弹潜力"
             )
-        return "中线动量表现平稳，股价围绕中期成本中枢温和波动"
     if factor_name == "factor_volatility_5d":
         if val > 1.2:
             return (
-                "短线历史波动率骤然放大，盘口多空分歧剧烈，"
+                "短期历史波动率处于变盘临界点，"
                 "个股向上拉升弹性与爆发力极佳"
             )
-        if val < 0.8:
-            return "短线波幅极度收敛，筹码锁定度高，个股正处于变盘临界点的前夕"
-        return "波动尺度维持正常中性水平"
+        if val < -0.8:
+            return (
+                "短线波幅极度收敛，筹码锁定度高，"
+                "个股正处于变盘临界点前夕"
+            )
     if factor_name == "factor_amihud_20d":
         if val > 1.0:
             return (
-                "Amihud非流动性指标偏高，反映盘口封单或承接变薄，"
-                "容易以极小的资金撬动高弹性的涨幅"
+                "Amihud 非流动性偏高，反映盘口承接变薄，"
+                "容易以极小资金撬动高弹性涨幅"
             )
         if val < -1.0:
             return (
-                "流动性充裕，冲击成本极低，"
-                "适合主力及机构大资金进行平稳的换手与建仓"
+                "流动性非常充裕，冲击成本极低，"
+                "适合主力大资金平稳换手建仓"
             )
-        return "市场流动性维持在温和合理的均衡区间"
-    return None
+    return default_template
 
 
 def _log_predict_bias_feature_stats(feat_df: pd.DataFrame) -> None:
@@ -339,11 +337,8 @@ def analyze_stock_reasons(
         if f in _BIAS_FACTOR_LABELS:
             desc = _describe_bias_factor(f, fval)
         else:
-            cond_desc = _describe_conditional_factor(f, fval)
-            if cond_desc is not None:
-                desc = cond_desc
-            else:
-                desc = templates.get(f, f"核心因子 [{f}] 处于截面优势地位")
+            base_tpl = templates.get(f, f"核心因子 [{f}] 处于截面优势地位")
+            desc = _describe_quant_量价_factor(f, fval, base_tpl)
         reasons.append(f"{idx + 1}. {desc}")
 
     return "；".join(reasons) + "。"

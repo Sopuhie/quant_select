@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import random
 import re
 import threading
@@ -551,6 +552,291 @@ def list_a_stock_codes(max_count: int | None = None) -> list[tuple[str, str]]:
     if last_exc is not None:
         _log.error("list_a_stock_codes 失败且无 Baostock 兜底: %s", last_exc)
     return []
+
+
+def _normalize_baostock_industry_label(raw: object) -> str:
+    """Baostock industry 常为「J66货币金融服务」，去掉前置字母数字行业编码。"""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    cleaned = re.sub(r"^[A-Za-z]+\d+", "", s).strip()
+    return cleaned or s
+
+
+def _fetch_industry_map_via_baostock() -> dict[str, str]:
+    """Baostock ``query_stock_industry`` 一次返回全市场，不依赖东方财富。"""
+    try:
+        import baostock as bs
+    except ImportError:
+        return {}
+
+    code_to_industry: dict[str, str] = {}
+    with _BS_LOCK:
+        global _BS_LOGGED_IN, _BS_ATEXIT_REGISTERED
+        if not _BS_LOGGED_IN:
+            lg = bs.login()
+            if lg.error_code != "0":
+                return []
+            _BS_LOGGED_IN = True
+            if not _BS_ATEXIT_REGISTERED:
+                atexit.register(_baostock_logout)
+                _BS_ATEXIT_REGISTERED = True
+        try:
+            rs = bs.query_stock_industry()
+            if rs.error_code != "0":
+                return {}
+            while rs.error_code == "0" and rs.next():
+                row = rs.get_row_data()
+                if len(row) < 4:
+                    continue
+                code6 = _extract_stock_code6(row[1])
+                if code6 is None:
+                    continue
+                label = _normalize_baostock_industry_label(row[3])
+                if not label:
+                    continue
+                if code6 not in code_to_industry:
+                    code_to_industry[code6] = label
+        except Exception:
+            return {}
+    return code_to_industry
+
+
+def fetch_industry_map_via_em_boards(
+    *,
+    board_sleep_sec: float = 0.2,
+    max_boards: int | None = None,
+    verbose: bool = False,
+) -> dict[str, str]:
+    """东方财富行业板块—成份映射（AkShare ``stock_board_industry_*_em``）。"""
+    ensure_eastmoney_no_proxy_if_configured()
+    code_to_industry: dict[str, str] = {}
+    boards_ok = 0
+    boards_fail = 0
+    n_loop = 0
+
+    try:
+        boards_df = ak.stock_board_industry_name_em()
+    except Exception as exc:
+        raise RuntimeError(
+            f"拉取东方财富行业板块列表失败: {exc}"
+        ) from exc
+
+    if boards_df is None or boards_df.empty:
+        raise RuntimeError("东方财富行业板块列表为空")
+
+    name_col = "板块名称"
+    if name_col not in boards_df.columns:
+        raise RuntimeError(
+            f"行业板块表缺少列「{name_col}」，当前列: {list(boards_df.columns)}"
+        )
+
+    for _, row in boards_df.iterrows():
+        if max_boards is not None and n_loop >= max_boards:
+            break
+        n_loop += 1
+        board_name = str(row[name_col]).strip()
+        if not board_name:
+            continue
+        try:
+            cons = ak.stock_board_industry_cons_em(symbol=board_name)
+        except Exception:
+            boards_fail += 1
+            time.sleep(board_sleep_sec)
+            continue
+        if cons is None or cons.empty or "代码" not in cons.columns:
+            boards_fail += 1
+            time.sleep(board_sleep_sec)
+            continue
+        boards_ok += 1
+        for _, crow in cons.iterrows():
+            raw = crow.get("代码")
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+                continue
+            c = str(raw).strip().zfill(6)
+            if len(c) != 6 or not c.isdigit():
+                continue
+            if c not in code_to_industry:
+                code_to_industry[c] = board_name
+        if verbose and boards_ok % 15 == 0:
+            print(
+                f"  [行业/东财] 板块 {n_loop}，成功 {boards_ok}，"
+                f"失败 {boards_fail}，已映射 {len(code_to_industry)} 只…",
+                flush=True,
+            )
+        time.sleep(board_sleep_sec)
+
+    if not code_to_industry:
+        raise RuntimeError(
+            f"东方财富行业成份解析为空（板块成功 {boards_ok}，失败 {boards_fail}）"
+        )
+    return code_to_industry
+
+
+def fetch_a_share_industry_map(
+    *,
+    source: str | None = None,
+    board_sleep_sec: float = 0.2,
+    max_boards: int | None = None,
+    verbose: bool = False,
+) -> dict[str, str]:
+    """
+    A 股代码→行业名称。``source`` / ``QUANT_INDUSTRY_SOURCE``：
+
+    - ``auto``（默认）：东方财富板块 → Baostock
+    - ``em``：仅东方财富
+    - ``baostock``：仅 Baostock（推荐在东财被限流/断开时使用）
+    """
+    src = (source or os.environ.get("QUANT_INDUSTRY_SOURCE", "auto")).strip().lower()
+
+    if src == "baostock":
+        m = _fetch_industry_map_via_baostock()
+        if not m:
+            raise RuntimeError("Baostock query_stock_industry 未返回有效行业数据")
+        if verbose:
+            print(f"行业映射来源: Baostock（{len(m)} 只）", flush=True)
+        return m
+
+    if src == "em":
+        m = fetch_industry_map_via_em_boards(
+            board_sleep_sec=board_sleep_sec,
+            max_boards=max_boards,
+            verbose=verbose,
+        )
+        if verbose:
+            print(f"行业映射来源: 东方财富行业板块（{len(m)} 只）", flush=True)
+        return m
+
+    # auto
+    em_err: BaseException | None = None
+    try:
+        m = fetch_industry_map_via_em_boards(
+            board_sleep_sec=board_sleep_sec,
+            max_boards=max_boards,
+            verbose=verbose,
+        )
+        if verbose:
+            print(f"行业映射来源: 东方财富行业板块（{len(m)} 只）", flush=True)
+        return m
+    except Exception as exc:
+        em_err = exc
+        if verbose:
+            print(
+                f"东方财富行业板块不可用（{exc}），改用 Baostock…",
+                flush=True,
+            )
+
+    m = _fetch_industry_map_via_baostock()
+    if m:
+        if verbose:
+            print(f"行业映射来源: Baostock（{len(m)} 只）", flush=True)
+        return m
+
+    raise RuntimeError(
+        "行业同步失败：东方财富与 Baostock 均不可用。"
+        + (f" 东财末次错误: {em_err}" if em_err else "")
+    )
+
+
+def fetch_single_market_cap_yuan(code6: str) -> float | None:
+    """
+    单只股票总市值（元）。``auto`` 时依次尝试：
+
+    1. 东财 push2 ``stock_individual_info_em``
+    2. 东财 datacenter ``stock_value_em``（push2 被断开时常仍可用）
+    """
+    import numpy as np
+
+    ensure_eastmoney_no_proxy_if_configured()
+    c = str(code6).strip().zfill(6)
+    src = os.environ.get("QUANT_MCAP_SOURCE", "auto").strip().lower()
+
+    def _from_push2() -> float | None:
+        df = ak.stock_individual_info_em(symbol=c)
+        mc_col = df[df["item"] == "总市值"]
+        if mc_col.empty:
+            return None
+        mc = float(mc_col.iloc[0]["value"])
+        if np.isfinite(mc) and mc > 0:
+            return mc
+        return None
+
+    def _from_value_em() -> float | None:
+        df = ak.stock_value_em(symbol=c)
+        if df is None or df.empty or "总市值" not in df.columns:
+            return None
+        mc = float(df.iloc[-1]["总市值"])
+        if np.isfinite(mc) and mc > 0:
+            return mc
+        return None
+
+    if src in ("em", "em_push2", "push2"):
+        try:
+            return _from_push2()
+        except Exception:
+            return None
+    if src in ("em_value", "value", "datacenter"):
+        try:
+            return _from_value_em()
+        except Exception:
+            return None
+
+    # auto
+    for fn in (_from_push2, _from_value_em):
+        for attempt in range(2):
+            try:
+                mc = fn()
+                if mc is not None:
+                    return mc
+            except Exception:
+                if attempt == 0:
+                    time.sleep(0.4 * (attempt + 1))
+    return None
+
+
+def fetch_market_cap_map(
+    codes: list[str],
+    *,
+    max_workers: int = 8,
+    sleep_sec: float | None = None,
+    verbose: bool = False,
+) -> dict[str, float]:
+    """并发拉取多只股票总市值（元）。"""
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if sleep_sec is None:
+        try:
+            sleep_sec = float(os.environ.get("QUANT_MCAP_SYNC_SLEEP", "0.35"))
+        except ValueError:
+            sleep_sec = 0.35
+
+    uniq = sorted({str(c).strip().zfill(6) for c in codes if c})
+    code_to_mcap: dict[str, float] = {}
+    lock = threading.Lock()
+    total = len(uniq)
+
+    def _one(code: str) -> None:
+        mc = fetch_single_market_cap_yuan(code)
+        if mc is not None:
+            with lock:
+                code_to_mcap[code] = mc
+        if sleep_sec and sleep_sec > 0:
+            time.sleep(float(sleep_sec))
+
+    workers_n = max(1, min(int(max_workers), 16))
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers_n) as ex:
+        futs = [ex.submit(_one, c) for c in uniq]
+        for fut in as_completed(futs):
+            fut.result()
+            done += 1
+            if verbose and done % 200 == 0:
+                print(
+                    f"  [市值] {done}/{total} 已完成，成功 {len(code_to_mcap)} 只…",
+                    flush=True,
+                )
+    return code_to_mcap
 
 
 def fetch_daily_hist(
