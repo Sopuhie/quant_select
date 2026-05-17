@@ -400,6 +400,16 @@ def prepare_ranking_cross_section_pipeline(
     else:
         w["date"] = w["date"].astype(str).str[:10]
     w = suppress_high_recent_gains(w)
+    # Compute factor_size_mcap = log10(total_market_cap_in_yuan) for size neutralization
+    if "mcap" in w.columns:
+        mcap_s = pd.to_numeric(w["mcap"], errors="coerce")
+        w[SIZE_FACTOR_COL] = np.where(
+            mcap_s.notna() & (mcap_s > 0),
+            np.log10(mcap_s) * 1.0,
+            np.nan,
+        )
+    else:
+        w[SIZE_FACTOR_COL] = np.nan
     w = clean_cross_sectional_features(w)
     if str(date_col) != "date":
         w = w.drop(columns=["date"], errors="ignore")

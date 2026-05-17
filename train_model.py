@@ -206,7 +206,10 @@ def _load_local_kline_panel(
             skipped_short += 1
             continue
         facts = compute_factors_for_history(g)
-        meta = g[["date", "stock_code", "stock_name", "industry"]].copy()
+        meta_cols = ["date", "stock_code", "stock_name", "industry"]
+        if "market_cap" in g.columns:
+            meta_cols.append("market_cap")
+        meta = g[meta_cols].copy()
         merged = pd.concat(
             [meta.reset_index(drop=True), facts.reset_index(drop=True)],
             axis=1,
@@ -229,6 +232,10 @@ def _load_local_kline_panel(
         )
 
     out = pd.concat(parts, ignore_index=True)
+    # Rename market_cap to mcap for factor pipeline compatibility
+    if "market_cap" in out.columns:
+        out["mcap"] = pd.to_numeric(out["market_cap"], errors="coerce")
+        out = out.drop(columns=["market_cap"], errors="ignore")
     if verbose:
         print(f"[本地因子] 合并后面板行数: {len(out)}", flush=True)
     return out

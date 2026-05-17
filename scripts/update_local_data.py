@@ -260,6 +260,7 @@ def update_database_kline(
     pool_type: str = "all",
     workers: int = DEFAULT_WORKERS,
     run_industry_sync: bool = True,
+    run_market_cap_sync: bool = True,
     industry_board_limit: int = 0,
 ) -> None:
     init_db()
@@ -438,6 +439,125 @@ def update_database_kline(
         except RuntimeError as exc:
             print(f"警告: 行业字段同步未成功（K 线仍已写入）: {exc}", flush=True)
 
+    if run_market_cap_sync:
+        print("", flush=True)
+        try:
+            sync_market_cap_batch(DB_PATH, verbose=True)
+        except RuntimeError as exc:
+            print(f"警告: 市值同步未成功（K 线仍已写入）: {exc}", flush=True)
+
+
+def sync_market_cap_batch(
+    db_path: Path | None = None,
+    *,
+    verbose: bool = True,
+    max_workers: int = 8,
+    sleep_sec: float = 1.5,
+) -> dict[str, int | str]:
+    """
+    使用 AkShare stock_individual_info_em 逐只获取总市值，
+    然后批量 UPDATE stock_daily_kline.market_cap（元）。
+
+    采用多线程并发 + IPv4 强制 + 请求间短暂休眠以降低限流。
+    """
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    ensure_eastmoney_no_proxy_if_configured()
+    path = db_path or DB_PATH
+    init_db(path)
+
+    # Force IPv4
+    import socket as _socket
+    import urllib3.util.connection as _uconn
+    _uconn.allowed_gai_family = lambda: _socket.AF_INET
+
+    # Get all A-share codes
+    if verbose:
+        print("正在获取全 A 股代码列表...", flush=True)
+    try:
+        code_df = ak.stock_info_a_code_name()
+    except Exception as exc:
+        raise RuntimeError(f"获取股票代码列表失败: {exc}") from exc
+
+    codes = [str(c).strip().zfill(6) for c in code_df["code"].tolist()]
+    if verbose:
+        print(f"共 {len(codes)} 只 A 股，开始并发获取市值（线程={max_workers}，间隔={sleep_sec}s）...", flush=True)
+
+    # Thread-safe collector
+    import threading
+    code_to_mcap: dict[str, float] = {}
+    _lock = threading.Lock()
+
+    def _fetch_one(code: str):
+        import time
+        for attempt in range(3):
+            try:
+                df = ak.stock_individual_info_em(symbol=code)
+                mc_col = df[df["item"] == "总市值"]
+                if not mc_col.empty:
+                    mc = float(mc_col.iloc[0]["value"])
+                    if np.isfinite(mc) and mc > 0:
+                        with _lock:
+                            code_to_mcap[code] = mc
+                        return
+            except Exception:
+                time.sleep(2 * (attempt + 1))
+        # silent fail for individual codes
+
+    workers_n = max(1, min(max_workers, 16))
+    total = len(codes)
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers_n) as ex:
+        futs = [ex.submit(_fetch_one, c) for c in codes]
+        for fut in as_completed(futs):
+            done += 1
+            if verbose and done % 200 == 0:
+                print(f"  [市值] {done}/{total} 已完成，成功 {len(code_to_mcap)} 只...", flush=True)
+
+    n_got = len(code_to_mcap)
+    if verbose:
+        print(f"市值获取完成：{n_got}/{total} 只有效市值", flush=True)
+
+    if n_got == 0:
+        raise RuntimeError("未能获取任何有效市值数据")
+
+    # Batch UPDATE
+    if verbose:
+        print("正在批量 UPDATE stock_daily_kline.market_cap...", flush=True)
+    conn = open_sqlite_connection(path)
+    try:
+        pairs = [(float(code_to_mcap[c]), c) for c in code_to_mcap]
+        conn.executemany(
+            """
+            UPDATE stock_daily_kline
+            SET market_cap = ?
+            WHERE stock_code = ?
+            """,
+            pairs,
+        )
+        conn.commit()
+        updated = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM stock_daily_kline WHERE market_cap IS NOT NULL AND market_cap > 0"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+    result = {
+        "n_codes_total": total,
+        "n_codes_with_mcap": n_got,
+        "n_kline_rows_with_mcap": updated,
+    }
+    if verbose:
+        print(
+            f"市值同步完成：{n_got} 只股票有有效市值，"
+            f"已为 {updated} 行 K 线记录写入 market_cap。",
+            flush=True,
+        )
+    return result
+
 
 def sync_fundamental_data(db_path: Path | None = None) -> None:
     """
@@ -585,6 +705,11 @@ def main() -> int:
         help="不同步 AkShare 行业板块到 stock_daily_kline.industry",
     )
     parser.add_argument(
+        "--skip-market-cap-sync",
+        action="store_true",
+        help="不同步全 A 股总市值到 stock_daily_kline.market_cap",
+    )
+    parser.add_argument(
         "--skip-fundamental-sync",
         action="store_true",
         help="不同步东方财富季度业绩报表到 stock_financial_data",
@@ -626,6 +751,7 @@ def main() -> int:
         workers=args.workers,
         run_industry_sync=not args.skip_industry_sync,
         industry_board_limit=args.industry_board_limit,
+        run_market_cap_sync=not args.skip_market_cap_sync,
     )
     if not args.skip_fundamental_sync:
         try:
