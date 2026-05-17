@@ -13,6 +13,11 @@ import numpy as np
 import pandas as pd
 
 from .config import (
+    DAILY_K_DEEP_OVERSOLD_BIAS_5,
+    DAILY_K_DRY_TRAP_FACTOR_PENALTY,
+    DAILY_K_DRY_VOLUME_POSITION,
+    DAILY_K_UPPER_SHADOW_RATIO_MIN,
+    DAILY_K_UPPER_SHADOW_VOL_RATIO_MIN,
     ENABLE_PREV_GAIN_SUPPRESSION,
     FACTOR_EWM_BLEND,
     FACTOR_EWM_HALFLIFE_DAYS,
@@ -339,31 +344,202 @@ def _roll_ewm_blend(s: pd.Series, window: int) -> pd.Series:
     return (1.0 - b) * roll + b * ewm
 
 
+def attach_anchor_bar_ohlc(
+    feat_df: pd.DataFrame,
+    *,
+    date_col: str = "date",
+) -> pd.DataFrame:
+    """
+    为截面行补齐锚定日 OHLC（训练/预测面板常仅有因子列时，从 SQLite 批量 JOIN）。
+    """
+    if feat_df is None or feat_df.empty or "stock_code" not in feat_df.columns:
+        return feat_df
+    if all(c in feat_df.columns for c in ("open", "high", "low", "close")):
+        return feat_df
+    dc = date_col
+    if dc not in feat_df.columns:
+        if "trade_date" in feat_df.columns:
+            dc = "trade_date"
+        elif "date" in feat_df.columns:
+            dc = "date"
+        else:
+            return feat_df
+    w = feat_df.copy()
+    pairs = (
+        w[["stock_code", dc]]
+        .rename(columns={dc: "date"})
+        .assign(
+            stock_code=lambda x: x["stock_code"].astype(str).str.zfill(6),
+            date=lambda x: x["date"].astype(str).str[:10],
+        )
+        .drop_duplicates()
+    )
+    if pairs.empty:
+        return w
+    try:
+        import sqlite3
+
+        from .config import DB_PATH
+
+        ohlc_chunks: list[pd.DataFrame] = []
+        chunk_n = 400
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            for i in range(0, len(pairs), chunk_n):
+                sub = pairs.iloc[i : i + chunk_n]
+                ph = ",".join(["(?,?)"] * len(sub))
+                params: list[str] = []
+                for _, r in sub.iterrows():
+                    params.extend([r["stock_code"], r["date"]])
+                sql = f"""
+                    SELECT k.stock_code, k.date, k.open, k.high, k.low, k.close, k.volume
+                    FROM stock_daily_kline k
+                    INNER JOIN (VALUES {ph}) AS v(code, d)
+                      ON k.stock_code = v.code AND k.date = v.d
+                """
+                part = pd.read_sql_query(sql, conn, params=params)
+                if not part.empty:
+                    ohlc_chunks.append(part)
+        if not ohlc_chunks:
+            return w
+        ohlc = pd.concat(ohlc_chunks, ignore_index=True)
+        ohlc["stock_code"] = ohlc["stock_code"].astype(str).str.zfill(6)
+        ohlc["date"] = ohlc["date"].astype(str).str[:10]
+        merge_on_left = ["stock_code", dc]
+        w["_merge_date"] = w[dc].astype(str).str[:10]
+        ohlc = ohlc.rename(columns={"date": "_merge_date"})
+        merged = w.merge(
+            ohlc.drop(columns=["date"], errors="ignore"),
+            on=["stock_code", "_merge_date"],
+            how="left",
+            suffixes=("", "_ohlc"),
+        )
+        merged = merged.drop(columns=["_merge_date"], errors="ignore")
+        return merged
+    except Exception as exc:
+        print(f"[警告] 批量补齐锚定日 OHLC 失败: {exc}", flush=True)
+        return w
+
+
+def _long_upper_shadow_trap_mask(
+    feat_df: pd.DataFrame,
+    *,
+    shadow_ratio_min: float | None = None,
+    vol_ratio_min: float | None = None,
+) -> pd.Series:
+    """
+    图2：高位放量长上影滞涨 — 上影线占振幅 > 阈值 且 量比/放量达标。
+    需 ``open/high/low/close``；缺列时返回全 False。
+    """
+    ratio_th = float(
+        shadow_ratio_min
+        if shadow_ratio_min is not None
+        else DAILY_K_UPPER_SHADOW_RATIO_MIN
+    )
+    vol_th = float(
+        vol_ratio_min if vol_ratio_min is not None else DAILY_K_UPPER_SHADOW_VOL_RATIO_MIN
+    )
+    req = ("open", "high", "low", "close")
+    if feat_df.empty or not all(c in feat_df.columns for c in req):
+        return pd.Series(False, index=feat_df.index)
+    o = pd.to_numeric(feat_df["open"], errors="coerce")
+    h = pd.to_numeric(feat_df["high"], errors="coerce")
+    l_ = pd.to_numeric(feat_df["low"], errors="coerce")
+    c = pd.to_numeric(feat_df["close"], errors="coerce")
+    entity_high = np.fmax(o, c)
+    total_amp = h - l_
+    upper_shadow = h - entity_high
+    amp_ok = total_amp > 0.001
+    shadow_ratio = upper_shadow / total_amp.replace(0, np.nan)
+    shadow_hit = amp_ok & (shadow_ratio > ratio_th)
+    if "factor_volume_ratio" in feat_df.columns:
+        vol_metric = pd.to_numeric(feat_df["factor_volume_ratio"], errors="coerce")
+    elif "volume_ratio_raw" in feat_df.columns:
+        vol_metric = pd.to_numeric(feat_df["volume_ratio_raw"], errors="coerce")
+    else:
+        vol_metric = pd.Series(np.nan, index=feat_df.index)
+    vol_hit = vol_metric > vol_th
+    return shadow_hit & vol_hit
+
+
+def _drop_high_volume_long_upper_shadow(feat_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """剔除触发「放量长上影」熔断的截面行。"""
+    if feat_df is None or feat_df.empty:
+        return feat_df, 0
+    w = attach_anchor_bar_ohlc(feat_df)
+    trap = _long_upper_shadow_trap_mask(w)
+    if not trap.any():
+        return feat_df, 0
+    n_drop = int(trap.sum())
+    out = feat_df.loc[~trap].reset_index(drop=True)
+    print(
+        "[风控增强] 已剔除高位放量长上影滞涨兑现形态（图2骗线） "
+        f"{n_drop} 只（上影占比>{DAILY_K_UPPER_SHADOW_RATIO_MIN:.0%} 且 "
+        f"量比>{DAILY_K_UPPER_SHADOW_VOL_RATIO_MIN:.1f}）。",
+        flush=True,
+    )
+    return out, n_drop
+
+
+def penalize_volume_drift_trap_features(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    图1 延伸 — 无量阴跌陷阱：深负 ``factor_bias_5`` 且 ``factor_volume_position`` 极低时，
+    对 13 维因子统一乘以惩罚系数，降低截面排序中的伪超跌吸引力。
+    """
+    if feat_df is None or feat_df.empty:
+        return feat_df
+    need = ("factor_bias_5", "factor_volume_position")
+    if not all(c in feat_df.columns for c in need):
+        return feat_df
+    w = feat_df.copy()
+    bias5 = pd.to_numeric(w["factor_bias_5"], errors="coerce")
+    vol_pos = pd.to_numeric(w["factor_volume_position"], errors="coerce")
+    trap = (bias5 <= float(DAILY_K_DEEP_OVERSOLD_BIAS_5)) & (
+        vol_pos <= float(DAILY_K_DRY_VOLUME_POSITION)
+    )
+    n_trap = int(trap.sum())
+    if n_trap <= 0:
+        return w
+    pen = float(DAILY_K_DRY_TRAP_FACTOR_PENALTY)
+    pen = max(0.0, min(1.0, pen))
+    for col in FEATURE_COLUMNS:
+        if col in w.columns:
+            w.loc[trap, col] = pd.to_numeric(w.loc[trap, col], errors="coerce") * pen
+    print(
+        "[风控增强] 无量阴跌陷阱因子惩罚："
+        f"{n_trap} 只（bias5≤{DAILY_K_DEEP_OVERSOLD_BIAS_5:.2%} 且 "
+        f"量能位置≤{DAILY_K_DRY_VOLUME_POSITION:.2%}）×{pen:.2f}",
+        flush=True,
+    )
+    return w
+
+
 def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
     """
-    在 ``clean_cross_sectional_features`` 之前：按原始 ``factor_return_5d``、
-    ``factor_momentum_10d`` 剔除短期透支标的（与 ``ENABLE_PREV_GAIN_SUPPRESSION`` 一致）。
+    在 ``clean_cross_sectional_features`` 之前：
+
+    - （可选）按 ``ENABLE_PREV_GAIN_SUPPRESSION`` 剔除短期涨幅/动量透支；
+    - **始终**剔除前一交易日「放量长上影滞涨」形态（图2）。
     """
     if feat_df is None or len(feat_df) == 0:
         return feat_df
     try:
-        if not ENABLE_PREV_GAIN_SUPPRESSION:
-            return feat_df
         out = feat_df.copy()
         n0 = len(out)
-        if "factor_return_5d" in out.columns:
-            r5 = pd.to_numeric(out["factor_return_5d"], errors="coerce")
-            out = out[r5 <= float(MAX_ALLOWED_5D_RETURN)]
-        if "factor_momentum_10d" in out.columns and len(out) > 0:
-            m10 = pd.to_numeric(out["factor_momentum_10d"], errors="coerce")
-            out = out[m10 <= float(MAX_ALLOWED_20D_RETURN)]
-        if len(out) < n0:
-            print(
-                "[风控增强] 已强行剔除过去5日涨幅过大或中线动量过高的高位超买股 "
-                f"（5日上限 {MAX_ALLOWED_5D_RETURN * 100:.1f}%，动量上限 {MAX_ALLOWED_20D_RETURN * 100:.1f}%），"
-                f"共剔除 {n0 - len(out)} 只。",
-                flush=True,
-            )
+        if ENABLE_PREV_GAIN_SUPPRESSION:
+            if "factor_return_5d" in out.columns:
+                r5 = pd.to_numeric(out["factor_return_5d"], errors="coerce")
+                out = out[r5 <= float(MAX_ALLOWED_5D_RETURN)]
+            if "factor_momentum_10d" in out.columns and len(out) > 0:
+                m10 = pd.to_numeric(out["factor_momentum_10d"], errors="coerce")
+                out = out[m10 <= float(MAX_ALLOWED_20D_RETURN)]
+            if len(out) < n0:
+                print(
+                    "[风控增强] 已强行剔除过去5日涨幅过大或中线动量过高的高位超买股 "
+                    f"（5日上限 {MAX_ALLOWED_5D_RETURN * 100:.1f}%，动量上限 {MAX_ALLOWED_20D_RETURN * 100:.1f}%），"
+                    f"共剔除 {n0 - len(out)} 只。",
+                    flush=True,
+                )
+        out, _ = _drop_high_volume_long_upper_shadow(out)
         return out.reset_index(drop=True)
     except Exception as exc:
         print(f"[警告] 前期涨幅压制阀门执行异常: {exc}", flush=True)
@@ -390,6 +566,7 @@ def prepare_ranking_cross_section_pipeline(
 
     w = attach_canonical_industry_labels(w)
     w = suppress_high_recent_gains(w)
+    w = penalize_volume_drift_trap_features(w)
     w = assign_factor_size_mcap_from_mcap(w)
 
     if "factor_size_mcap" in w.columns:

@@ -277,9 +277,30 @@ MAX_PRICE = None  # 例如: 100.0
 MIN_MCAP = None  # 例如: 30.0 (低于30亿的微盘股不要)
 MAX_MCAP = None  # 例如: 500.0 (大于500亿的巨无霸不要)
 
-# 3. 股票热度范围（以今日换手率 % 为代理指标；无换手列时用 volume_ratio_raw 近似，阈值同文档除以 2）
-MIN_TURNOVER = None  # 例如: 1.5 (过滤掉无人关注的僵尸股)
+# 3. 股票热度范围（以前一交易日换手率 % 为硬门槛；无换手列时用 volume_ratio_raw 近似，阈值÷2）
+# 图1「无量冷门虚假脉冲」：默认强制 ≥2.0%，过滤流动性枯竭标的（可用 QUANT_MIN_TURNOVER 覆盖）
+MIN_TURNOVER_FLOOR = float(os.environ.get("QUANT_MIN_TURNOVER_FLOOR", "2.0"))
+MIN_TURNOVER = float(os.environ.get("QUANT_MIN_TURNOVER", str(MIN_TURNOVER_FLOOR)))
 MAX_TURNOVER = None  # 例如: 15.0 (过滤掉短期极度亢奋、换手过热的筹码松动股)
+
+# --- 纯日 K 形态防御（factor_calculator 与经验过滤共用，不依赖分时/Tick）---
+# 图2「高位放量长上影滞涨」：上影线占全日振幅比例、放量量比下限
+DAILY_K_UPPER_SHADOW_RATIO_MIN = float(
+    os.environ.get("QUANT_K_UPPER_SHADOW_RATIO", "0.45")
+)
+DAILY_K_UPPER_SHADOW_VOL_RATIO_MIN = float(
+    os.environ.get("QUANT_K_UPPER_SHADOW_VOL_RATIO", "1.5")
+)
+# 图1/图3「无量阴跌陷阱」：深负乖离 + 极度缩量量能位置 → 因子惩罚系数
+DAILY_K_DEEP_OVERSOLD_BIAS_5 = float(
+    os.environ.get("QUANT_K_DEEP_OVERSOLD_BIAS5", "-0.08")
+)
+DAILY_K_DRY_VOLUME_POSITION = float(
+    os.environ.get("QUANT_K_DRY_VOL_POSITION", "-0.15")
+)
+DAILY_K_DRY_TRAP_FACTOR_PENALTY = float(
+    os.environ.get("QUANT_K_DRY_TRAP_PENALTY", "0.5")
+)
 
 
 def get_experience_thresholds() -> tuple[
@@ -324,16 +345,21 @@ def get_experience_thresholds() -> tuple[
             except (TypeError, ValueError):
                 return cur
 
+        mt_eff = _pick("min_turnover", mt)
+        if mt_eff is None:
+            mt_eff = float(MIN_TURNOVER)
+        mt_eff = max(float(MIN_TURNOVER_FLOOR), float(mt_eff))
         return (
             _pick("min_price", mp),
             _pick("max_price", Mxp),
             _pick("min_mcap", mm),
             _pick("max_mcap", Mxm),
-            _pick("min_turnover", mt),
+            mt_eff,
             _pick("max_turnover", Mxt),
         )
     except Exception:
-        return (mp, Mxp, mm, Mxm, mt, Mxt)
+        mt_fb = max(float(MIN_TURNOVER_FLOOR), float(MIN_TURNOVER))
+        return (mp, Mxp, mm, Mxm, mt_fb, Mxt)
 
 # --- 热门题材交易系统规则 v2.0 核心参数 ---
 THEME_MA_SHORT = 20
