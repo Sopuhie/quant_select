@@ -53,8 +53,8 @@ from .factor_calculator import (
     compute_factors_for_history,
     enrich_factors_with_incremental_db,
     normalize_industry_label,
+    coerce_hsgt_flow_interact_finite,
     prepare_ranking_cross_section_pipeline,
-    sanitize_hsgt_flow_interact_column,
 )
 from .model_trainer import (
     assert_feature_matrix_matches_rankers,
@@ -758,7 +758,12 @@ def _overlay_auxiliary_features_for_diagnose_anchor(
     r5_s = pd.to_numeric(out.loc[ri, "factor_return_5d"], errors="coerce")
     r5 = float(r5_s) if pd.notna(r5_s) and np.isfinite(float(r5_s)) else 0.0
     out.loc[ri, HSGT_FLOW_INTERACT_COL] = zv * r5
-    return sanitize_hsgt_flow_interact_column(out)
+    out[HSGT_FLOW_INTERACT_COL] = pd.to_numeric(
+        out[HSGT_FLOW_INTERACT_COL], errors="coerce"
+    ).fillna(0.0)
+    _hi = out[HSGT_FLOW_INTERACT_COL].to_numpy(dtype=float)
+    out[HSGT_FLOW_INTERACT_COL] = np.where(np.isfinite(_hi), _hi, 0.0)
+    return out
 
 
 def _diagnose_features_via_ranking_pipeline(
@@ -1369,7 +1374,7 @@ def diagnose_single_stock(
         trade_date=td,
         row_index=last_i,
     )
-    factors = sanitize_hsgt_flow_interact_column(factors)
+    factors = coerce_hsgt_flow_interact_finite(factors)
     last_row = factors.iloc[last_i]
     if last_row[list(FEATURE_COLUMNS)].isna().any():
         return None, "最新一日因子存在缺失，无法诊断。", "warning"
@@ -1506,11 +1511,10 @@ def diagnose_single_stock(
         _hsgt_df = pd.DataFrame([feat_map])
         _hsgt_df["trade_date"] = td
         _hsgt_df = attach_hsgt_flow_interact(_hsgt_df, date_col="trade_date")
-        _hsgt_df = sanitize_hsgt_flow_interact_column(_hsgt_df)
+        _hsgt_df = coerce_hsgt_flow_interact_finite(_hsgt_df)
         feat_map = {c: float(_hsgt_df.iloc[0][c]) for c in FEATURE_COLUMNS}
     else:
-        _fm = pd.DataFrame([feat_map])
-        _fm = sanitize_hsgt_flow_interact_column(_fm)
+        _fm = coerce_hsgt_flow_interact_finite(pd.DataFrame([feat_map]))
         feat_map = {c: float(_fm.iloc[0][c]) for c in FEATURE_COLUMNS}
     X = pd.DataFrame([[feat_map[c] for c in FEATURE_COLUMNS]], columns=list(FEATURE_COLUMNS))
     X = X[list(FEATURE_COLUMNS)]

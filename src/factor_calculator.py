@@ -142,28 +142,25 @@ def assign_factor_size_mcap_from_mcap(feat_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def sanitize_hsgt_flow_interact_column(
+def coerce_hsgt_flow_interact_finite(
     feat_df: pd.DataFrame,
     *,
     col: str = HSGT_FLOW_INTERACT_COL,
 ) -> pd.DataFrame:
     """
-    北向交互因子安全收敛：``zv * r5`` 后因北向表缺失/次新股历史不足产生的
-    NaN/Inf 一律拉回序列中轴，避免 LGB/XGB/Cat 融合打分被污染。
+    北向交互 ``zv * r5`` 后的数值有限性强转：NaN/Inf 收敛为 0，防止诊股/截面打分爆破。
     """
     if feat_df.empty or col not in feat_df.columns:
         return feat_df
     out = feat_df.copy()
-    s = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    center = (
-        float(s.median())
-        if not s.isna().all()
-        else float(HSGT_FLOW_INTERACT_SAFE_CENTER)
-    )
-    s = s.fillna(center)
-    s = s.where(np.isfinite(s), center)
-    out[col] = s.astype(np.float64)
+    out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    vals = out[col].to_numpy(dtype=float)
+    out[col] = np.where(np.isfinite(vals), vals, 0.0)
     return out
+
+
+# 兼容旧调用名
+sanitize_hsgt_flow_interact_column = coerce_hsgt_flow_interact_finite
 
 
 def sanitize_factor_size_mcap_column(feat_df: pd.DataFrame) -> pd.DataFrame:
@@ -359,7 +356,7 @@ def attach_hsgt_flow_interact(
     zv = work[date_col].astype(str).str[:10].map(zmap).astype(float)
     r = pd.to_numeric(work[ret_col], errors="coerce").astype(float)
     work[out_col] = zv * r
-    return sanitize_hsgt_flow_interact_column(work, col=out_col)
+    return coerce_hsgt_flow_interact_finite(work, col=out_col)
 
 
 def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
@@ -503,8 +500,12 @@ def prepare_ranking_cross_section_pipeline(
         w["date"] = w["date"].astype(str).str[:10]
     w = suppress_high_recent_gains(w)
     w = assign_factor_size_mcap_from_mcap(w)
-    # 对数市值 → 全市场截面中位数兜底安全锁（行业截面归一化之前）
-    w = sanitize_factor_size_mcap_column(w)
+    # 全市场截面中位数兜底安全锁（行业/市值截面归一化之前）
+    if SIZE_FACTOR_COL in w.columns:
+        _sz = pd.to_numeric(w[SIZE_FACTOR_COL], errors="coerce")
+        w[SIZE_FACTOR_COL] = _sz.fillna(
+            float(_sz.median()) if not _sz.isna().all() else float(SIZE_MCAP_LOG_FALLBACK)
+        )
     w = clean_cross_sectional_features(w)
     if str(date_col) != "date":
         w = w.drop(columns=["date"], errors="ignore")
