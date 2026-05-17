@@ -81,6 +81,25 @@ from src.predictor import (  # noqa: E402
 PriceKind = Literal["open", "close"]
 TRADING_DAYS_PER_YEAR = 242
 
+# 与 run_daily / 题材选股一致：沪深300 环境分低于该值 → 回测当日空仓、收益 0、无换仓摩擦
+DEFAULT_REGIME_FUSE_MIN_SCORE = 60
+
+
+def is_market_regime_fuse_day(
+    trade_date: str,
+    *,
+    min_score: int | None = None,
+) -> tuple[bool, int]:
+    """
+  判定历史交易日是否触发大盘择时熔断。
+
+  Returns:
+      (是否熔断, 当日环境分)
+    """
+    threshold = int(min_score if min_score is not None else MARKET_REGIME_MIN_SCORE)
+    score = int(compute_market_regime_score(trade_date))
+    return score < threshold, score
+
 
 def _board_limit_pct(code: str) -> float:
     z = _normalize_stock_code(code)
@@ -716,11 +735,11 @@ class BacktestEngine:
     stamp_duty_sell_rate: float
     """买卖冲击成本：买入成交价 = 市价×(1+rate)，卖出 = 市价×(1−rate)。"""
     slippage_rate: float
+    get_universe: Callable[[str], list[tuple[str, str]]]
     """涨跌停价与 OHLC 对齐容差（元）。"""
     limit_price_eps_yuan: float = BACKTEST_LIMIT_PRICE_EPS_YUAN
     """相邻日 K 自然日间隔超过该值视为缺口/长期停牌，禁止买入。"""
     max_calendar_gap_days: int = BACKTEST_MAX_CALENDAR_GAP_DAYS
-    get_universe: Callable[[str], list[tuple[str, str]]]
     include_300: bool = False
     include_688: bool = False
     """沪深300 环境分低于该值触发空仓熔断（与 run_daily / 题材 tab 一致）。"""
@@ -754,7 +773,10 @@ class BacktestEngine:
 
     def _apply_market_regime_fuse_day(self, d: str, regime_score: int) -> None:
         """
-        大盘熔断日：强制空仓，净值与前一日相同（当日收益率 0），不产生换仓摩擦。
+        风控防御空仓日（与 run_daily 熔断对齐）：
+
+        - 清空持仓，不调用 ``_sell_all_open`` / ``_buy_equal_open``（无佣金/印花税/滑点）；
+        - 组合净值 = 前一日净值，``daily_return`` 显式为 0.0。
         """
         prev_nav = (
             float(self.nav_records[-1]["nav"])
@@ -770,6 +792,7 @@ class BacktestEngine:
                 "cash": prev_nav,
                 "hold_mv": 0.0,
                 "n_positions": 0,
+                "daily_return": 0.0,
                 "market_regime_fuse": 1,
                 "regime_score": int(regime_score),
             }
@@ -777,6 +800,12 @@ class BacktestEngine:
         self.regime_fuse_days += 1
 
     def run(self) -> None:
+        """
+        逐日滚动回测。
+
+        **大盘风控卡口（循环体最前端）**：每个 ``trade_date`` 先算环境分；
+        低于 ``regime_min_score``（默认 60）则熔断空仓并 ``continue``，跳过一切换仓摩擦。
+        """
         self.by_code = {
             c: g.reset_index(drop=True)
             for c, g in self.bars.groupby("stock_code", sort=False)
@@ -792,18 +821,22 @@ class BacktestEngine:
         self.regime_fuse_days = 0
 
         for i, d in enumerate(self.trade_dates):
-            regime_score = compute_market_regime_score(d)
-            if regime_score < regime_min:
+            # --- 大盘风控熔断卡口（必须在换仓/打分之前，与 run_daily 强一致）---
+            fuse_today, regime_score = is_market_regime_fuse_day(
+                d, min_score=regime_min
+            )
+            if fuse_today:
                 if i >= 1 and (i - 1) % hd == 0:
                     print(
                         f"[大盘熔断] {d} 环境分 {regime_score} < {regime_min}，"
-                        f"跳过换仓（信号日 {self.trade_dates[i - 1]}），强制空仓、当日收益 0",
+                        f"跳过换仓（信号日 {self.trade_dates[i - 1]}），"
+                        "防御空仓、daily_return=0、无摩擦成本",
                         flush=True,
                     )
                 else:
                     print(
                         f"[大盘熔断] {d} 环境分 {regime_score} < {regime_min}，"
-                        "强制空仓、当日收益 0",
+                        "防御空仓、daily_return=0、无摩擦成本",
                         flush=True,
                     )
                 self._apply_market_regime_fuse_day(d, regime_score)
@@ -955,6 +988,12 @@ class BacktestEngine:
             if np.isfinite(c) and c > 0:
                 mv += lot.shares * c
         nav = self.cash + mv
+        prev_nav = (
+            float(self.nav_records[-1]["nav"])
+            if self.nav_records
+            else float(self.initial_cash)
+        )
+        daily_ret = (float(nav) / prev_nav - 1.0) if prev_nav > 1e-12 else 0.0
         score = (
             int(regime_score)
             if regime_score is not None
@@ -967,6 +1006,7 @@ class BacktestEngine:
                 "cash": float(self.cash),
                 "hold_mv": float(mv),
                 "n_positions": len(self.positions),
+                "daily_return": float(daily_ret),
                 "market_regime_fuse": 0,
                 "regime_score": score,
             }
@@ -981,7 +1021,10 @@ def _compute_metrics(
 ) -> dict[str, Any]:
     nav_df = nav_df.sort_values("trade_date").reset_index(drop=True)
     nav = nav_df["nav"].astype(float)
-    daily_ret = nav.pct_change().fillna(0.0)
+    if "daily_return" in nav_df.columns:
+        daily_ret = pd.to_numeric(nav_df["daily_return"], errors="coerce").fillna(0.0)
+    else:
+        daily_ret = nav.pct_change().fillna(0.0)
     equity = nav / nav.iloc[0]
     cum_ret = float(equity.iloc[-1] - 1.0)
     n = len(nav_df)
@@ -1336,7 +1379,8 @@ def main() -> None:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     nav_out = metrics["nav_df"].copy()
-    nav_out["daily_return"] = metrics["daily_ret"].values
+    if "daily_return" not in nav_out.columns:
+        nav_out["daily_return"] = metrics["daily_ret"].values
     if bench_df is not None and not bench_df.empty:
         nav_out = pd.merge(
             nav_out,
@@ -1353,6 +1397,11 @@ def main() -> None:
     nav_out["commission_rate"] = comm
     nav_out["stamp_duty_sell_rate"] = stamp
     nav_out["slippage_rate"] = slip
+    nav_out["regime_fuse_min_score"] = int(MARKET_REGIME_MIN_SCORE)
+    if "market_regime_fuse" in nav_out.columns:
+        nav_out["regime_fuse_days_cum"] = (
+            nav_out["market_regime_fuse"].fillna(0).astype(int).cumsum()
+        )
     nav_out.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"净值序列已写入: {out_path.resolve()}")
 
