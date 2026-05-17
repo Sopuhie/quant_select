@@ -142,6 +142,12 @@ CREATE TABLE IF NOT EXISTS stock_north_hold_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_nh_date ON stock_north_hold_daily(trade_date);
 
+CREATE TABLE IF NOT EXISTS market_hsgt_flow_daily (
+    trade_date TEXT NOT NULL PRIMARY KEY,
+    net_inflow REAL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS system_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_name TEXT NOT NULL,
@@ -232,6 +238,23 @@ def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN market_cap REAL")
 
 
+def _ensure_market_hsgt_flow_daily(conn: sqlite3.Connection) -> None:
+    """旧库升级：全市场北向净流入日频表（因子层只读本地）。"""
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_hsgt_flow_daily'"
+    )
+    if cur.fetchone() is None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_hsgt_flow_daily (
+                trade_date TEXT NOT NULL PRIMARY KEY,
+                net_inflow REAL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+
 def _ensure_stock_concept_boards(conn):
     cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_concept_boards'")
     if cur.fetchone() is None:
@@ -251,6 +274,7 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_stock_daily_kline_market_cap(conn)
         _ensure_daily_selections_selection_reason(conn)
         _ensure_stock_concept_boards(conn)
+        _ensure_market_hsgt_flow_daily(conn)
         conn.commit()
     finally:
         conn.close()
@@ -971,6 +995,82 @@ def stock_codes_with_local_bars(
     finally:
         conn.close()
     return {str(r[0]).strip().zfill(6) for r in rows}
+
+
+def fetch_market_hsgt_net_flow_map(
+    dates: list[str],
+    *,
+    db_path: Path | None = None,
+) -> dict[str, float]:
+    """从 ``market_hsgt_flow_daily`` 读取北向净流入（元）；无记录则不在字典中。"""
+    if not dates:
+        return {}
+    ds = sorted({str(d).strip()[:10] for d in dates if d})
+    if not ds:
+        return {}
+    placeholders = ",".join("?" * len(ds))
+    path = str(db_path or DB_PATH)
+    init_db(db_path)
+    conn = sqlite3.connect(path, timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        cur = conn.execute(
+            f"""
+            SELECT trade_date, net_inflow FROM market_hsgt_flow_daily
+            WHERE trade_date IN ({placeholders}) AND net_inflow IS NOT NULL
+            """,
+            tuple(ds),
+        )
+        out: dict[str, float] = {}
+        for r in cur.fetchall():
+            td = str(r[0]).strip()[:10]
+            v = float(r[1])
+            if math.isfinite(v):
+                out[td] = v
+        return out
+    finally:
+        conn.close()
+
+
+def upsert_market_hsgt_flow_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    db_path: Path | None = None,
+) -> int:
+    """批量写入全市场北向净流入；``rows`` 含 ``trade_date``, ``net_inflow``。"""
+    batch = [
+        (
+            str(r["trade_date"]).strip()[:10],
+            float(r["net_inflow"]),
+        )
+        for r in rows
+        if r.get("trade_date") is not None and r.get("net_inflow") is not None
+    ]
+    if not batch:
+        return 0
+    path = db_path or DB_PATH
+    init_db(path)
+
+    def _op() -> None:
+        conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+        _apply_sqlite_pragmas(conn)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO market_hsgt_flow_daily (trade_date, net_inflow, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(trade_date) DO UPDATE SET
+                    net_inflow = excluded.net_inflow,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                batch,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _retry_sqlite_locked(_op)
+    return len(batch)
 
 
 def fetch_auxiliary_feature_frames(

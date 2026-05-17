@@ -34,10 +34,38 @@ def rank_gauss_cross_section(s: pd.Series, *, eps: float = 1e-6) -> pd.Series:
     return pd.Series(out, index=v.index, dtype=float)
 
 
+def zca_whiten_columns_cross_section(X: np.ndarray, *, eps: float = 1e-5) -> np.ndarray:
+    """
+    截面 ZCA 对称白化：``P = V @ (D + eps)^(-1/2) @ V.T``，无列顺序偏好。
+    """
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("zca_whiten_columns_cross_section expects 2d array")
+    n, k = X.shape
+    if k == 0:
+        return X
+    out = np.zeros((n, k), dtype=float)
+    m = np.isfinite(X).all(axis=1)
+    if int(m.sum()) < max(k + 2, 4):
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    Xv = X[m]
+    mu = Xv.mean(axis=0, keepdims=True)
+    Xc = Xv - mu
+    sigma = (Xc.T @ Xc) / max(1.0, float(Xv.shape[0] - 1))
+    evals, evecs = np.linalg.eigh(sigma)
+    evals = np.maximum(evals, float(eps))
+    d_inv_sqrt = 1.0 / np.sqrt(evals)
+    p = (evecs * d_inv_sqrt) @ evecs.T
+    Y = Xc @ p
+    out[m] = Y
+    if (~m).any():
+        out[~m] = 0.0
+    return out
+
+
 def gram_schmidt_columns_cross_section(X: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
     """
-    列向施密特正交化（单位列）：``X`` 形状 ``(n_samples, n_features)``，逐列相对前面列去相关并单位化。
-    用于同一交易日内多只股票在技术指标因子张成的子空间上去共线。
+    列向施密特正交化（单位列）；截面技术指标请优先 ``zca_whiten_columns_cross_section``。
     """
     X = np.asarray(X, dtype=float)
     if X.ndim != 2:

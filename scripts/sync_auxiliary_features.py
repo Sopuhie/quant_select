@@ -86,6 +86,16 @@ def main() -> None:
     )
     p.add_argument("--only-money-flow", action="store_true", help="仅补资金流")
     p.add_argument("--only-north", action="store_true", help="仅补北向持股")
+    p.add_argument(
+        "--sync-market-hsgt",
+        action="store_true",
+        help="同步全市场北向净流入至 market_hsgt_flow_daily（因子层只读本地）",
+    )
+    p.add_argument(
+        "--only-market-hsgt",
+        action="store_true",
+        help="仅同步全市场北向净流入后退出",
+    )
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
     fill_mf = not args.only_north
@@ -94,6 +104,17 @@ def main() -> None:
         raise SystemExit("不能同时指定 --only-money-flow 与 --only-north")
 
     init_db(DB_PATH)
+
+    if args.sync_market_hsgt or args.only_market_hsgt:
+        from src.market_hsgt_sync import sync_market_hsgt_flow_to_db
+
+        sync_market_hsgt_flow_to_db(
+            str(args.start_date).strip()[:10],
+            str(args.end_date).strip()[:10],
+            verbose=not args.quiet,
+        )
+        if args.only_market_hsgt:
+            return
 
     if args.codes.strip():
         s = str(args.start_date).strip()[:10]

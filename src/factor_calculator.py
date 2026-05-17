@@ -19,7 +19,7 @@ from .config import (
     MAX_ALLOWED_20D_RETURN,
     MAX_ALLOWED_5D_RETURN,
 )
-from .utils import gram_schmidt_columns_cross_section, rank_gauss_cross_section
+from .utils import rank_gauss_cross_section, zca_whiten_columns_cross_section
 
 # 行业内样本过少时退回当日全截面 MAD+Z，避免行业组统计不稳
 MIN_INDUSTRY_GROUP_SIZE = 5
@@ -70,7 +70,7 @@ PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
     "factor_macd_hist",
 )
 
-# 波动 / 换手类：分位秩后做 RankGauss（在 ``clean_cross_sectional_features`` 内顺序执行）
+# 波动 / 换手类：先截面相对尺度，再 RankGauss（在 ``clean_cross_sectional_features`` 内顺序执行）
 RANK_GAUSS_AFTER_RANK_FEATURES: tuple[str, ...] = (
     "factor_volatility_5d",
     "factor_volatility_20d",
@@ -78,7 +78,10 @@ RANK_GAUSS_AFTER_RANK_FEATURES: tuple[str, ...] = (
     "factor_volume_position",
 )
 
-# 技术指标：在截面分位前对原始因子做施密特正交（列顺序固定）
+# 截面相对波动率：当日个股时序波动 / 当日全市场截面中位数（RankGauss 之前）
+CROSS_SECTION_RELATIVE_VOL_FEATURES: tuple[str, ...] = RANK_GAUSS_AFTER_RANK_FEATURES
+
+# 技术指标：截面分位前做 ZCA 对称正交（无列顺序偏好）
 TECHNICAL_ORTHOGONAL_FEATURE_COLS: tuple[str, ...] = (
     "factor_rsi_14",
     "factor_kdj_j",
@@ -155,6 +158,61 @@ def _apply_size_residual_regression(sub_df: pd.DataFrame) -> pd.DataFrame:
     return sub_df
 
 
+def _apply_cross_section_relative_volatility(day_df: pd.DataFrame) -> pd.DataFrame:
+    """波动/换手类：当日个股值 / 当日全市场截面中位数，体现相对波动 regime。"""
+    out = day_df.copy()
+    for col in CROSS_SECTION_RELATIVE_VOL_FEATURES:
+        if col not in out.columns:
+            continue
+        s = pd.to_numeric(out[col], errors="coerce")
+        med = float(s.median()) if s.notna().any() else float("nan")
+        if np.isfinite(med) and abs(med) > 1e-12:
+            out[col] = s / med
+    return out
+
+
+def _limit_move_ratio(stock_code: str | None) -> float:
+    """涨跌停幅度代理（主板 10%，创业板/科创板 20%）。"""
+    c = str(stock_code or "").strip().zfill(6)
+    if c.startswith(("300", "301", "688")):
+        return 0.20
+    if c.startswith(("8", "4")):
+        return 0.30
+    return 0.10
+
+
+def _bar_one_word_limit_locked(
+    row: pd.Series,
+    prev_close: float,
+    *,
+    limit_ratio: float,
+    direction: str,
+) -> bool:
+    """一字涨/跌停：开高低收近似相等且触及涨跌停价。"""
+    try:
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+        vol = float(row.get("volume", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if not all(np.isfinite(x) for x in (o, h, l, c, prev_close)) or prev_close <= 0:
+        return False
+    if vol <= 0:
+        return False
+    span = max(abs(h - l), 1e-9)
+    one_word = span <= max(1e-6, 1e-4 * abs(c))
+    if not one_word:
+        return False
+    tol = prev_close * 1e-3
+    if direction == "down":
+        limit_px = prev_close * (1.0 - limit_ratio)
+        return c <= limit_px + tol
+    limit_px = prev_close * (1.0 + limit_ratio)
+    return c >= limit_px - tol
+
+
 def _roll_ewm_blend(s: pd.Series, window: int) -> pd.Series:
     """rolling 与 EWM 线性混合，近期权重更高（因子衰减）。"""
     w = max(2, int(window))
@@ -171,63 +229,32 @@ def build_hsgt_net_zscore_by_trade_date(
 ) -> dict[str, float]:
     """
     北向资金净流入（全市场日频）按日期映射为 Z-score；用于 ``factor_hsgt_flow_interact``。
-    接口失败或列结构变化时返回空字典（调用方填 0）。
+    仅从本地 SQLite ``market_hsgt_flow_daily`` 读取（网络同步见 ``market_hsgt_sync`` / 数据脚本）。
+    无本地数据时返回空字典（调用方填 0）。
     """
     if not dates:
         return {}
     ds = sorted({str(d).strip()[:10] for d in dates if d})
     if not ds:
         return {}
-    start = ds[0].replace("-", "")
-    end = ds[-1].replace("-", "")
     try:
-        import akshare as ak  # type: ignore[import-untyped]
+        from .database import fetch_market_hsgt_net_flow_map
+
+        flow = fetch_market_hsgt_net_flow_map(ds)
     except Exception:
         return {}
-    try:
-        raw = ak.stock_hsgt_hist_em(symbol="北向资金", start_date=start, end_date=end)
-    except Exception:
-        try:
-            raw = ak.stock_hsgt_hist_em(symbol="沪股通", start_date=start, end_date=end)
-        except Exception:
-            return {}
-    if raw is None or getattr(raw, "empty", True):
+    if not flow:
         return {}
-    df = raw.copy()
-    date_col = next(
-        (c for c in df.columns if "日期" in str(c) or str(c).lower() == "date"),
-        df.columns[0],
-    )
-    val_col = next(
-        (
-            c
-            for c in df.columns
-            if "净" in str(c)
-            or "流入" in str(c)
-            or "当日" in str(c)
-            or str(c).lower() in ("value", "net", "amount")
-        ),
-        None,
-    )
-    if val_col is None:
-        num_cols = [c for c in df.columns if c != date_col and str(df[c].dtype).startswith(("float", "int"))]
-        if not num_cols:
-            return {}
-        val_col = num_cols[-1]
-    ser = pd.to_numeric(df[val_col], errors="coerce")
-    dt = pd.to_datetime(df[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
-    g = pd.DataFrame({"d": dt, "v": ser}).dropna(subset=["d", "v"])
-    if g.empty:
-        return {}
-    mu = float(g["v"].mean())
-    sig = float(g["v"].std(ddof=0))
+    vals = np.asarray(list(flow.values()), dtype=float)
+    mu = float(np.nanmean(vals))
+    sig = float(np.nanstd(vals, ddof=0))
     if not np.isfinite(mu) or not np.isfinite(sig) or sig < 1e-12:
         return {}
     out: dict[str, float] = {}
-    for _, row in g.iterrows():
-        z = (float(row["v"]) - mu) / sig
+    for d, v in flow.items():
+        z = (float(v) - mu) / sig
         if np.isfinite(z):
-            out[str(row["d"])[:10]] = float(z)
+            out[str(d)[:10]] = float(z)
     return out
 
 
@@ -526,7 +553,8 @@ def clean_cross_sectional_features(
     截面清洗：
 
     - 按 ``date`` / ``trade_date`` 分组；
-    - 对 ``TECHNICAL_ORTHOGONAL_FEATURE_COLS`` 先做列向 Gram–Schmidt 正交；
+    - 对 ``TECHNICAL_ORTHOGONAL_FEATURE_COLS`` 先做 ZCA 对称正交；
+    - 对波动/换手类先做截面相对波动率（/ 当日中位数），再 RankGauss；
     - 对 ``PERCENTILE_RANK_FEATURES`` 做 ``rank(pct=True) - 0.5``；
     - 对 ``RANK_GAUSS_AFTER_RANK_FEATURES`` 做截面 RankGauss；
     - 可选：在每个行业组内对因子（除 ``factor_size_mcap``）相对市值对数做 OLS 残差提取；
@@ -551,11 +579,12 @@ def clean_cross_sectional_features(
                 .apply(pd.to_numeric, errors="coerce")
                 .to_numpy(dtype=float)
             )
-            Q = gram_schmidt_columns_cross_section(M)
+            Q = zca_whiten_columns_cross_section(M)
             for j, c in enumerate(TECHNICAL_ORTHOGONAL_FEATURE_COLS):
                 day_df[c] = Q[:, j]
 
         if use_percentile_rank_volatility:
+            day_df = _apply_cross_section_relative_volatility(day_df)
             for col in PERCENTILE_RANK_FEATURES:
                 if col not in day_df.columns or col in PRESERVE_RAW_CROSS_SECTION_FEATURES:
                     continue
@@ -636,14 +665,80 @@ def anchor_ma_levels_from_history(df: pd.DataFrame) -> tuple[float, float, float
     return c, m20, m60
 
 
-def label_forward_return(close: pd.Series, horizon: int = LABEL_HORIZON_DAYS) -> pd.Series:
-    """T 日因子对应的标签：从 T 收盘到 T+h 收盘的收益率（最后 horizon 行为 NaN）。"""
-    c = close.astype(float)
-    future = c.shift(-horizon)
-    valid = (c > 1e-8) & c.notna() & future.notna() & (future > 0)
-    ret = future / c - 1.0
-    ret = ret.where(valid)
-    return ret.replace([np.inf, -np.inf], np.nan)
+def label_forward_return(
+    ohlcv: pd.DataFrame | pd.Series,
+    horizon: int = LABEL_HORIZON_DAYS,
+    *,
+    stock_code: str | None = None,
+) -> pd.Series:
+    """
+    T 日因子标签：T 收盘 → 可成交买入价 → 可成交卖出价，收益率考虑涨跌停一字板流动性陷阱。
+
+    ``ohlcv`` 为含 open/high/low/close/volume 的 DataFrame；若仅传入 ``close`` Series 则退回简单 shift 标签。
+    """
+    if isinstance(ohlcv, pd.Series):
+        c = ohlcv.astype(float)
+        future = c.shift(-horizon)
+        valid = (c > 1e-8) & c.notna() & future.notna() & (future > 0)
+        ret = (future / c - 1.0).where(valid)
+        return ret.replace([np.inf, -np.inf], np.nan)
+
+    work = ohlcv.sort_values("date").reset_index(drop=True) if "date" in ohlcv.columns else ohlcv.reset_index(drop=True)
+    n = len(work)
+    out = np.full(n, np.nan, dtype=float)
+    if n < horizon + 2:
+        return pd.Series(out, index=work.index, dtype=float)
+
+    limit_r = _limit_move_ratio(stock_code)
+    close = pd.to_numeric(work["close"], errors="coerce").astype(float)
+    max_scan = min(n, horizon + 25)
+
+    for i in range(n - 1):
+        c0 = float(close.iloc[i])
+        if not np.isfinite(c0) or c0 <= 1e-8:
+            continue
+        buy_i = i + 1
+        if buy_i >= n:
+            break
+        prev_buy = c0
+        while buy_i < min(n, i + max_scan):
+            row_b = work.iloc[buy_i]
+            if _bar_one_word_limit_locked(
+                row_b, prev_buy, limit_ratio=limit_r, direction="down"
+            ):
+                prev_buy = float(row_b["close"])
+                buy_i += 1
+                continue
+            break
+        if buy_i >= n:
+            continue
+        entry = float(work.iloc[buy_i]["close"])
+        if not np.isfinite(entry) or entry <= 1e-8:
+            continue
+
+        sell_i = min(i + horizon, n - 1)
+        if sell_i <= buy_i:
+            continue
+        prev_sell = float(close.iloc[sell_i - 1]) if sell_i > 0 else entry
+        while sell_i < min(n - 1, i + max_scan):
+            row_s = work.iloc[sell_i]
+            if _bar_one_word_limit_locked(
+                row_s, prev_sell, limit_ratio=limit_r, direction="down"
+            ):
+                prev_sell = float(row_s["close"])
+                sell_i += 1
+                continue
+            break
+        if sell_i >= n:
+            continue
+        exit_px = float(work.iloc[sell_i]["close"])
+        if not np.isfinite(exit_px) or exit_px <= 0:
+            continue
+        r = exit_px / entry - 1.0
+        if np.isfinite(r):
+            out[i] = r
+
+    return pd.Series(out, index=work.index, dtype=float).replace([np.inf, -np.inf], np.nan)
 
 
 def build_stock_panel_features(
@@ -651,9 +746,9 @@ def build_stock_panel_features(
     stock_code: str,
     stock_name: str,
 ) -> pd.DataFrame:
-    _ = (stock_code, stock_name)
+    _ = stock_name
     factors = compute_factors_for_history(df)
-    lab = label_forward_return(df["close"].astype(float))
+    lab = label_forward_return(df, horizon=LABEL_HORIZON_DAYS, stock_code=stock_code)
     meta_cols = ["date"]
     if "industry" in df.columns:
         meta_cols.append("industry")

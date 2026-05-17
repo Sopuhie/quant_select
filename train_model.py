@@ -210,7 +210,9 @@ def _load_local_kline_panel(
             [meta.reset_index(drop=True), facts.reset_index(drop=True)],
             axis=1,
         )
-        merged["label_ret"] = label_forward_return(g["close"].astype(float)).values
+        merged["label_ret"] = label_forward_return(
+            g, horizon=LABEL_HORIZON_DAYS, stock_code=str(code)
+        ).values
         merged = merged.replace([np.inf, -np.inf], np.nan).dropna(
             subset=FEATURE_COLUMNS + ["label_ret"]
         )

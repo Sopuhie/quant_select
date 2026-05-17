@@ -1928,18 +1928,6 @@ with tab_data:
             _ef_cfg_mtime = float(config_manager.config_path.stat().st_mtime)
         except OSError:
             _ef_cfg_mtime = 0.0
-        if st.session_state.get("_quant_ef_cfg_mtime") != _ef_cfg_mtime:
-            st.session_state["_quant_ef_cfg_mtime"] = _ef_cfg_mtime
-            for _k in (
-                "task_c_ef_min_price",
-                "task_c_ef_max_price",
-                "task_c_ef_min_mcap",
-                "task_c_ef_max_mcap",
-                "task_c_ef_min_turnover",
-                "task_c_ef_max_turnover",
-            ):
-                st.session_state.pop(_k, None)
-
         _mp, _Mxp, _mm, _Mxm, _mt, _Mxt = get_experience_thresholds()
         _ef_ui = {
             "min_price": _mp,
@@ -1949,6 +1937,27 @@ with tab_data:
             "min_turnover": _mt,
             "max_turnover": _Mxt,
         }
+        _ef_widget_fields = (
+            ("task_c_ef_min_price", "min_price"),
+            ("task_c_ef_max_price", "max_price"),
+            ("task_c_ef_min_mcap", "min_mcap"),
+            ("task_c_ef_max_mcap", "max_mcap"),
+            ("task_c_ef_min_turnover", "min_turnover"),
+            ("task_c_ef_max_turnover", "max_turnover"),
+        )
+        if st.session_state.get("_quant_ef_cfg_mtime") != _ef_cfg_mtime:
+            st.session_state["_quant_ef_cfg_mtime"] = _ef_cfg_mtime
+            for _state_key, _cfg_key in _ef_widget_fields:
+                st.session_state[_state_key] = _experience_filter_display_str(
+                    _ef_ui, _cfg_key
+                )
+        else:
+            for _state_key, _cfg_key in _ef_widget_fields:
+                st.session_state.setdefault(
+                    _state_key,
+                    _experience_filter_display_str(_ef_ui, _cfg_key),
+                )
+
         with st.expander(
             "⚙️ 经验风控阈值（打分后、取 Top 前硬过滤；留空表示不限制）",
             expanded=False,
@@ -1962,37 +1971,13 @@ with tab_data:
             )
             _ec1, _ec2, _ec3 = st.columns(3)
             with _ec1:
-                st.text_input(
-                    "最低价 (元)",
-                    value=_experience_filter_display_str(_ef_ui, "min_price"),
-                    key="task_c_ef_min_price",
-                )
-                st.text_input(
-                    "最低市值 (亿元)",
-                    value=_experience_filter_display_str(_ef_ui, "min_mcap"),
-                    key="task_c_ef_min_mcap",
-                )
-                st.text_input(
-                    "最低换手 (%)",
-                    value=_experience_filter_display_str(_ef_ui, "min_turnover"),
-                    key="task_c_ef_min_turnover",
-                )
+                st.text_input("最低价 (元)", key="task_c_ef_min_price")
+                st.text_input("最低市值 (亿元)", key="task_c_ef_min_mcap")
+                st.text_input("最低换手 (%)", key="task_c_ef_min_turnover")
             with _ec2:
-                st.text_input(
-                    "最高价 (元)",
-                    value=_experience_filter_display_str(_ef_ui, "max_price"),
-                    key="task_c_ef_max_price",
-                )
-                st.text_input(
-                    "最高市值 (亿元)",
-                    value=_experience_filter_display_str(_ef_ui, "max_mcap"),
-                    key="task_c_ef_max_mcap",
-                )
-                st.text_input(
-                    "最高换手 (%)",
-                    value=_experience_filter_display_str(_ef_ui, "max_turnover"),
-                    key="task_c_ef_max_turnover",
-                )
+                st.text_input("最高价 (元)", key="task_c_ef_max_price")
+                st.text_input("最高市值 (亿元)", key="task_c_ef_max_mcap")
+                st.text_input("最高换手 (%)", key="task_c_ef_max_turnover")
             with _ec3:
                 st.markdown(
                     "<p style='font-size:0.82rem;color:#475569;margin-top:0.2rem;'>"
