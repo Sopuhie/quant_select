@@ -18,6 +18,8 @@
   - 沪深300 基准：优先读库内代码 000300；若无则再尝试 AkShare。
   - 净值序列默认写入 data/backtest_results.csv。
   - 换仓时计入 **单边佣金**（默认万三）与 **卖出印花税**（默认千一），以及 **滑点**（默认见 ``config.py`` 的 ``BACKTEST_DEFAULT_SLIPPAGE_RATE`` / ``quant.backtest.slippage_rate``，可用 ``--slippage-rate`` 覆盖）。
+  - **大盘择时熔断**（与 ``run_daily.py`` 一致）：逐日用 ``compute_market_regime_score`` 判断沪深300环境分；
+    低于 ``MARKET_REGIME_MIN_SCORE``（默认 60）当日强制空仓、当日收益率为 0、不计佣金/印花税/滑点。
 """
 from __future__ import annotations
 
@@ -52,8 +54,10 @@ from src.config import (  # noqa: E402
     TOP_N_SELECTION,
     STOCK_POOL,
     MAX_STOCKS_UNIVERSE,
+    MARKET_REGIME_MIN_SCORE,
     get_quant_config_merged,
 )
+from src.market_regime import compute_market_regime_score  # noqa: E402
 from src.data_fetcher import fetch_daily_hist, get_stock_pool  # noqa: E402
 from src.database import get_active_model_version  # noqa: E402
 from src.factor_calculator import (  # noqa: E402
@@ -719,8 +723,11 @@ class BacktestEngine:
     get_universe: Callable[[str], list[tuple[str, str]]]
     include_300: bool = False
     include_688: bool = False
+    """沪深300 环境分低于该值触发空仓熔断（与 run_daily / 题材 tab 一致）。"""
+    regime_min_score: int = MARKET_REGIME_MIN_SCORE
 
     cash: float = field(init=False)
+    regime_fuse_days: int = field(default=0, init=False)
     date_pos: dict[str, dict[str, int]] = field(default_factory=dict)
     by_code: dict[str, pd.DataFrame] = field(default_factory=dict)
     positions: list[HeldShare] = field(default_factory=list)
@@ -745,6 +752,30 @@ class BacktestEngine:
             return None
         return g.iloc[int(pos) - 1]
 
+    def _apply_market_regime_fuse_day(self, d: str, regime_score: int) -> None:
+        """
+        大盘熔断日：强制空仓，净值与前一日相同（当日收益率 0），不产生换仓摩擦。
+        """
+        prev_nav = (
+            float(self.nav_records[-1]["nav"])
+            if self.nav_records
+            else float(self.initial_cash)
+        )
+        self.positions = []
+        self.cash = prev_nav
+        self.nav_records.append(
+            {
+                "trade_date": d,
+                "nav": prev_nav,
+                "cash": prev_nav,
+                "hold_mv": 0.0,
+                "n_positions": 0,
+                "market_regime_fuse": 1,
+                "regime_score": int(regime_score),
+            }
+        )
+        self.regime_fuse_days += 1
+
     def run(self) -> None:
         self.by_code = {
             c: g.reset_index(drop=True)
@@ -757,7 +788,27 @@ class BacktestEngine:
             self.date_pos[c] = {str(g.iloc[i]["date"]): i for i in range(len(g))}
 
         hd = max(1, int(self.holding_days))
+        regime_min = int(self.regime_min_score)
+        self.regime_fuse_days = 0
+
         for i, d in enumerate(self.trade_dates):
+            regime_score = compute_market_regime_score(d)
+            if regime_score < regime_min:
+                if i >= 1 and (i - 1) % hd == 0:
+                    print(
+                        f"[大盘熔断] {d} 环境分 {regime_score} < {regime_min}，"
+                        f"跳过换仓（信号日 {self.trade_dates[i - 1]}），强制空仓、当日收益 0",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[大盘熔断] {d} 环境分 {regime_score} < {regime_min}，"
+                        "强制空仓、当日收益 0",
+                        flush=True,
+                    )
+                self._apply_market_regime_fuse_day(d, regime_score)
+                continue
+
             # 每 holding_days 个交易日全额换仓：T-1 收盘后信号 → T 日开盘先卖清再等额买入 TopN
             if i >= 1 and (i - 1) % hd == 0:
                 sig_date = self.trade_dates[i - 1]
@@ -775,7 +826,7 @@ class BacktestEngine:
                 )
                 self._buy_equal_open(d, codes)
 
-            self._mark_to_market_close(d)
+            self._mark_to_market_close(d, regime_score=regime_score)
 
     def _sell_all_open(self, d: str) -> None:
         if not self.positions:
@@ -894,7 +945,7 @@ class BacktestEngine:
         self.cash -= spent_total
         self.positions.extend(new_holdings)
 
-    def _mark_to_market_close(self, d: str) -> None:
+    def _mark_to_market_close(self, d: str, *, regime_score: int | None = None) -> None:
         mv = 0.0
         for lot in self.positions:
             row = self._row(d, lot.code)
@@ -904,6 +955,11 @@ class BacktestEngine:
             if np.isfinite(c) and c > 0:
                 mv += lot.shares * c
         nav = self.cash + mv
+        score = (
+            int(regime_score)
+            if regime_score is not None
+            else int(compute_market_regime_score(d))
+        )
         self.nav_records.append(
             {
                 "trade_date": d,
@@ -911,6 +967,8 @@ class BacktestEngine:
                 "cash": float(self.cash),
                 "hold_mv": float(mv),
                 "n_positions": len(self.positions),
+                "market_regime_fuse": 0,
+                "regime_score": score,
             }
         )
 
@@ -1256,7 +1314,17 @@ def main() -> None:
         f"含300/301={args.include_300}, 含688={args.include_688}。",
         flush=True,
     )
+    print(
+        f"大盘择时熔断：沪深300 环境分 < {MARKET_REGIME_MIN_SCORE} 时强制空仓、"
+        "当日收益 0、不计换仓摩擦（与 run_daily 一致）。",
+        flush=True,
+    )
     engine.run()
+    if engine.regime_fuse_days > 0:
+        print(
+            f"回测期内大盘熔断空仓交易日: {engine.regime_fuse_days} 天",
+            flush=True,
+        )
 
     nav_df = pd.DataFrame(engine.nav_records)
     bench_df = fetch_benchmark_close(
