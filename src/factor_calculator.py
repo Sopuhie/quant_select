@@ -13,11 +13,8 @@ import numpy as np
 import pandas as pd
 
 from .config import (
-    DAILY_K_DEEP_OVERSOLD_BIAS_5,
-    DAILY_K_DRY_TRAP_FACTOR_PENALTY,
-    DAILY_K_DRY_VOLUME_POSITION,
-    DAILY_K_UPPER_SHADOW_RATIO_MIN,
-    DAILY_K_UPPER_SHADOW_VOL_RATIO_MIN,
+    DAILY_K_SPIKE_VS_OPEN_MIN,
+    DAILY_K_UPPER_SHADOW_BODY_MULT,
     ENABLE_PREV_GAIN_SUPPRESSION,
     FACTOR_EWM_BLEND,
     FACTOR_EWM_HALFLIFE_DAYS,
@@ -25,6 +22,8 @@ from .config import (
     LABEL_HORIZON_DAYS,
     MAX_ALLOWED_20D_RETURN,
     MAX_ALLOWED_5D_RETURN,
+    SOFT_TURNOVER_PENALTY_MULT,
+    SOFT_TURNOVER_PENALTY_PCT,
 )
 from .utils import rank_gauss_cross_section
 
@@ -420,49 +419,92 @@ def attach_anchor_bar_ohlc(
         return w
 
 
+def _resolve_anchor_close_series(feat_df: pd.DataFrame) -> pd.Series:
+    """锚定日收盘价：优先 ``close`` / ``close_price``，否则从 SQLite OHLC 补齐。"""
+    if feat_df.empty:
+        return pd.Series(dtype=float)
+    if "close" in feat_df.columns:
+        return pd.to_numeric(feat_df["close"], errors="coerce")
+    if "close_price" in feat_df.columns:
+        return pd.to_numeric(feat_df["close_price"], errors="coerce")
+    w = attach_anchor_bar_ohlc(feat_df)
+    if "close" in w.columns:
+        return pd.to_numeric(w["close"], errors="coerce")
+    return pd.Series(np.nan, index=feat_df.index)
+
+
+def _absolute_bear_trend_trap_mask(feat_df: pd.DataFrame) -> pd.Series:
+    """
+    绝对空头压制：收盘价同时低于 MA5 与 MA10（由乖离率倒推均线）。
+    """
+    if feat_df.empty:
+        return pd.Series(False, index=feat_df.index)
+    need = ("factor_bias_5", "factor_bias_10")
+    if not all(c in feat_df.columns for c in need):
+        return pd.Series(False, index=feat_df.index)
+    close = _resolve_anchor_close_series(feat_df)
+    bias5 = pd.to_numeric(feat_df["factor_bias_5"], errors="coerce")
+    bias10 = pd.to_numeric(feat_df["factor_bias_10"], errors="coerce")
+    eps = 1e-12
+    ma5 = close / (bias5 + 1.0 + eps)
+    ma10 = close / (bias10 + 1.0 + eps)
+    valid = close.notna() & ma5.notna() & ma10.notna() & (ma5 > 0) & (ma10 > 0)
+    bear = valid & (close < ma5) & (close < ma10)
+    return bear.fillna(False)
+
+
+def _drop_absolute_bear_trend_suppression(feat_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """剔除收盘价被 MA5/MA10 双线压制的绝对空头股。"""
+    if feat_df is None or feat_df.empty:
+        return feat_df, 0
+    trap = _absolute_bear_trend_trap_mask(feat_df)
+    if not trap.any():
+        return feat_df, 0
+    n_drop = int(trap.sum())
+    out = feat_df.loc[~trap].reset_index(drop=True)
+    print(
+        f"[风控增强] 已剔除绝对空头压制形态（收盘<MA5且<MA10）{n_drop} 只",
+        flush=True,
+    )
+    return out, n_drop
+
+
 def _long_upper_shadow_trap_mask(
     feat_df: pd.DataFrame,
     *,
-    shadow_ratio_min: float | None = None,
-    vol_ratio_min: float | None = None,
+    spike_vs_open_min: float | None = None,
+    shadow_body_mult: float | None = None,
 ) -> pd.Series:
     """
-    图2：高位放量长上影滞涨 — 上影线占振幅 > 阈值 且 量比/放量达标。
-    需 ``open/high/low/close``；缺列时返回全 False。
+    高位冲高回落诱多：盘中冲高 > 4% 且 上影线 > 实体 × 1.2（不依赖量比/换手）。
     """
-    ratio_th = float(
-        shadow_ratio_min
-        if shadow_ratio_min is not None
-        else DAILY_K_UPPER_SHADOW_RATIO_MIN
+    spike_th = float(
+        spike_vs_open_min if spike_vs_open_min is not None else DAILY_K_SPIKE_VS_OPEN_MIN
     )
-    vol_th = float(
-        vol_ratio_min if vol_ratio_min is not None else DAILY_K_UPPER_SHADOW_VOL_RATIO_MIN
+    body_mult = float(
+        shadow_body_mult
+        if shadow_body_mult is not None
+        else DAILY_K_UPPER_SHADOW_BODY_MULT
     )
-    req = ("open", "high", "low", "close")
+    req = ("open", "high", "close")
     if feat_df.empty or not all(c in feat_df.columns for c in req):
         return pd.Series(False, index=feat_df.index)
     o = pd.to_numeric(feat_df["open"], errors="coerce")
     h = pd.to_numeric(feat_df["high"], errors="coerce")
-    l_ = pd.to_numeric(feat_df["low"], errors="coerce")
     c = pd.to_numeric(feat_df["close"], errors="coerce")
+    o_safe = o.replace(0, np.nan)
+    high_vs_open = (h - o) / o_safe
     entity_high = np.fmax(o, c)
-    total_amp = h - l_
     upper_shadow = h - entity_high
-    amp_ok = total_amp > 0.001
-    shadow_ratio = upper_shadow / total_amp.replace(0, np.nan)
-    shadow_hit = amp_ok & (shadow_ratio > ratio_th)
-    if "factor_volume_ratio" in feat_df.columns:
-        vol_metric = pd.to_numeric(feat_df["factor_volume_ratio"], errors="coerce")
-    elif "volume_ratio_raw" in feat_df.columns:
-        vol_metric = pd.to_numeric(feat_df["volume_ratio_raw"], errors="coerce")
-    else:
-        vol_metric = pd.Series(np.nan, index=feat_df.index)
-    vol_hit = vol_metric > vol_th
-    return shadow_hit & vol_hit
+    body_length = (o - c).abs()
+    body_floor = body_length.clip(lower=1e-4)
+    spike_hit = high_vs_open > spike_th
+    shadow_hit = upper_shadow > (body_floor * body_mult)
+    return spike_hit & shadow_hit & o.notna() & h.notna() & c.notna()
 
 
 def _drop_high_volume_long_upper_shadow(feat_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """剔除触发「放量长上影」熔断的截面行。"""
+    """剔除触发「冲高回落长上影诱多」物理熔断的截面行。"""
     if feat_df is None or feat_df.empty:
         return feat_df, 0
     w = attach_anchor_bar_ohlc(feat_df)
@@ -472,42 +514,48 @@ def _drop_high_volume_long_upper_shadow(feat_df: pd.DataFrame) -> tuple[pd.DataF
     n_drop = int(trap.sum())
     out = feat_df.loc[~trap].reset_index(drop=True)
     print(
-        "[风控增强] 已剔除高位放量长上影滞涨兑现形态（图2骗线） "
-        f"{n_drop} 只（上影占比>{DAILY_K_UPPER_SHADOW_RATIO_MIN:.0%} 且 "
-        f"量比>{DAILY_K_UPPER_SHADOW_VOL_RATIO_MIN:.1f}）。",
+        "[风控增强] 已剔除高位冲高回落诱多骗线 "
+        f"{n_drop} 只（冲高>{DAILY_K_SPIKE_VS_OPEN_MIN:.1%} 且 "
+        f"上影>实体×{DAILY_K_UPPER_SHADOW_BODY_MULT:.1f}）。",
         flush=True,
     )
     return out, n_drop
 
 
-def penalize_volume_drift_trap_features(feat_df: pd.DataFrame) -> pd.DataFrame:
+def _resolve_turnover_pct_series(feat_df: pd.DataFrame) -> pd.Series:
     """
-    图1 延伸 — 无量阴跌陷阱：深负 ``factor_bias_5`` 且 ``factor_volume_position`` 极低时，
-    对 13 维因子统一乘以惩罚系数，降低截面排序中的伪超跌吸引力。
+    前一交易日换手率（%）：优先 ``turnover_rate``；否则用量比代理 ×2（与经验过滤一致）。
+    """
+    if feat_df.empty:
+        return pd.Series(dtype=float)
+    if "turnover_rate" in feat_df.columns:
+        return pd.to_numeric(feat_df["turnover_rate"], errors="coerce")
+    if "volume_ratio_raw" in feat_df.columns:
+        return pd.to_numeric(feat_df["volume_ratio_raw"], errors="coerce") * 2.0
+    if "factor_volume_ratio" in feat_df.columns:
+        return pd.to_numeric(feat_df["factor_volume_ratio"], errors="coerce") * 2.0
+    return pd.Series(np.nan, index=feat_df.index)
+
+
+def apply_soft_low_turnover_penalty(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    柔性换手惩罚：换手率 < 2.2% 时对 13 维因子 ×0.3，保留在池内但难以冲进 Top 排名。
     """
     if feat_df is None or feat_df.empty:
         return feat_df
-    need = ("factor_bias_5", "factor_volume_position")
-    if not all(c in feat_df.columns for c in need):
-        return feat_df
     w = feat_df.copy()
-    bias5 = pd.to_numeric(w["factor_bias_5"], errors="coerce")
-    vol_pos = pd.to_numeric(w["factor_volume_position"], errors="coerce")
-    trap = (bias5 <= float(DAILY_K_DEEP_OVERSOLD_BIAS_5)) & (
-        vol_pos <= float(DAILY_K_DRY_VOLUME_POSITION)
-    )
-    n_trap = int(trap.sum())
-    if n_trap <= 0:
+    tr = _resolve_turnover_pct_series(w)
+    low = tr.notna() & (tr < float(SOFT_TURNOVER_PENALTY_PCT))
+    n_low = int(low.sum())
+    if n_low <= 0:
         return w
-    pen = float(DAILY_K_DRY_TRAP_FACTOR_PENALTY)
-    pen = max(0.0, min(1.0, pen))
+    pen = max(0.0, min(1.0, float(SOFT_TURNOVER_PENALTY_MULT)))
     for col in FEATURE_COLUMNS:
         if col in w.columns:
-            w.loc[trap, col] = pd.to_numeric(w.loc[trap, col], errors="coerce") * pen
+            w.loc[low, col] = pd.to_numeric(w.loc[low, col], errors="coerce") * pen
     print(
-        "[风控增强] 无量阴跌陷阱因子惩罚："
-        f"{n_trap} 只（bias5≤{DAILY_K_DEEP_OVERSOLD_BIAS_5:.2%} 且 "
-        f"量能位置≤{DAILY_K_DRY_VOLUME_POSITION:.2%}）×{pen:.2f}",
+        f"[风控增强] 低换手柔性惩罚：{n_low} 只（换手<{SOFT_TURNOVER_PENALTY_PCT:.1f}%）"
+        f"×{pen:.2f}",
         flush=True,
     )
     return w
@@ -518,7 +566,8 @@ def suppress_high_recent_gains(feat_df: pd.DataFrame) -> pd.DataFrame:
     在 ``clean_cross_sectional_features`` 之前：
 
     - （可选）按 ``ENABLE_PREV_GAIN_SUPPRESSION`` 剔除短期涨幅/动量透支；
-    - **始终**剔除前一交易日「放量长上影滞涨」形态（图2）。
+    - **始终**剔除前一交易日「冲高回落长上影诱多」形态；
+    - 绝对空头压制在 ``prepare_ranking_cross_section_pipeline`` 入口已先行剔除。
     """
     if feat_df is None or len(feat_df) == 0:
         return feat_df
@@ -565,8 +614,9 @@ def prepare_ranking_cross_section_pipeline(
         w["date"] = w["date"].astype(str).str[:10]
 
     w = attach_canonical_industry_labels(w)
+    w, _ = _drop_absolute_bear_trend_suppression(w)
     w = suppress_high_recent_gains(w)
-    w = penalize_volume_drift_trap_features(w)
+    w = apply_soft_low_turnover_penalty(w)
     w = assign_factor_size_mcap_from_mcap(w)
 
     if "factor_size_mcap" in w.columns:

@@ -277,29 +277,26 @@ MAX_PRICE = None  # 例如: 100.0
 MIN_MCAP = None  # 例如: 30.0 (低于30亿的微盘股不要)
 MAX_MCAP = None  # 例如: 500.0 (大于500亿的巨无霸不要)
 
-# 3. 股票热度范围（以前一交易日换手率 % 为硬门槛；无换手列时用 volume_ratio_raw 近似，阈值÷2）
-# 图1「无量冷门虚假脉冲」：默认强制 ≥2.0%，过滤流动性枯竭标的（可用 QUANT_MIN_TURNOVER 覆盖）
-MIN_TURNOVER_FLOOR = float(os.environ.get("QUANT_MIN_TURNOVER_FLOOR", "2.0"))
+# 3. 股票热度：硬淘汰下限 1.2%（保留截面分布）；低于 2.2% 走柔性因子惩罚（见 factor_calculator）
+MIN_TURNOVER_FLOOR = float(os.environ.get("QUANT_MIN_TURNOVER_FLOOR", "1.2"))
 MIN_TURNOVER = float(os.environ.get("QUANT_MIN_TURNOVER", str(MIN_TURNOVER_FLOOR)))
 MAX_TURNOVER = None  # 例如: 15.0 (过滤掉短期极度亢奋、换手过热的筹码松动股)
 
-# --- 纯日 K 形态防御（factor_calculator 与经验过滤共用，不依赖分时/Tick）---
-# 图2「高位放量长上影滞涨」：上影线占全日振幅比例、放量量比下限
-DAILY_K_UPPER_SHADOW_RATIO_MIN = float(
-    os.environ.get("QUANT_K_UPPER_SHADOW_RATIO", "0.45")
+# 柔性换手惩罚：前一交易日换手率 < 该值时，截面因子/得分 × 惩罚系数（非一刀切）
+SOFT_TURNOVER_PENALTY_PCT = float(
+    os.environ.get("QUANT_SOFT_TURNOVER_PENALTY_PCT", "2.2")
 )
-DAILY_K_UPPER_SHADOW_VOL_RATIO_MIN = float(
-    os.environ.get("QUANT_K_UPPER_SHADOW_VOL_RATIO", "1.5")
+SOFT_TURNOVER_PENALTY_MULT = float(
+    os.environ.get("QUANT_SOFT_TURNOVER_PENALTY_MULT", "0.3")
 )
-# 图1/图3「无量阴跌陷阱」：深负乖离 + 极度缩量量能位置 → 因子惩罚系数
-DAILY_K_DEEP_OVERSOLD_BIAS_5 = float(
-    os.environ.get("QUANT_K_DEEP_OVERSOLD_BIAS5", "-0.08")
+
+# --- 纯日 K 形态物理熔断（factor_calculator，不依赖分时/Tick）---
+# 高位冲高回落诱多：盘中冲高幅度 > 4% 且 上影线 > 实体 × 1.2（不看量比/换手）
+DAILY_K_SPIKE_VS_OPEN_MIN = float(
+    os.environ.get("QUANT_K_SPIKE_VS_OPEN", "0.04")
 )
-DAILY_K_DRY_VOLUME_POSITION = float(
-    os.environ.get("QUANT_K_DRY_VOL_POSITION", "-0.15")
-)
-DAILY_K_DRY_TRAP_FACTOR_PENALTY = float(
-    os.environ.get("QUANT_K_DRY_TRAP_PENALTY", "0.5")
+DAILY_K_UPPER_SHADOW_BODY_MULT = float(
+    os.environ.get("QUANT_K_UPPER_SHADOW_BODY", "1.2")
 )
 
 
