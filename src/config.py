@@ -306,6 +306,12 @@ MA5_SLOPE_DOWN_FACTOR_MULT = float(
 SINGLE_DAY_CRASH_PCT_THRESHOLD = float(
     os.environ.get("QUANT_SINGLE_DAY_CRASH_PCT", "-0.06")
 )
+# MA20/MA60 三日斜率 < 0 → 大级别左侧阴跌通道硬剔除
+MA_TREND_SLOPE_LOOKBACK_DAYS = max(
+    2, int(os.environ.get("QUANT_MA_TREND_SLOPE_DAYS", "3"))
+)
+# KDJ 绝对空头：锚定日 K < D（死叉区）或 J < 该值 → 短期惯性未扭转，硬剔除
+KDJ_BEARISH_J_MAX = float(os.environ.get("QUANT_KDJ_BEARISH_J_MAX", "15"))
 
 
 def get_experience_thresholds() -> tuple[

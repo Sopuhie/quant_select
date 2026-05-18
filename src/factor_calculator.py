@@ -15,12 +15,14 @@ import pandas as pd
 from .config import (
     DAILY_K_SPIKE_VS_OPEN_MIN,
     DAILY_K_UPPER_SHADOW_BODY_MULT,
-    MA5_SLOPE_DOWN_FACTOR_MULT,
     ENABLE_PREV_GAIN_SUPPRESSION,
     FACTOR_EWM_BLEND,
     FACTOR_EWM_HALFLIFE_DAYS,
     FEATURE_COLUMNS,
+    KDJ_BEARISH_J_MAX,
     LABEL_HORIZON_DAYS,
+    MA5_SLOPE_DOWN_FACTOR_MULT,
+    MA_TREND_SLOPE_LOOKBACK_DAYS,
     MAX_ALLOWED_20D_RETURN,
     MAX_ALLOWED_5D_RETURN,
     SOFT_TURNOVER_PENALTY_MULT,
@@ -607,6 +609,195 @@ def _resolve_turnover_pct_series(feat_df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.nan, index=feat_df.index)
 
 
+def _ma_slope_over_days(ma_series: pd.Series, *, days: int) -> float:
+    """
+    均线 ``days`` 日斜率：``(MA_t - MA_{t-days}) / days``。
+    需至少 ``days + 1`` 个有效 MA 点（与 ``_roll_ewm_blend`` 序列对齐）。
+    """
+    n = max(2, int(days))
+    if len(ma_series) < n + 1:
+        return float("nan")
+    s = pd.to_numeric(ma_series, errors="coerce").iloc[-(n + 1) :]
+    if s.isna().any():
+        return float("nan")
+    return float((s.iloc[-1] - s.iloc[0]) / n)
+
+
+def _kdj_last_from_ohlc(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+) -> tuple[float, float, float]:
+    """锚定日 KDJ（9,3,3 经典参数，与题材策略一致）。"""
+    h = pd.to_numeric(high, errors="coerce")
+    l_ = pd.to_numeric(low, errors="coerce")
+    c = pd.to_numeric(close, errors="coerce")
+    if len(c) < 9:
+        return float("nan"), float("nan"), float("nan")
+    low_min = l_.rolling(9, min_periods=9).min()
+    high_max = h.rolling(9, min_periods=9).max()
+    rsv = (c - low_min) / (high_max - low_min + 1e-6) * 100.0
+    k = rsv.ewm(com=2, adjust=False).mean()
+    d = k.ewm(com=2, adjust=False).mean()
+    j = 3.0 * k - 2.0 * d
+    if pd.isna(k.iloc[-1]) or pd.isna(d.iloc[-1]) or pd.isna(j.iloc[-1]):
+        return float("nan"), float("nan"), float("nan")
+    return float(k.iloc[-1]), float(d.iloc[-1]), float(j.iloc[-1])
+
+
+def _anchor_bar_morphology_metrics_on_keys(keys_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    批量计算锚定日：MA20/MA60 的 N 日斜率、KDJ(K,D,J)。
+    仅对去重 ``(stock_code, date)`` 查库，供训练/预测/回测共用。
+    """
+    if keys_df.empty or "stock_code" not in keys_df.columns or "date" not in keys_df.columns:
+        return keys_df.assign(
+            ma20_slope_3d=np.nan,
+            ma60_slope_3d=np.nan,
+            kdj_k=np.nan,
+            kdj_d=np.nan,
+            kdj_j=np.nan,
+        )
+    keys = keys_df[["stock_code", "date"]].drop_duplicates().copy()
+    keys["stock_code"] = keys["stock_code"].astype(str).str.zfill(6)
+    keys["date"] = keys["date"].astype(str).str[:10]
+    slope_days = int(MA_TREND_SLOPE_LOOKBACK_DAYS)
+    keys["ma20_slope_3d"] = np.nan
+    keys["ma60_slope_3d"] = np.nan
+    keys["kdj_k"] = np.nan
+    keys["kdj_d"] = np.nan
+    keys["kdj_j"] = np.nan
+    min_bars = max(65, slope_days + 25)
+    try:
+        from .config import DB_PATH
+        from .database import get_connection
+
+        for anchor, grp in keys.groupby("date", sort=False):
+            codes = grp["stock_code"].unique().tolist()
+            chunk_n = 200
+            with get_connection(DB_PATH) as conn:
+                for i in range(0, len(codes), chunk_n):
+                    chunk = codes[i : i + chunk_n]
+                    ph = ",".join(["?"] * len(chunk))
+                    bars = pd.read_sql_query(
+                        f"""
+                        SELECT stock_code, date, high, low, close
+                        FROM stock_daily_kline
+                        WHERE stock_code IN ({ph}) AND date <= ?
+                        ORDER BY stock_code, date
+                        """,
+                        conn,
+                        params=[*chunk, anchor],
+                    )
+                    if bars.empty:
+                        continue
+                    bars["stock_code"] = bars["stock_code"].astype(str).str.zfill(6)
+                    for code, g in bars.groupby("stock_code", sort=False):
+                        g = g.sort_values("date").tail(min_bars)
+                        if len(g) < 9:
+                            continue
+                        close = pd.to_numeric(g["close"], errors="coerce").reset_index(
+                            drop=True
+                        )
+                        high = pd.to_numeric(g["high"], errors="coerce").reset_index(
+                            drop=True
+                        )
+                        low = pd.to_numeric(g["low"], errors="coerce").reset_index(
+                            drop=True
+                        )
+                        if close.isna().all():
+                            continue
+                        ma20 = _roll_ewm_blend(close, 20)
+                        ma60 = _roll_ewm_blend(close, 60)
+                        s20 = _ma_slope_over_days(ma20, days=slope_days)
+                        s60 = _ma_slope_over_days(ma60, days=slope_days)
+                        k_v, d_v, j_v = _kdj_last_from_ohlc(high, low, close)
+                        sel = (keys["date"] == anchor) & (keys["stock_code"] == code)
+                        if not sel.any():
+                            continue
+                        keys.loc[sel, "ma20_slope_3d"] = s20
+                        keys.loc[sel, "ma60_slope_3d"] = s60
+                        keys.loc[sel, "kdj_k"] = k_v
+                        keys.loc[sel, "kdj_d"] = d_v
+                        keys.loc[sel, "kdj_j"] = j_v
+    except Exception as exc:
+        print(f"[警告] MA 斜率/KDJ 形态指标批量计算失败: {exc}", flush=True)
+    return keys
+
+
+def _merge_morphology_metrics_onto_panel(
+    feat_df: pd.DataFrame,
+    *,
+    date_col: str = "date",
+) -> pd.DataFrame:
+    """将 ``_anchor_bar_morphology_metrics_on_keys`` 结果 left-merge 回截面面板。"""
+    if feat_df.empty or "stock_code" not in feat_df.columns:
+        return feat_df
+    dc = date_col if date_col in feat_df.columns else "trade_date"
+    if dc not in feat_df.columns:
+        return feat_df
+    w = feat_df.copy()
+    keys = (
+        w[["stock_code", dc]]
+        .drop_duplicates()
+        .rename(columns={dc: "date"})
+        .assign(stock_code=lambda x: x["stock_code"].astype(str).str.zfill(6))
+    )
+    keys["date"] = keys["date"].astype(str).str[:10]
+    metrics = _anchor_bar_morphology_metrics_on_keys(keys)
+    w["_merge_d"] = w[dc].astype(str).str[:10]
+    w["_code6"] = w["stock_code"].astype(str).str.zfill(6)
+    merged = w.merge(
+        metrics,
+        left_on=["_code6", "_merge_d"],
+        right_on=["stock_code", "date"],
+        how="left",
+        suffixes=("", "_morph"),
+    )
+    drop_cols = ["_merge_d", "_code6"]
+    for c in merged.columns:
+        if c.endswith("_morph") or c in ("stock_code_y", "date_y"):
+            drop_cols.append(c)
+    return merged.drop(columns=drop_cols, errors="ignore")
+
+
+def _drop_morphology_ma_slope_and_kdj(feat_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    终极形态学阻断（训练/预测/回测共用）：
+
+    - MA20 或 MA60 的 N 日斜率 < 0 → 左侧阴跌通道 Drop；
+    - 锚定日 K < D 或 J < 15 → KDJ 绝对空头 Drop。
+    """
+    if feat_df is None or feat_df.empty:
+        return feat_df, 0
+    m = _merge_morphology_metrics_onto_panel(feat_df)
+    s20 = pd.to_numeric(m.get("ma20_slope_3d"), errors="coerce")
+    s60 = pd.to_numeric(m.get("ma60_slope_3d"), errors="coerce")
+    k = pd.to_numeric(m.get("kdj_k"), errors="coerce")
+    d = pd.to_numeric(m.get("kdj_d"), errors="coerce")
+    j = pd.to_numeric(m.get("kdj_j"), errors="coerce")
+    j_max = float(KDJ_BEARISH_J_MAX)
+    ma_trap = (s20.notna() & (s20 < 0)) | (s60.notna() & (s60 < 0))
+    kdj_valid = k.notna() & d.notna() & j.notna()
+    kdj_trap = kdj_valid & ((k < d) | (j < j_max))
+    trap = ma_trap | kdj_trap
+    if not trap.any():
+        return feat_df, 0
+    n_ma = int(ma_trap.sum())
+    n_kdj = int(
+        (k.notna() & d.notna() & j.notna() & ((k < d) | (j < j_max))).sum()
+    )
+    n_drop = int(trap.sum())
+    out = feat_df.loc[~trap.to_numpy()].reset_index(drop=True)
+    print(
+        f"[风控增强] 形态学阻断：共剔除 {n_drop} 只"
+        f"（MA{int(MA_TREND_SLOPE_LOOKBACK_DAYS)}日斜率向下 {n_ma}，"
+        f"KDJ空头 K<D 或 J<{j_max:.0f} {n_kdj}）",
+        flush=True,
+    )
+    return out, n_drop
+
+
 def _ma5_slope_down_on_keys(keys_df: pd.DataFrame) -> pd.DataFrame:
     """
     对去重后的 ``(stock_code, date)`` 键计算 MA5 是否较前一日下行。
@@ -790,6 +981,7 @@ def prepare_ranking_cross_section_pipeline(
     w = attach_canonical_industry_labels(w)
     w, _ = _drop_midterm_absolute_bear_trend(w)
     w, _ = _drop_absolute_bear_trend_suppression(w)
+    w, _ = _drop_morphology_ma_slope_and_kdj(w)
     w = suppress_high_recent_gains(w)
     w = apply_soft_low_turnover_penalty(w)
     w = apply_ma5_slope_down_penalty(w)
