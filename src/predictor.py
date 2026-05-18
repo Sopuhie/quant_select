@@ -21,6 +21,7 @@ from .config import (
     MODEL_PATH,
     NEAR_LIMIT_PCT_THRESHOLD,
     PREDICT_FETCH_WORKERS,
+    SINGLE_DAY_CRASH_PCT_THRESHOLD,
     TOP_N_SELECTION,
     get_experience_thresholds,
 )
@@ -399,6 +400,22 @@ def select_top_n_with_industry_cap(
             continue
         code = str(row.get("stock_code", "")).strip().zfill(6)
         name = str(row.get("stock_name") or "").strip()
+        if _row_single_day_crash(row):
+            if code in prelim_codes:
+                print(
+                    f"[风控拒绝] 股票 {code} 前一交易日暴跌≤"
+                    f"{SINGLE_DAY_CRASH_PCT_THRESHOLD:.0%}，顺位递补",
+                    flush=True,
+                )
+            continue
+        if _row_midterm_bear_breakdown(row):
+            if code in prelim_codes:
+                print(
+                    f"[风控拒绝] 股票 {code} 中长期空头破位压制（低于 MA20/MA60 且均线向下），"
+                    "顺位递补",
+                    flush=True,
+                )
+            continue
         if as_of_date:
             hit, detail = is_high_volume_price_stagnation(code, as_of_date)
             if hit:
@@ -752,6 +769,68 @@ def is_major_trend_breakdown(
     return bool(close < ma20 and close < ma60 and ma20 < ma60)
 
 
+def is_midterm_bear_breakdown(
+    close: float,
+    ma20: float,
+    ma60: float,
+    *,
+    ma20_slope_down: bool | None = None,
+) -> bool:
+    """
+    中长期空头破位压制：收盘低于 MA20/MA60、空头排列，且 MA20 较前一日下行（均线朝下）。
+    """
+    if not is_major_trend_breakdown(close, ma20, ma60):
+        return False
+    if ma20_slope_down is False:
+        return False
+    return True
+
+
+def _row_midterm_bear_breakdown(row: Any) -> bool:
+    """从打分/选股行判定是否触发中长期空头破位（用于 continue 硬拦截）。"""
+    try:
+        cp = float(row.get("close_price") if hasattr(row, "get") else row["close_price"])
+    except (TypeError, ValueError, KeyError):
+        cp = float("nan")
+    try:
+        r20 = float(row.get("raw_ma20") if hasattr(row, "get") else row["raw_ma20"])
+        r60 = float(row.get("raw_ma60") if hasattr(row, "get") else row["raw_ma60"])
+    except (TypeError, ValueError, KeyError):
+        r20 = r60 = float("nan")
+    if all(np.isfinite(x) for x in (cp, r20, r60)):
+        md_raw = row.get("ma20_slope_down") if hasattr(row, "get") else None
+        ma20_down = None if md_raw is None else bool(md_raw)
+        return is_midterm_bear_breakdown(cp, r20, r60, ma20_slope_down=ma20_down)
+    if not all(np.isfinite(x) for x in (cp,)):
+        return False
+    b20 = pd.to_numeric(
+        row.get("factor_bias_20") if hasattr(row, "get") else row.get("factor_bias_20"),
+        errors="coerce",
+    )
+    b60 = pd.to_numeric(
+        row.get("factor_bias_60") if hasattr(row, "get") else row.get("factor_bias_60"),
+        errors="coerce",
+    )
+    if pd.notna(b20) and pd.notna(b60) and float(b20) < 0 and float(b60) < 0:
+        m20, m60 = infer_ma_from_close_bias(cp, float(b20), float(b60))
+        return is_midterm_bear_breakdown(cp, m20, m60, ma20_slope_down=None)
+    return False
+
+
+def _row_single_day_crash(row: Any) -> bool:
+    """前一交易日收盘跌幅 ≤ 阈值（默认 -6%）。"""
+    thresh = float(SINGLE_DAY_CRASH_PCT_THRESHOLD)
+    for key in ("pct_prev_day", "factor_return_1d"):
+        try:
+            raw = row.get(key) if hasattr(row, "get") else row[key]
+        except (TypeError, ValueError, KeyError):
+            continue
+        p = pd.to_numeric(raw, errors="coerce")
+        if pd.notna(p) and float(p) <= thresh:
+            return True
+    return False
+
+
 def attach_raw_ma_from_bias_fallback(feat_df: pd.DataFrame) -> pd.DataFrame:
     """缺 ``raw_ma20``/``raw_ma60`` 时，由未截面清洗前的乖离率倒推（兜底）。"""
     if feat_df is None or feat_df.empty:
@@ -781,34 +860,46 @@ def attach_raw_ma_from_bias_fallback(feat_df: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
-def filter_downtrend_breakdown_hard(feat_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    大趋势全面破位一票否决（策略层绝对数值过滤，不参与模型 predict）。
-
-    条件：close < raw_ma20 且 close < raw_ma60 且 raw_ma20 < raw_ma60。
-    ``raw_ma20``/``raw_ma60`` 由 ``_fetch_one_stock_features`` 从原始 K 线写入，非 FEATURE_COLUMNS。
-    """
+def filter_single_day_crash_hard(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """单日暴跌硬熔断：前一交易日跌幅 ≤ SINGLE_DAY_CRASH_PCT_THRESHOLD（默认 -6%）。"""
     if feat_df is None or feat_df.empty:
         return feat_df
-    if "raw_ma20" not in feat_df.columns or "raw_ma60" not in feat_df.columns:
+    work = feat_df.copy()
+    before = len(work)
+    crash_mask = work.apply(_row_single_day_crash, axis=1)
+    out = work.loc[~crash_mask].reset_index(drop=True)
+    n_drop = before - len(out)
+    if n_drop > 0:
+        print(
+            f"[风控拒绝] 单日暴跌硬熔断：剔除前一交易日跌幅≤"
+            f"{SINGLE_DAY_CRASH_PCT_THRESHOLD:.0%} 的标的 {n_drop} 只",
+            flush=True,
+        )
+    return out
+
+
+def filter_downtrend_breakdown_hard(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    中长期空头破位一票否决（打分前物理 Drop，非仅诊股 violated 提示）。
+
+    条件：收盘 < MA20 且 < MA60、MA20 < MA60，且 MA20 较前一日下行（若可算）。
+  ``raw_ma20``/``raw_ma60`` 须由拉 K 线阶段写入；缺失时由未清洗乖离率倒推兜底。
+    """
+    if feat_df is None or feat_df.empty:
         return feat_df
     if "close_price" not in feat_df.columns:
         return feat_df
 
     work = attach_raw_ma_from_bias_fallback(feat_df.copy())
     before_count = len(work)
-    cp = pd.to_numeric(work["close_price"], errors="coerce")
-    r20 = pd.to_numeric(work["raw_ma20"], errors="coerce")
-    r60 = pd.to_numeric(work["raw_ma60"], errors="coerce")
-
-    valid = cp.notna() & r20.notna() & r60.notna()
-    downtrend_mask = valid & (cp < r20) & (cp < r60) & (r20 < r60)
-    out = work.loc[~downtrend_mask].reset_index(drop=True)
+    drop_mask = work.apply(_row_midterm_bear_breakdown, axis=1)
+    out = work.loc[~drop_mask].reset_index(drop=True)
 
     n_drop = before_count - len(out)
     if n_drop > 0:
         print(
-            f"[趋势硬风控] 已强行一票否决中长期大趋势全面破位、处于空头阴跌通道的股票 {n_drop} 只。",
+            f"[趋势硬风控] 已强行一票否决中长期空头破位压制（低于 MA20/MA60 且均线空头向下）"
+            f" {n_drop} 只。",
             flush=True,
         )
     if len(out) == 0 and before_count > 0:
@@ -822,6 +913,13 @@ def filter_downtrend_breakdown_hard(feat_df: pd.DataFrame) -> pd.DataFrame:
             "将按实际数量继续打分/入库。",
             flush=True,
         )
+    return out
+
+
+def apply_pre_score_hard_risk_filters(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """打分 / 截面清洗前：单日暴跌熔断 + 中长期空头破位硬剔除。"""
+    out = filter_single_day_crash_hard(feat_df)
+    out = filter_downtrend_breakdown_hard(out)
     return out
 
 
@@ -1129,6 +1227,10 @@ def _fetch_one_stock_features(
     ma60_last = ma60.iloc[-1]
     row["raw_ma20"] = float(ma20_last) if pd.notna(ma20_last) else float("nan")
     row["raw_ma60"] = float(ma60_last) if pd.notna(ma60_last) else float("nan")
+    if len(ma20) >= 2 and pd.notna(ma20.iloc[-1]) and pd.notna(ma20.iloc[-2]):
+        row["ma20_slope_down"] = bool(float(ma20.iloc[-1]) < float(ma20.iloc[-2]))
+    else:
+        row["ma20_slope_down"] = False
     return row
 
 
@@ -1228,6 +1330,12 @@ def predict_universe_scores(
     if feat_df.empty:
         raise RuntimeError("剔除停牌或锚定日零成交量标的后样本为空。")
 
+    feat_df = apply_pre_score_hard_risk_filters(feat_df)
+    if feat_df.empty:
+        raise RuntimeError(
+            "单日暴跌或中长期空头破位硬风控后无可用股票，请扩大股票池。"
+        )
+
     feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
     _log_predict_bias_feature_stats(feat_df)
     if feat_df.empty:
@@ -1241,12 +1349,6 @@ def predict_universe_scores(
         feat_df = filter_st_stocks(feat_df)
     if feat_df.empty:
         raise RuntimeError("经 ST/涨跌停过滤后无可用股票，请检查股票池或关闭部分过滤开关。")
-
-    feat_df = filter_downtrend_breakdown_hard(feat_df)
-    if feat_df.empty:
-        raise RuntimeError(
-            "趋势硬风控（中长期大趋势全面破位）后无可用股票，请扩大股票池或检查行情。"
-        )
 
     cat_model = load_catboost_ranker_optional()
     X = feat_df[list(FEATURE_COLUMNS)].astype(np.float64)
@@ -1324,14 +1426,6 @@ def persist_predictions(
         scores_df = filter_st_stocks(scores_df)
     if scores_df.empty:
         raise RuntimeError("写入前过滤结果为空，无法保存预测与选股。")
-    scores_df = filter_downtrend_breakdown_hard(scores_df)
-    if scores_df.empty:
-        print(
-            "[警告] 趋势硬风控后无剩余股票，无法写入 Top N；"
-            "请检查当日行情或上游预测结果。",
-            flush=True,
-        )
-        return
     scores_df = scores_df.sort_values("score", ascending=False).reset_index(drop=True)
     scores_df = apply_experience_trading_filters(scores_df)
     if scores_df.empty:

@@ -37,6 +37,7 @@ from src.config import (
     MODEL_PATH,
     PREDICT_FETCH_WORKERS,
     STOCK_POOL,
+    SINGLE_DAY_CRASH_PCT_THRESHOLD,
     TOP_N_SELECTION,
 )
 from src.data_fetcher import get_stock_pool
@@ -54,6 +55,7 @@ from src.database import (
 from src.dingtalk_notifier import maybe_push_daily_selections
 from src.market_regime import compute_market_regime_score
 from src.factor_calculator import (
+    _roll_ewm_blend,
     compute_factors_for_history,
     normalize_industry_label,
     prepare_ranking_cross_section_pipeline,
@@ -68,7 +70,10 @@ from src.predictor import (
     analyze_stock_reasons,
     apply_experience_trading_filters,
     apply_buy_execution_safety_filters,
+    apply_pre_score_hard_risk_filters,
     apply_volume_stagnation_experience_filter,
+    _row_midterm_bear_breakdown,
+    _row_single_day_crash,
     is_high_volume_price_stagnation,
     blend_ranker_scores_with_optional_meta,
     feature_importances_aligned,
@@ -249,6 +254,20 @@ def _fetch_one_predict_row(
         row_dict["pct_prev_day"] = (c_now / c_prev - 1.0) if c_prev > 0 else 0.0
     else:
         row_dict["pct_prev_day"] = 0.0
+
+    close_hist = df_today["close"].astype(float)
+    ma20 = _roll_ewm_blend(close_hist, 20)
+    ma60 = _roll_ewm_blend(close_hist, 60)
+    ma20_last = ma20.iloc[-1]
+    ma60_last = ma60.iloc[-1]
+    row_dict["raw_ma20"] = float(ma20_last) if pd.notna(ma20_last) else float("nan")
+    row_dict["raw_ma60"] = float(ma60_last) if pd.notna(ma60_last) else float("nan")
+    if len(ma20) >= 2 and pd.notna(ma20.iloc[-1]) and pd.notna(ma20.iloc[-2]):
+        row_dict["ma20_slope_down"] = bool(
+            float(ma20.iloc[-1]) < float(ma20.iloc[-2])
+        )
+    else:
+        row_dict["ma20_slope_down"] = False
 
     row_dict["volume"] = last_vol
     return row_dict
@@ -495,6 +514,13 @@ def predict_daily(
         print("警告: 剔除停牌或零成交量标的后没有剩余的候选股票。")
         sys.exit(1)
 
+    feat_df = apply_pre_score_hard_risk_filters(feat_df)
+    if feat_df.empty:
+        print(
+            "警告: 单日暴跌或中长期空头破位硬风控后没有剩余的候选股票。"
+        )
+        sys.exit(1)
+
     feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
     _log_predict_bias_feature_stats(feat_df)
     if feat_df.empty:
@@ -619,6 +645,19 @@ def predict_daily(
     selection_rows: list[dict[str, object]] = []
     for _, row in selections.iterrows():
         code = _normalize_stock_code(str(row["stock_code"]))
+        if _row_single_day_crash(row):
+            print(
+                f"[风控拒绝] 股票 {code} 前一交易日暴跌≤"
+                f"{SINGLE_DAY_CRASH_PCT_THRESHOLD:.0%}，写库前复核剔除",
+                flush=True,
+            )
+            continue
+        if _row_midterm_bear_breakdown(row):
+            print(
+                f"[风控拒绝] 股票 {code} 中长期空头破位，写库前复核剔除",
+                flush=True,
+            )
+            continue
         stag_hit, stag_detail = is_high_volume_price_stagnation(
             code, str(anchor_td)[:10]
         )

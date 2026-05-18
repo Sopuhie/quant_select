@@ -302,6 +302,10 @@ DAILY_K_UPPER_SHADOW_BODY_MULT = float(
 MA5_SLOPE_DOWN_FACTOR_MULT = float(
     os.environ.get("QUANT_MA5_SLOPE_DOWN_PENALTY", "0.4")
 )
+# 前一交易日收盘跌幅 ≤ 该值（如 -6%）→ 单日暴跌硬熔断，不接破位飞刀
+SINGLE_DAY_CRASH_PCT_THRESHOLD = float(
+    os.environ.get("QUANT_SINGLE_DAY_CRASH_PCT", "-0.06")
+)
 
 
 def get_experience_thresholds() -> tuple[
