@@ -298,6 +298,10 @@ DAILY_K_SPIKE_VS_OPEN_MIN = float(
 DAILY_K_UPPER_SHADOW_BODY_MULT = float(
     os.environ.get("QUANT_K_UPPER_SHADOW_BODY", "1.2")
 )
+# 5 日均线向下拐头：截面因子重度惩罚（左侧阴跌反弹绕 MA5 时用）
+MA5_SLOPE_DOWN_FACTOR_MULT = float(
+    os.environ.get("QUANT_MA5_SLOPE_DOWN_PENALTY", "0.4")
+)
 
 
 def get_experience_thresholds() -> tuple[

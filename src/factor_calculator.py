@@ -15,6 +15,7 @@ import pandas as pd
 from .config import (
     DAILY_K_SPIKE_VS_OPEN_MIN,
     DAILY_K_UPPER_SHADOW_BODY_MULT,
+    MA5_SLOPE_DOWN_FACTOR_MULT,
     ENABLE_PREV_GAIN_SUPPRESSION,
     FACTOR_EWM_BLEND,
     FACTOR_EWM_HALFLIFE_DAYS,
@@ -376,26 +377,43 @@ def attach_anchor_bar_ohlc(
     if pairs.empty:
         return w
     try:
-        import sqlite3
-
         from .config import DB_PATH
+        from .database import get_connection
 
         ohlc_chunks: list[pd.DataFrame] = []
         chunk_n = 400
-        with sqlite3.connect(str(DB_PATH)) as conn:
-            for i in range(0, len(pairs), chunk_n):
-                sub = pairs.iloc[i : i + chunk_n]
-                ph = ",".join(["(?,?)"] * len(sub))
-                params: list[str] = []
-                for _, r in sub.iterrows():
-                    params.extend([r["stock_code"], r["date"]])
-                sql = f"""
+        key_rows = [
+            (str(r["stock_code"]).strip().zfill(6), str(r["date"]).strip()[:10])
+            for _, r in pairs.iterrows()
+        ]
+        with get_connection(DB_PATH) as conn:
+            for i in range(0, len(key_rows), chunk_n):
+                sub_keys = key_rows[i : i + chunk_n]
+                conn.execute("DROP TABLE IF EXISTS _feat_ohlc_keys")
+                conn.execute(
+                    """
+                    CREATE TEMP TABLE _feat_ohlc_keys (
+                        stock_code TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        PRIMARY KEY (stock_code, date)
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO _feat_ohlc_keys (stock_code, date) "
+                    "VALUES (?, ?)",
+                    sub_keys,
+                )
+                conn.commit()
+                part = pd.read_sql_query(
+                    """
                     SELECT k.stock_code, k.date, k.open, k.high, k.low, k.close, k.volume
                     FROM stock_daily_kline k
-                    INNER JOIN (VALUES {ph}) AS v(code, d)
-                      ON k.stock_code = v.code AND k.date = v.d
-                """
-                part = pd.read_sql_query(sql, conn, params=params)
+                    INNER JOIN _feat_ohlc_keys v
+                      ON k.stock_code = v.stock_code AND k.date = v.date
+                    """,
+                    conn,
+                )
                 if not part.empty:
                     ohlc_chunks.append(part)
         if not ohlc_chunks:
@@ -435,22 +453,50 @@ def _resolve_anchor_close_series(feat_df: pd.DataFrame) -> pd.Series:
 
 def _absolute_bear_trend_trap_mask(feat_df: pd.DataFrame) -> pd.Series:
     """
-    绝对空头压制：收盘价同时低于 MA5 与 MA10（由乖离率倒推均线）。
+    绝对空头压制：收盘同时低于 MA5 与 MA10。
+    等价于 ``factor_bias_5 < 0`` 且 ``factor_bias_10 < 0``（无需批量查 OHLC）。
     """
     if feat_df.empty:
         return pd.Series(False, index=feat_df.index)
     need = ("factor_bias_5", "factor_bias_10")
     if not all(c in feat_df.columns for c in need):
         return pd.Series(False, index=feat_df.index)
-    close = _resolve_anchor_close_series(feat_df)
     bias5 = pd.to_numeric(feat_df["factor_bias_5"], errors="coerce")
     bias10 = pd.to_numeric(feat_df["factor_bias_10"], errors="coerce")
-    eps = 1e-12
-    ma5 = close / (bias5 + 1.0 + eps)
-    ma10 = close / (bias10 + 1.0 + eps)
-    valid = close.notna() & ma5.notna() & ma10.notna() & (ma5 > 0) & (ma10 > 0)
-    bear = valid & (close < ma5) & (close < ma10)
+    bear = bias5.notna() & bias10.notna() & (bias5 < 0) & (bias10 < 0)
     return bear.fillna(False)
+
+
+def _midterm_absolute_bear_trap_mask(feat_df: pd.DataFrame) -> pd.Series:
+    """
+    中线绝对空头：收盘同时低于 MA20 与 MA60。
+    等价于 ``factor_bias_20 < 0`` 且 ``factor_bias_60 < 0``；拦截反弹仍压在均线下的阴跌飞刀。
+    """
+    if feat_df.empty:
+        return pd.Series(False, index=feat_df.index)
+    need = ("factor_bias_20", "factor_bias_60")
+    if not all(c in feat_df.columns for c in need):
+        return pd.Series(False, index=feat_df.index)
+    bias20 = pd.to_numeric(feat_df["factor_bias_20"], errors="coerce")
+    bias60 = pd.to_numeric(feat_df["factor_bias_60"], errors="coerce")
+    bear = bias20.notna() & bias60.notna() & (bias20 < 0) & (bias60 < 0)
+    return bear.fillna(False)
+
+
+def _drop_midterm_absolute_bear_trend(feat_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """剔除中线绝对空头（收盘<MA20 且 <MA60）。"""
+    if feat_df is None or feat_df.empty:
+        return feat_df, 0
+    trap = _midterm_absolute_bear_trap_mask(feat_df)
+    if not trap.any():
+        return feat_df, 0
+    n_drop = int(trap.sum())
+    out = feat_df.loc[~trap].reset_index(drop=True)
+    print(
+        f"[风控增强] 已剔除中线绝对空头（收盘<MA20且<MA60）{n_drop} 只",
+        flush=True,
+    )
+    return out, n_drop
 
 
 def _drop_absolute_bear_trend_suppression(feat_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -504,15 +550,39 @@ def _long_upper_shadow_trap_mask(
 
 
 def _drop_high_volume_long_upper_shadow(feat_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """剔除触发「冲高回落长上影诱多」物理熔断的截面行。"""
+    """剔除触发「冲高回落长上影诱多」物理熔断的截面行（仅对去重后的键查 OHLC）。"""
     if feat_df is None or feat_df.empty:
         return feat_df, 0
-    w = attach_anchor_bar_ohlc(feat_df)
-    trap = _long_upper_shadow_trap_mask(w)
-    if not trap.any():
+    if "stock_code" not in feat_df.columns:
         return feat_df, 0
-    n_drop = int(trap.sum())
-    out = feat_df.loc[~trap].reset_index(drop=True)
+    dc = "date" if "date" in feat_df.columns else "trade_date"
+    if dc not in feat_df.columns:
+        return feat_df, 0
+    keys = (
+        feat_df[["stock_code", dc]]
+        .drop_duplicates()
+        .rename(columns={dc: "date"})
+        .assign(stock_code=lambda x: x["stock_code"].astype(str).str.zfill(6))
+    )
+    keys["date"] = keys["date"].astype(str).str[:10]
+    w = attach_anchor_bar_ohlc(keys, date_col="date")
+    trap_on_keys = _long_upper_shadow_trap_mask(w)
+    if not trap_on_keys.any():
+        return feat_df, 0
+    trap_keys = w.loc[trap_on_keys, ["stock_code", "date"]].copy()
+    trap_keys["_kline_trap"] = 1
+    merged = feat_df.copy()
+    merged["_merge_d"] = merged[dc].astype(str).str[:10]
+    merged["_code6"] = merged["stock_code"].astype(str).str.zfill(6)
+    hit = merged.merge(
+        trap_keys.rename(columns={"date": "_merge_d"}),
+        left_on=["_code6", "_merge_d"],
+        right_on=["stock_code", "_merge_d"],
+        how="left",
+    )
+    drop_mask = hit["_kline_trap"].notna()
+    n_drop = int(drop_mask.sum())
+    out = feat_df.loc[~drop_mask.to_numpy()].reset_index(drop=True)
     print(
         "[风控增强] 已剔除高位冲高回落诱多骗线 "
         f"{n_drop} 只（冲高>{DAILY_K_SPIKE_VS_OPEN_MIN:.1%} 且 "
@@ -535,6 +605,110 @@ def _resolve_turnover_pct_series(feat_df: pd.DataFrame) -> pd.Series:
     if "factor_volume_ratio" in feat_df.columns:
         return pd.to_numeric(feat_df["factor_volume_ratio"], errors="coerce") * 2.0
     return pd.Series(np.nan, index=feat_df.index)
+
+
+def _ma5_slope_down_on_keys(keys_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    对去重后的 ``(stock_code, date)`` 键计算 MA5 是否较前一日下行。
+    返回带 ``ma5_slope_down`` 布尔列的 DataFrame（训练百万行面板时避免全表逐行查库）。
+    """
+    if keys_df.empty or "stock_code" not in keys_df.columns or "date" not in keys_df.columns:
+        return keys_df.assign(ma5_slope_down=False)
+    keys = keys_df[["stock_code", "date"]].drop_duplicates().copy()
+    keys["stock_code"] = keys["stock_code"].astype(str).str.zfill(6)
+    keys["date"] = keys["date"].astype(str).str[:10]
+    keys["ma5_slope_down"] = False
+    try:
+        from .config import DB_PATH
+        from .database import get_connection
+
+        for anchor, grp in keys.groupby("date", sort=False):
+            codes = grp["stock_code"].unique().tolist()
+            chunk_n = 200
+            with get_connection(DB_PATH) as conn:
+                for i in range(0, len(codes), chunk_n):
+                    chunk = codes[i : i + chunk_n]
+                    ph = ",".join(["?"] * len(chunk))
+                    bars = pd.read_sql_query(
+                        f"""
+                        SELECT stock_code, date, close
+                        FROM stock_daily_kline
+                        WHERE stock_code IN ({ph}) AND date <= ?
+                        ORDER BY stock_code, date
+                        """,
+                        conn,
+                        params=[*chunk, anchor],
+                    )
+                    if bars.empty:
+                        continue
+                    bars["stock_code"] = bars["stock_code"].astype(str).str.zfill(6)
+                    down_codes: list[str] = []
+                    for code, g in bars.groupby("stock_code", sort=False):
+                        g = g.sort_values("date").tail(12)
+                        if len(g) < 6:
+                            continue
+                        close = pd.to_numeric(g["close"], errors="coerce").reset_index(
+                            drop=True
+                        )
+                        if close.isna().all():
+                            continue
+                        ma5 = _roll_ewm_blend(close, 5)
+                        if len(ma5) < 2:
+                            continue
+                        m_now = float(ma5.iloc[-1])
+                        m_prev = float(ma5.iloc[-2])
+                        if np.isfinite(m_now) and np.isfinite(m_prev) and m_now < m_prev:
+                            down_codes.append(code)
+                    if down_codes:
+                        sel = (keys["date"] == anchor) & keys["stock_code"].isin(down_codes)
+                        keys.loc[sel, "ma5_slope_down"] = True
+    except Exception as exc:
+        print(f"[警告] MA5 斜率下行判定失败: {exc}", flush=True)
+    return keys
+
+
+def apply_ma5_slope_down_penalty(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """5 日均线向下拐头：13 维因子 × 重度惩罚系数（默认 0.4）。"""
+    if feat_df is None or feat_df.empty:
+        return feat_df
+    if "stock_code" not in feat_df.columns:
+        return feat_df
+    dc = "date" if "date" in feat_df.columns else "trade_date"
+    if dc not in feat_df.columns:
+        return feat_df
+    w = feat_df.copy()
+    keys = (
+        w[["stock_code", dc]]
+        .drop_duplicates()
+        .rename(columns={dc: "date"})
+        .assign(stock_code=lambda x: x["stock_code"].astype(str).str.zfill(6))
+    )
+    keys["date"] = keys["date"].astype(str).str[:10]
+    flagged = _ma5_slope_down_on_keys(keys)
+    merged = w.copy()
+    merged["_merge_d"] = merged[dc].astype(str).str[:10]
+    merged["_code6"] = merged["stock_code"].astype(str).str.zfill(6)
+    merged = merged.merge(
+        flagged,
+        left_on=["_code6", "_merge_d"],
+        right_on=["stock_code", "date"],
+        how="left",
+    )
+    down_mask = merged["ma5_slope_down"].fillna(False).astype(bool).to_numpy()
+    n_down = int(down_mask.sum())
+    if n_down <= 0:
+        return w
+    pen = max(0.0, min(1.0, float(MA5_SLOPE_DOWN_FACTOR_MULT)))
+    for col in FEATURE_COLUMNS:
+        if col in w.columns:
+            w.loc[down_mask, col] = (
+                pd.to_numeric(w.loc[down_mask, col], errors="coerce") * pen
+            )
+    print(
+        f"[风控增强] MA5 均线向下拐头惩罚：{n_down} 只 ×{pen:.2f}",
+        flush=True,
+    )
+    return w
 
 
 def apply_soft_low_turnover_penalty(feat_df: pd.DataFrame) -> pd.DataFrame:
@@ -614,9 +788,11 @@ def prepare_ranking_cross_section_pipeline(
         w["date"] = w["date"].astype(str).str[:10]
 
     w = attach_canonical_industry_labels(w)
+    w, _ = _drop_midterm_absolute_bear_trend(w)
     w, _ = _drop_absolute_bear_trend_suppression(w)
     w = suppress_high_recent_gains(w)
     w = apply_soft_low_turnover_penalty(w)
+    w = apply_ma5_slope_down_penalty(w)
     w = assign_factor_size_mcap_from_mcap(w)
 
     if "factor_size_mcap" in w.columns:
