@@ -495,6 +495,9 @@ def _feature_dict_as_of(
     sub = hist[hist["date"] <= as_of_date].reset_index(drop=True)
     if len(sub) < MIN_HISTORY_BARS:
         return None
+    from src.panel_enrichment import enrich_ohlcv_history
+
+    sub = enrich_ohlcv_history(sub, stock_code=code)
     fac = compute_factors_for_history(sub)
     if fac.empty:
         return None

@@ -1150,8 +1150,11 @@ def latest_feature_row(
 ) -> Optional[pd.Series]:
     if df.empty or len(df) < 30:
         return None
-    _ = stock_code
     code6 = str(stock_code).strip().zfill(6) if stock_code else ""
+    from .panel_enrichment import enrich_ohlcv_history
+
+    if code6:
+        df = enrich_ohlcv_history(df, stock_code=code6)
     fac = compute_factors_for_history(df)
     if fac.empty:
         return None
@@ -1174,13 +1177,16 @@ def _fetch_one_stock_features(
     mcap_by_code: dict[str, float] | None,
 ) -> Optional[dict[str, Any]]:
     """仅拉数据算因子；在主线程里统一 predict，避免多线程共用模型。"""
+    code6 = str(code).strip().zfill(6)
     hist = fetch_daily_hist(code, start_date=start_compact, timeout=timeout)
     if not has_enough_history(hist):
         return None
+    from .panel_enrichment import enrich_ohlcv_history
+
+    hist = enrich_ohlcv_history(hist, stock_code=code6)
     last_vol = float(pd.to_numeric(hist.iloc[-1]["volume"], errors="coerce") or 0.0)
     if not np.isfinite(last_vol) or last_vol <= 0:
         return None
-    code6 = str(code).strip().zfill(6)
     mc = (mcap_by_code or {}).get(code6)
     if mc is not None and np.isfinite(mc) and mc > 0:
         hist = hist.copy()
@@ -1640,6 +1646,9 @@ def diagnose_single_stock(
             "warning",
         )
 
+    from .panel_enrichment import enrich_ohlcv_history
+
+    df_hist = enrich_ohlcv_history(df_hist, stock_code=code6)
     factors = compute_factors_for_history(df_hist)
     if factors.empty:
         return None, "因子计算结果为空。", "error"

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import akshare as ak
+import numpy as np
 import pandas as pd
 
 from .config import (
@@ -174,7 +175,7 @@ def _fetch_daily_hist_baostock(
 
 
 def _finalize_hist_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """统一数值列与日期格式。"""
+    """统一数值列与日期格式；保留 ``turnover_rate``（换手率 %）若存在。"""
     if df.empty:
         return df
     need = {"date", "open", "high", "low", "close", "volume"}
@@ -184,6 +185,8 @@ def _finalize_hist_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     for col in ("open", "high", "low", "close", "volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "turnover_rate" in df.columns:
+        df["turnover_rate"] = pd.to_numeric(df["turnover_rate"], errors="coerce")
     return df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
 _POOL_CACHE: dict[str, tuple[float, list[tuple[str, str]]]] = {}
@@ -993,12 +996,64 @@ def fetch_daily_hist(
                 rename[c] = "low"
             elif "成交量" in str(c) or "volume" in lc:
                 rename[c] = "volume"
+            elif "换手" in str(c):
+                rename[c] = "turnover_rate"
         df = df.rename(columns=rename)
 
     if not need.issubset(set(df.columns)):
         return pd.DataFrame()
 
     return _finalize_hist_columns(df)
+
+
+def fetch_spot_pe_turnover_map() -> dict[str, tuple[float | None, float | None]]:
+    """
+    东财 A 股实时快照：``(pe_ttm, turnover_rate)`` 按 6 位代码。
+    用于增量同步最新交易日估值字段；失败返回空 dict。
+    """
+    ensure_eastmoney_no_proxy_if_configured()
+    try:
+        df = ak.stock_zh_a_spot_em()
+    except Exception as exc:
+        _log.warning("stock_zh_a_spot_em 失败: %r", exc)
+        return {}
+    if df is None or df.empty:
+        return {}
+
+    code_col = next((c for c in df.columns if str(c) in ("代码", "code")), None)
+    if code_col is None:
+        return {}
+    pe_col = next(
+        (c for c in df.columns if "市盈" in str(c) and "动" in str(c)),
+        next((c for c in df.columns if str(c) == "市盈率-动态"), None),
+    )
+    if pe_col is None:
+        pe_col = next((c for c in df.columns if "市盈" in str(c)), None)
+    tr_col = next((c for c in df.columns if "换手" in str(c)), None)
+
+    out: dict[str, tuple[float | None, float | None]] = {}
+    for _, row in df.iterrows():
+        code = _extract_stock_code6(row.get(code_col))
+        if code is None:
+            continue
+        pe_v: float | None = None
+        tr_v: float | None = None
+        if pe_col is not None:
+            try:
+                pe_raw = float(row[pe_col])
+                if np.isfinite(pe_raw):
+                    pe_v = pe_raw
+            except (TypeError, ValueError):
+                pe_v = None
+        if tr_col is not None:
+            try:
+                tr_raw = float(row[tr_col])
+                if np.isfinite(tr_raw):
+                    tr_v = tr_raw
+            except (TypeError, ValueError):
+                tr_v = None
+        out[code] = (pe_v, tr_v)
+    return out
 
 
 def resolve_incremental_daily_fetch_window(

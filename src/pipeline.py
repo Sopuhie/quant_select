@@ -10,12 +10,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from src.config import (
     SCRIPT_BACKTEST,
     SCRIPT_RUN_DAILY,
+    SCRIPT_SYNC_AUXILIARY,
     SCRIPT_SYNC_HOT_CONCEPT,
     SCRIPT_TRAIN_MODEL,
     SCRIPT_UPDATE_LOCAL_DATA,
@@ -89,11 +90,42 @@ def run_complete_pipeline(
     顺序执行 A→E；任一步非零退出码则中止。
     """
     python_exe = sys.executable
+    aux_skip = os.environ.get("QUANT_SKIP_AUX_SYNC", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    aux_lookback = max(30, int(os.environ.get("QUANT_AUX_SYNC_LOOKBACK_DAYS", "120")))
+    aux_max_stocks = int(os.environ.get("QUANT_AUX_SYNC_MAX_STOCKS", "800"))
+    aux_end = datetime.now().strftime("%Y-%m-%d")
+    aux_start = (datetime.now() - timedelta(days=aux_lookback)).strftime("%Y-%m-%d")
+
     steps: list[dict[str, object]] = [
         {
             "name": "1. 增量行情与行业同步",
             "args": [python_exe, str(SCRIPT_UPDATE_LOCAL_DATA)],
         },
+    ]
+    if not aux_skip and SCRIPT_SYNC_AUXILIARY.is_file():
+        aux_args = [
+            python_exe,
+            str(SCRIPT_SYNC_AUXILIARY),
+            "--start-date",
+            aux_start,
+            "--end-date",
+            aux_end,
+            "--only-money-flow",
+        ]
+        if aux_max_stocks > 0:
+            aux_args.extend(["--max-stocks", str(aux_max_stocks)])
+        steps.append(
+            {
+                "name": "1b. 个股资金流增量同步",
+                "args": aux_args,
+            }
+        )
+    steps.extend(
+        [
         {
             "name": "2. 热门概念题材与成份股同步",
             "args": [python_exe, str(SCRIPT_SYNC_HOT_CONCEPT)],
@@ -114,7 +146,8 @@ def run_complete_pipeline(
             "name": "6. 历史选股收益率回填",
             "args": [python_exe, str(SCRIPT_UPDATE_RETURNS)],
         },
-    ]
+        ]
+    )
 
     def _emit(line: str) -> None:
         if log_consumer is not None:

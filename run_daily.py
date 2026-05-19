@@ -60,6 +60,7 @@ from src.factor_calculator import (
     normalize_industry_label,
     prepare_ranking_cross_section_pipeline,
 )
+from src.panel_enrichment import enrich_ohlcv_history
 from src.model_trainer import (
     assert_feature_matrix_matches_rankers,
     load_catboost_ranker_optional,
@@ -198,6 +199,7 @@ def _fetch_one_predict_row(
     if df_today.empty:
         return None
 
+    df_today = enrich_ohlcv_history(df_today, stock_code=code)
     factors = compute_factors_for_history(df_today)
     if factors.empty:
         return None
@@ -232,6 +234,10 @@ def _fetch_one_predict_row(
     else:
         row_dict["industry"] = normalize_industry_label(None)
     row_dict["close_price"] = float(df_today.iloc[last_idx]["close"])
+    if "turnover_rate" in df_today.columns:
+        tr_last = pd.to_numeric(df_today.iloc[last_idx].get("turnover_rate"), errors="coerce")
+        if pd.notna(tr_last):
+            row_dict["turnover_rate"] = float(tr_last)
 
     vol_s = df_today["volume"].astype(float)
     vma5 = vol_s.rolling(5).mean()

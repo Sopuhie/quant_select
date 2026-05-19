@@ -49,6 +49,7 @@ from src.data_fetcher import (
     fetch_a_share_industry_map,
     fetch_daily_hist,
     fetch_market_cap_map,
+    fetch_spot_pe_turnover_map,
     get_stock_pool,
     list_a_stock_codes,
     resolve_incremental_daily_fetch_window,
@@ -226,18 +227,19 @@ def _worker_fetch_only(
     for _, row in df.iterrows():
         d = row["date"]
         ds = d if isinstance(d, str) else pd.Timestamp(d).strftime("%Y-%m-%d")
-        records.append(
-            {
-                "date": ds,
-                "stock_code": code,
-                "stock_name": str(name).strip(),
-                "open": row["open"],
-                "high": row["high"],
-                "low": row["low"],
-                "close": row["close"],
-                "volume": row["volume"],
-            }
-        )
+        rec: dict = {
+            "date": ds,
+            "stock_code": code,
+            "stock_name": str(name).strip(),
+            "open": row["open"],
+            "high": row["high"],
+            "low": row["low"],
+            "close": row["close"],
+            "volume": row["volume"],
+        }
+        if "turnover_rate" in row.index and pd.notna(row.get("turnover_rate")):
+            rec["turnover_rate"] = float(row["turnover_rate"])
+        records.append(rec)
     return records, "fetched"
 
 
@@ -517,6 +519,54 @@ def sync_market_cap_batch(
     return result
 
 
+def sync_spot_pe_turnover_to_latest_kline(
+    db_path: Path | None = None,
+    *,
+    verbose: bool = True,
+) -> int:
+    """
+    用东财实时快照为各股「最近一根 K 线」写入 ``pe_ttm`` / ``turnover_rate``（若快照有值）。
+    """
+    from src.utils import get_kline_incremental_end_trade_date
+
+    path = db_path or DB_PATH
+    init_db(path)
+    latest = get_kline_incremental_end_trade_date()
+    spot = fetch_spot_pe_turnover_map()
+    if not spot:
+        if verbose:
+            print("[估值] 实时快照为空或拉取失败，跳过 pe/换手 写入。", flush=True)
+        return 0
+
+    conn = open_sqlite_connection(path)
+    updated = 0
+    try:
+        for code, (pe_v, tr_v) in spot.items():
+            if pe_v is None and tr_v is None:
+                continue
+            cur = conn.execute(
+                """
+                UPDATE stock_daily_kline
+                SET pe_ttm = COALESCE(?, pe_ttm),
+                    turnover_rate = COALESCE(?, turnover_rate)
+                WHERE stock_code = ? AND date = (
+                    SELECT MAX(date) FROM stock_daily_kline WHERE stock_code = ?
+                )
+                """,
+                (pe_v, tr_v, code, code),
+            )
+            updated += int(cur.rowcount or 0)
+        conn.commit()
+    finally:
+        conn.close()
+    if verbose:
+        print(
+            f"[估值] 已为最近交易日 {latest} 更新 pe/换手 字段（触及约 {updated} 只）。",
+            flush=True,
+        )
+    return updated
+
+
 def sync_fundamental_data(db_path: Path | None = None) -> None:
     """
     使用 AkShare 东方财富业绩报表接口增量同步 ``stock_financial_data``（季报关键字段）。
@@ -726,6 +776,10 @@ def main() -> int:
             sync_fundamental_data(DB_PATH)
         except Exception as exc:
             print(f"警告: 基本面财报同步失败（K 线已写入）: {exc}", flush=True)
+    try:
+        sync_spot_pe_turnover_to_latest_kline(DB_PATH)
+    except Exception as exc:
+        print(f"警告: 实时 pe/换手 写入失败: {exc}", flush=True)
     return 0
 
 

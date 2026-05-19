@@ -185,7 +185,7 @@ LGB_RANKER_DEFAULT_PARAMS: dict[str, Any] = {
     "seed": 42,
 }
 
-FEATURE_COLUMNS = [
+TECH_FEATURE_COLUMNS: list[str] = [
     "factor_bias_5",          # 5日均线乖离
     "factor_bias_10",         # 10日均线乖离
     "factor_bias_20",         # 20日均线乖离（生命线）
@@ -200,6 +200,15 @@ FEATURE_COLUMNS = [
     "factor_volume_ratio",    # 量比（当前成交量相对5日均量）
     "factor_volume_position",  # 量能位置（5日均量相对20日均量）
 ]
+
+ALT_FEATURE_COLUMNS: list[str] = [
+    "factor_ep_ttm",                  # 盈利收益率 1/PE(TTM)
+    "factor_fundamental_quality",     # ROE + 净利/营收增速合成（PIT 财报）
+    "factor_money_flow_intensity",    # 5 日大单+超大单净占比均值
+    "factor_turnover_stability",      # 20 日换手率波动（低波动=筹码稳定）
+]
+
+FEATURE_COLUMNS: list[str] = TECH_FEATURE_COLUMNS + ALT_FEATURE_COLUMNS
 
 # 因子时间序列：EWM 与简单 rolling 的混合权重（越大越偏重近期）
 FACTOR_EWM_BLEND = float(os.environ.get("QUANT_FACTOR_EWM_BLEND", "0.35"))
@@ -448,6 +457,7 @@ SCRIPT_TRAIN_MODEL = PROJECT_ROOT / "train_model.py"
 SCRIPT_RUN_DAILY = PROJECT_ROOT / "run_daily.py"
 SCRIPT_BACKTEST = PROJECT_ROOT / "scripts" / "backtest.py"
 SCRIPT_UPDATE_RETURNS = PROJECT_ROOT / "update_returns.py"
+SCRIPT_SYNC_AUXILIARY = PROJECT_ROOT / "scripts" / "sync_auxiliary_features.py"
 
 # 经验风控：高位放量滞涨（近 3 日均量 / 近 20 日均量、近 3 日累计涨跌幅）
 VOLUME_STAGNATION_VOL_RATIO = float(

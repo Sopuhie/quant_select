@@ -8,6 +8,7 @@ import random
 import sqlite3
 import time
 
+import numpy as np
 import pandas as pd
 from contextlib import contextmanager
 from datetime import datetime
@@ -113,6 +114,8 @@ CREATE TABLE IF NOT EXISTS stock_daily_kline (
     volume REAL,
     industry TEXT,
     market_cap REAL,
+    turnover_rate REAL,
+    pe_ttm REAL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(date, stock_code)
 );
@@ -227,6 +230,27 @@ def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN market_cap REAL")
 
 
+def _ensure_stock_daily_kline_turnover_pe(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_daily_kline'")
+    if cur.fetchone() is None:
+        return
+    cur = conn.execute("PRAGMA table_info(stock_daily_kline)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    if "turnover_rate" not in cols:
+
+        def _add_tr() -> None:
+            conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN turnover_rate REAL")
+
+        _retry_sqlite_locked(_add_tr, attempts=8)
+        cols.add("turnover_rate")
+    if "pe_ttm" not in cols:
+
+        def _add_pe() -> None:
+            conn.execute("ALTER TABLE stock_daily_kline ADD COLUMN pe_ttm REAL")
+
+        _retry_sqlite_locked(_add_pe, attempts=8)
+
+
 def _ensure_market_hsgt_flow_daily(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_hsgt_flow_daily'")
     if cur.fetchone() is None:
@@ -275,6 +299,7 @@ def init_db(db_path: Path | None = None) -> None:
         conn.executescript(SCHEMA_SQL)
         _ensure_stock_daily_kline_industry(conn)
         _ensure_stock_daily_kline_market_cap(conn)
+        _ensure_stock_daily_kline_turnover_pe(conn)
         _ensure_daily_selections_selection_reason(conn)
         _ensure_stock_concept_boards(conn)
         _ensure_market_hsgt_flow_daily(conn)
@@ -315,13 +340,16 @@ def upsert_stock_daily_klines(
     sql = """
     INSERT INTO stock_daily_kline (
         date, stock_code, stock_name, industry, market_cap,
+        turnover_rate, pe_ttm,
         open, high, low, close, volume
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(date, stock_code) DO UPDATE SET
         stock_name = excluded.stock_name,
         industry = COALESCE(NULLIF(TRIM(excluded.industry), ''), stock_daily_kline.industry),
         market_cap = COALESCE(excluded.market_cap, stock_daily_kline.market_cap),
+        turnover_rate = COALESCE(excluded.turnover_rate, stock_daily_kline.turnover_rate),
+        pe_ttm = COALESCE(excluded.pe_ttm, stock_daily_kline.pe_ttm),
         open = excluded.open,
         high = excluded.high,
         low = excluded.low,
@@ -337,6 +365,17 @@ def upsert_stock_daily_klines(
             market_cap_val = float(mc_raw) if mc_raw is not None and pd.notna(mc_raw) else None
         except (TypeError, ValueError):
             market_cap_val = None
+
+        def _opt_float(key: str) -> float | None:
+            raw = r.get(key)
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+                return None
+            try:
+                v = float(raw)
+                return v if math.isfinite(v) else None
+            except (TypeError, ValueError):
+                return None
+
         batch.append(
             (
                 r["date"],
@@ -344,6 +383,8 @@ def upsert_stock_daily_klines(
                 str(r.get("stock_name") or "").strip(),
                 industry_val,
                 market_cap_val,
+                _opt_float("turnover_rate"),
+                _opt_float("pe_ttm"),
                 float(r["open"]) if r.get("open") is not None else None,
                 float(r["high"]) if r.get("high") is not None else None,
                 float(r["low"]) if r.get("low") is not None else None,
@@ -570,10 +611,16 @@ def update_selection_returns(trade_date: str, stock_code: str, next_day_return: 
 def fetch_stock_daily_bars_until(stock_code: str, end_date: str, *, db_path: Path | None = None) -> pd.DataFrame:
     code, end = str(stock_code).strip().zfill(6), str(end_date).strip()[:10]
     with get_connection(db_path or DB_PATH) as conn:
-        df = pd.read_sql_query("SELECT date, open, high, low, close, volume, industry, market_cap FROM stock_daily_kline WHERE stock_code = ? AND date <= ? ORDER BY date ASC", conn, params=(code, end))
+        df = pd.read_sql_query(
+            "SELECT date, open, high, low, close, volume, industry, market_cap, "
+            "turnover_rate, pe_ttm FROM stock_daily_kline WHERE stock_code = ? AND date <= ? "
+            "ORDER BY date ASC",
+            conn,
+            params=(code, end),
+        )
     if df.empty: return df
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    for col in ("open", "high", "low", "close", "volume", "market_cap"):
+    for col in ("open", "high", "low", "close", "volume", "market_cap", "turnover_rate", "pe_ttm"):
         if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
     if "industry" in df.columns: df["industry"] = df["industry"].fillna("").astype(str)
     return df.dropna(subset=["close"]).reset_index(drop=True)
@@ -768,6 +815,114 @@ def fetch_concept_boards_by_stock(stock_code: str, db_path=None) -> list[str]:
 def fetch_stocks_by_concept_board(board_name: str, db_path=None) -> list[str]:
     with get_connection(db_path) as conn:
         return [r[0] for r in conn.execute("SELECT DISTINCT stock_code FROM stock_concept_boards WHERE board_name = ?", (str(board_name),)).fetchall()]
+
+
+def fetch_joined_fundamental_moneyflow_panel(
+    trade_date: str,
+    codes: list[str],
+    *,
+    db_path: Path | None = None,
+) -> pd.DataFrame:
+    """
+    截面左连接：``stock_daily_kline``（锚定日）+ 最新 ``pub_date<=trade_date`` 财报
+    + 当日 ``stock_money_flow_daily``。
+    """
+    td = str(trade_date).strip()[:10]
+    uniq = sorted({str(c).strip().zfill(6) for c in codes if len(str(c).strip().zfill(6)) == 6})
+    if not uniq:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "stock_code",
+                "roe",
+                "net_profit_growth",
+                "revenue_growth",
+                "big_net_ratio",
+                "turnover_rate",
+                "pe_ttm",
+            ]
+        )
+    path = db_path or DB_PATH
+    conn = sqlite3.connect(str(path), timeout=_SQLITE_CONNECT_TIMEOUT)
+    _apply_sqlite_pragmas(conn)
+    try:
+        cur_cols = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(stock_daily_kline)").fetchall()
+        }
+        tr_sel = (
+            "k.turnover_rate"
+            if "turnover_rate" in cur_cols
+            else "NULL AS turnover_rate"
+        )
+        pe_sel = "k.pe_ttm" if "pe_ttm" in cur_cols else "NULL AS pe_ttm"
+        ph = ",".join("?" * len(uniq))
+        kline = pd.read_sql_query(
+            f"""
+            SELECT k.date, k.stock_code, {tr_sel}, {pe_sel}
+            FROM stock_daily_kline k
+            WHERE k.date = ? AND k.stock_code IN ({ph})
+            """,
+            conn,
+            params=(td, *uniq),
+        )
+        mf = pd.read_sql_query(
+            f"""
+            SELECT stock_code, big_net_ratio
+            FROM stock_money_flow_daily
+            WHERE trade_date = ? AND stock_code IN ({ph})
+            """,
+            conn,
+            params=(td, *uniq),
+        )
+        fin = pd.read_sql_query(
+            f"""
+            SELECT f.stock_code, f.pub_date, f.roe, f.net_profit_growth, f.revenue_growth
+            FROM stock_financial_data f
+            INNER JOIN (
+                SELECT stock_code, MAX(pub_date) AS mx_pub
+                FROM stock_financial_data
+                WHERE pub_date <= ? AND stock_code IN ({ph})
+                GROUP BY stock_code
+            ) t ON f.stock_code = t.stock_code AND f.pub_date = t.mx_pub
+            WHERE f.stock_code IN ({ph})
+            """,
+            conn,
+            params=(td, *uniq, *uniq),
+        )
+    finally:
+        conn.close()
+
+    if kline.empty:
+        base = pd.DataFrame({"stock_code": uniq, "date": td})
+    else:
+        base = kline.copy()
+        base["stock_code"] = base["stock_code"].astype(str).str.zfill(6)
+        base["date"] = base["date"].astype(str).str[:10]
+
+    if not mf.empty:
+        mf["stock_code"] = mf["stock_code"].astype(str).str.zfill(6)
+        base = base.merge(mf, on="stock_code", how="left")
+    elif "big_net_ratio" not in base.columns:
+        base["big_net_ratio"] = np.nan
+
+    if not fin.empty:
+        fin["stock_code"] = fin["stock_code"].astype(str).str.zfill(6)
+        fin = fin.drop_duplicates(subset=["stock_code"], keep="last")
+        base = base.merge(
+            fin[["stock_code", "roe", "net_profit_growth", "revenue_growth"]],
+            on="stock_code",
+            how="left",
+        )
+    else:
+        for c in ("roe", "net_profit_growth", "revenue_growth"):
+            if c not in base.columns:
+                base[c] = np.nan
+
+    for c in ("turnover_rate", "pe_ttm", "big_net_ratio"):
+        if c in base.columns:
+            base[c] = pd.to_numeric(base[c], errors="coerce")
+    return base
 
 
 def fetch_stock_financial_panel(stock_code: str, *, db_path: Path | None = None) -> pd.DataFrame:

@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (
+    ALT_FEATURE_COLUMNS,
     DAILY_K_SPIKE_VS_OPEN_MIN,
     DAILY_K_UPPER_SHADOW_BODY_MULT,
     ENABLE_PREV_GAIN_SUPPRESSION,
@@ -27,6 +28,7 @@ from .config import (
     MAX_ALLOWED_5D_RETURN,
     SOFT_TURNOVER_PENALTY_MULT,
     SOFT_TURNOVER_PENALTY_PCT,
+    TECH_FEATURE_COLUMNS,
 )
 from .utils import rank_gauss_cross_section
 
@@ -138,6 +140,8 @@ PERCENTILE_RANK_FEATURES: tuple[str, ...] = (
 RANK_GAUSS_AFTER_RANK_FEATURES: tuple[str, ...] = (
     "factor_volume_ratio",
     "factor_volume_position",
+    "factor_money_flow_intensity",
+    "factor_turnover_stability",
 )
 
 # 截面相对波动率：当日个股值 / 当日全市场截面中位数（RankGauss 之前）
@@ -1061,8 +1065,9 @@ def prepare_ranking_cross_section_pipeline(
     date_col: str = "trade_date",
 ) -> pd.DataFrame:
     """
-    训练 / 预测 / 回测共用的截面排序特征管道（轻量化纯净版）：
-    仅处理 13 个纯技术面量价因子，彻底移除大单、北向、资金流等外部增量库合并与冗余查库动作。
+    训练 / 预测 / 回测共用的截面排序特征管道：
+    形态风控 → 涨幅/换手惩罚 → 行业内截面清洗（含基本面/资金流扩展因子）。
+    上游须在 ``compute_factors_for_history`` 前经 ``panel_enrichment.enrich_ohlcv_history`` 拼好 PIT 字段。
     """
     if feat_df.empty:
         return feat_df
@@ -1100,6 +1105,28 @@ def prepare_ranking_cross_section_pipeline(
     if str(date_col) != "date":
         w = w.drop(columns=["date"], errors="ignore")
     return w
+
+
+def _composite_fundamental_quality_series(
+    roe: pd.Series,
+    net_profit_growth: pd.Series,
+    revenue_growth: pd.Series,
+) -> pd.Series:
+    """财报可见后的质量合成（分量 Winsorize 后等权，截面清洗前）。"""
+    r = pd.to_numeric(roe, errors="coerce").clip(-30.0, 80.0) / 50.0
+    n = pd.to_numeric(net_profit_growth, errors="coerce").clip(-90.0, 300.0) / 200.0
+    g = pd.to_numeric(revenue_growth, errors="coerce").clip(-90.0, 300.0) / 200.0
+    return (r + n + g) / 3.0
+
+
+def _turnover_pct_series_from_work(work: pd.DataFrame, vol: pd.Series, eps: float) -> pd.Series:
+    if "turnover_rate" in work.columns:
+        tr = pd.to_numeric(work["turnover_rate"], errors="coerce")
+        if tr.notna().any():
+            return tr
+    vol_ma5 = _roll_ewm_blend(vol, 5)
+    vr = vol / (vol_ma5 + eps)
+    return vr * 2.0
 
 
 def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
@@ -1150,12 +1177,46 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     out["factor_volume_ratio"] = vol / (vol_ma5 + eps)
     out["factor_volume_position"] = vol_ma5 / (vol_ma20 + eps) - 1.0
 
+    pe = (
+        pd.to_numeric(work["pe_ttm"], errors="coerce")
+        if "pe_ttm" in work.columns
+        else pd.Series(np.nan, index=work.index)
+    )
+    pe_safe = pe.where(pe > 0)
+    out["factor_ep_ttm"] = 1.0 / (pe_safe + 1e-6)
+
+    roe_col = work["roe"] if "roe" in work.columns else pd.Series(np.nan, index=work.index)
+    ng_col = (
+        work["net_profit_growth"]
+        if "net_profit_growth" in work.columns
+        else pd.Series(np.nan, index=work.index)
+    )
+    rg_col = (
+        work["revenue_growth"]
+        if "revenue_growth" in work.columns
+        else pd.Series(np.nan, index=work.index)
+    )
+    out["factor_fundamental_quality"] = _composite_fundamental_quality_series(
+        roe_col, ng_col, rg_col
+    )
+
+    bnr = (
+        pd.to_numeric(work["big_net_ratio"], errors="coerce")
+        if "big_net_ratio" in work.columns
+        else pd.Series(np.nan, index=work.index)
+    )
+    out["factor_money_flow_intensity"] = bnr.rolling(5, min_periods=2).mean()
+
+    tr_pct = _turnover_pct_series_from_work(work, vol, eps)
+    out["factor_turnover_stability"] = tr_pct.rolling(20, min_periods=5).std()
+
     out = out.replace([np.inf, -np.inf], np.nan)
     for c in FEATURE_COLUMNS:
         if c not in out.columns:
             out[c] = np.nan
-    out[FEATURE_COLUMNS] = out[FEATURE_COLUMNS].ffill().bfill().fillna(0.0)
-
+    tech = out[TECH_FEATURE_COLUMNS].ffill().bfill().fillna(0.0)
+    alt = out[ALT_FEATURE_COLUMNS].ffill().fillna(0.0)
+    out = pd.concat([tech, alt], axis=1)
     return out[FEATURE_COLUMNS]
 
 
@@ -1167,7 +1228,7 @@ def clean_cross_sectional_features(
     use_size_neutralization: bool = True,
 ) -> pd.DataFrame:
     """
-    截面清洗（13 维纯技术因子，无 MACD/RSI/KDJ ZCA 正交）：
+    截面清洗（技术 + 基本面/资金流扩展因子）：
 
     - 按 ``date`` / ``trade_date`` 分组；
     - 对量能类先做截面相对波动率（/ 当日中位数），再 RankGauss；
@@ -1355,7 +1416,10 @@ def build_stock_panel_features(
     stock_name: str,
 ) -> pd.DataFrame:
     _ = stock_name
-    factors = compute_factors_for_history(df)
+    from .panel_enrichment import enrich_ohlcv_history
+
+    work = enrich_ohlcv_history(df, stock_code=stock_code)
+    factors = compute_factors_for_history(work)
     lab = label_forward_return(df, horizon=LABEL_HORIZON_DAYS, stock_code=stock_code)
     meta_cols = ["date"]
     if "industry" in df.columns:

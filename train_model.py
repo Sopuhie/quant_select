@@ -63,6 +63,7 @@ from src.factor_calculator import (
     normalize_industry_column,
     prepare_ranking_cross_section_pipeline,
 )
+from src.panel_enrichment import enrich_ohlcv_history, load_financial_panels_bulk
 from src.model_trainer import (
     _json_safe,
     _prepare_rank_xy,
@@ -134,7 +135,8 @@ def _load_local_kline_panel(
     init_db()
     conn = sqlite3.connect(str(DB_PATH))
     sql = """
-        SELECT date, stock_code, stock_name, open, high, low, close, volume, industry, market_cap
+        SELECT date, stock_code, stock_name, open, high, low, close, volume,
+               industry, market_cap, turnover_rate, pe_ttm
         FROM stock_daily_kline
         ORDER BY stock_code, date
     """
@@ -198,6 +200,7 @@ def _load_local_kline_panel(
     parts: list[pd.DataFrame] = []
     grouped = raw_df.groupby(raw_df["stock_code"].astype(str).str.zfill(6))
     skipped_short = 0
+    fin_cache = load_financial_panels_bulk(codes)
 
     for gi, (code, group) in enumerate(grouped):
         if verbose and total_g and (gi % 500 == 0 or gi == total_g - 1):
@@ -206,6 +209,7 @@ def _load_local_kline_panel(
         if len(g) < min_bars:
             skipped_short += 1
             continue
+        g = enrich_ohlcv_history(g, stock_code=str(code), financial_cache=fin_cache)
         facts = compute_factors_for_history(g)
         morph = compute_morphology_metrics_for_history(g)
         meta_cols = ["date", "stock_code", "stock_name", "industry"]
