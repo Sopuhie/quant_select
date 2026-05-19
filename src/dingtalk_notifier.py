@@ -16,6 +16,20 @@ from urllib.parse import quote_plus
 
 import requests
 
+from .utils import display_trading_date_for_push
+
+def _footer_text_content(now_s: str) -> str:
+    """页脚纯文本（text 消息，避免 Markdown 加粗继承）。"""
+    return "\n".join(
+        [
+            "🤖 本推荐由量化选股系统自动生成",
+            f"⏰ 推送时间：{now_s}",
+            "---",
+            "⚠️ 仅供参考，不构成投资建议",
+        ]
+    )
+
+
 class DingTalkNotifier:
     """钉钉机器人通知"""
 
@@ -74,24 +88,41 @@ class DingTalkNotifier:
         }
         return self._send_request(url, data)
 
-    def send_stock_selection(self, trade_date: str, selections: List[Dict[str, Any]]) -> bool:
+    def send_stock_selection(
+        self,
+        trade_date: str,
+        selections: List[Dict[str, Any]],
+        *,
+        include_brief: bool | None = None,
+    ) -> bool:
         """
-        发送 Top3 标的（钉钉 markdown）：与产品固定模板一致——
-        标题 + 交易日 +「序号. 代码 名称」列表（不展示分数/收盘价/理由）+ 页脚三行。
-        换行使用「行尾两空格 + \\n」，避免手机端挤行。
+        发送 Top3 标的：主文为 Markdown（标题 + 列表 + 简评）；页脚为第二条纯文本消息（避免加粗继承）。
+        主文换行使用「行尾两空格 + \\n」，避免手机端挤行。
         Args:
-            trade_date: 选股数据对应的交易日（YYYY-MM-DD）
-            selections: 选股列表，每个元素需含 rank, stock_code, stock_name
+            trade_date: 选股数据对应的信号日（YYYY-MM-DD）
+            selections: 选股列表（rank, stock_code, stock_name；可选 score, close_price, selection_reason）
+            include_brief: 是否附带简评模板；默认 True，环境变量 QUANT_DINGTALK_NO_BRIEF=1 时关闭
 
         Returns:
             是否发送成功
         """
         title = "财富密码 Top3 推荐"
         now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        td_short = str(trade_date).strip()[:10]
-        date_esc = html.escape(td_short)
-        # 钉钉 Markdown：单行 \n 常被合并；官方建议换行处使用「行尾两个空格 + \\n」
-        header = f"📈 **财富密码 Top3 推荐**  \n**交易日：{date_esc}**"
+        signal_td = str(trade_date).strip()[:10]
+        exec_td = display_trading_date_for_push(signal_td)
+        signal_esc = html.escape(signal_td)
+        exec_esc = html.escape(exec_td)
+        header = (
+            f"📈 **财富密码 Top3 推荐**  \n"
+            f"**信号日：{signal_esc}**　|　**执行参考：{exec_esc}**"
+        )
+        if include_brief is None:
+            include_brief = os.environ.get("QUANT_DINGTALK_NO_BRIEF", "0") not in (
+                "1",
+                "true",
+                "True",
+            )
+
         lines: list[str] = [
             header,
             "",
@@ -107,24 +138,32 @@ class DingTalkNotifier:
             name = str(s.get("stock_name", "")).strip()
             code_esc = html.escape(code)
             name_esc = html.escape(name)
-            lines.append(f"**{rank}. {code_esc} {name_esc}**  ")
+            extra = ""
+            sc = s.get("score")
+            cp = s.get("close_price")
+            if sc is not None and cp is not None:
+                extra = f"（分 {float(sc):.4f}，收 {float(cp):.2f}）"
+            elif sc is not None:
+                extra = f"（分 {float(sc):.4f}）"
+            elif cp is not None:
+                extra = f"（收 {float(cp):.2f}）"
+            lines.append(f"**{rank}. {code_esc} {name_esc}**{html.escape(extra)}  ")
 
-        footer = (
-            "🤖 本推荐由量化选股系统自动生成  \n"
-            f"⏰ 推送时间： {now_s}  \n"
-            "⚠️ 仅供参考，不构成投资建议"
-        )
-        lines.extend(
-            [
-                "",
-                "---",
-                "",
-                footer,
-            ]
-        )
+        if include_brief and selections:
+            try:
+                from .dingtalk_selection_brief import build_selection_brief_markdown
+
+                lines.extend(["", "---", ""])
+                lines.append(build_selection_brief_markdown(signal_td, selections))
+                lines.append("")
+            except Exception as exc:
+                print(f"钉钉简评生成失败（仍发送标的列表）: {exc}")
+
         text = "\n".join(lines)
-
-        return self.send_markdown(title, text)
+        ok = self.send_markdown(title, text)
+        if not ok:
+            return False
+        return self.send_text(_footer_text_content(now_s))
 
     def _send_request(self, url: str, data: dict[str, Any]) -> bool:
         try:

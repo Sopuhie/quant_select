@@ -380,3 +380,13 @@ def next_trade_day_after(d: str) -> str | None:
     while nxt.weekday() >= 5:
         nxt += timedelta(days=1)
     return nxt.isoformat()
+
+
+def display_trading_date_for_push(signal_trade_date: str) -> str:
+    """
+    钉钉等对外展示用的「交易日」：信号日之后的下一个 A 股交易日。
+    无法解析或日历不可用时退回 signal_trade_date 本身。
+    """
+    td = str(signal_trade_date).strip()[:10]
+    nxt = next_trade_day_after(td)
+    return nxt if nxt else td

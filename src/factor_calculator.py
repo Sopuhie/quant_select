@@ -609,6 +609,50 @@ def _resolve_turnover_pct_series(feat_df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.nan, index=feat_df.index)
 
 
+MORPHOLOGY_METRIC_COLUMNS = (
+    "ma20_slope_3d",
+    "ma60_slope_3d",
+    "kdj_k",
+    "kdj_d",
+    "kdj_j",
+)
+
+
+def compute_morphology_metrics_for_history(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    按单股完整 K 线向量化计算形态列（与 ``_anchor_bar_morphology_metrics_on_keys`` 锚定日语义一致）。
+    训练面板在 ``_load_local_kline_panel`` 中预计算，避免百万行截面再逐键查库。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=list(MORPHOLOGY_METRIC_COLUMNS))
+    work = df.sort_values("date").reset_index(drop=True)
+    close = pd.to_numeric(work["close"], errors="coerce")
+    high = pd.to_numeric(work["high"], errors="coerce")
+    low = pd.to_numeric(work["low"], errors="coerce")
+    slope_days = max(2, int(MA_TREND_SLOPE_LOOKBACK_DAYS))
+    ma20 = _roll_ewm_blend(close, 20)
+    ma60 = _roll_ewm_blend(close, 60)
+    s20 = (ma20 - ma20.shift(slope_days)) / float(slope_days)
+    s60 = (ma60 - ma60.shift(slope_days)) / float(slope_days)
+    low_min = low.rolling(9, min_periods=9).min()
+    high_max = high.rolling(9, min_periods=9).max()
+    rsv = (close - low_min) / (high_max - low_min + 1e-6) * 100.0
+    k = rsv.ewm(com=2, adjust=False).mean()
+    d = k.ewm(com=2, adjust=False).mean()
+    j = 3.0 * k - 2.0 * d
+    out = pd.DataFrame(
+        {
+            "ma20_slope_3d": s20,
+            "ma60_slope_3d": s60,
+            "kdj_k": k,
+            "kdj_d": d,
+            "kdj_j": j,
+        },
+        index=work.index,
+    )
+    return out
+
+
 def _ma_slope_over_days(ma_series: pd.Series, *, days: int) -> float:
     """
     均线 ``days`` 日斜率：``(MA_t - MA_{t-days}) / days``。
@@ -672,7 +716,14 @@ def _anchor_bar_morphology_metrics_on_keys(keys_df: pd.DataFrame) -> pd.DataFram
         from .config import DB_PATH
         from .database import get_connection
 
-        for anchor, grp in keys.groupby("date", sort=False):
+        date_groups = list(keys.groupby("date", sort=False))
+        n_dates = len(date_groups)
+        for di, (anchor, grp) in enumerate(date_groups):
+            if n_dates >= 20 and di > 0 and di % max(1, n_dates // 10) == 0:
+                print(
+                    f"[形态指标] 查库进度 {di}/{n_dates} 交易日（{anchor}）…",
+                    flush=True,
+                )
             codes = grp["stock_code"].unique().tolist()
             chunk_n = 200
             with get_connection(DB_PATH) as conn:
@@ -732,6 +783,8 @@ def _merge_morphology_metrics_onto_panel(
 ) -> pd.DataFrame:
     """将 ``_anchor_bar_morphology_metrics_on_keys`` 结果 left-merge 回截面面板。"""
     if feat_df.empty or "stock_code" not in feat_df.columns:
+        return feat_df
+    if all(c in feat_df.columns for c in MORPHOLOGY_METRIC_COLUMNS):
         return feat_df
     dc = date_col if date_col in feat_df.columns else "trade_date"
     if dc not in feat_df.columns:
@@ -981,6 +1034,10 @@ def prepare_ranking_cross_section_pipeline(
     w = attach_canonical_industry_labels(w)
     w, _ = _drop_midterm_absolute_bear_trend(w)
     w, _ = _drop_absolute_bear_trend_suppression(w)
+    if not all(c in w.columns for c in MORPHOLOGY_METRIC_COLUMNS):
+        print("[特征管道] 形态学指标（按锚定日查库）…", flush=True)
+    else:
+        print("[特征管道] 形态学阻断（使用面板预计算列）…", flush=True)
     w, _ = _drop_morphology_ma_slope_and_kdj(w)
     w = suppress_high_recent_gains(w)
     w = apply_soft_low_turnover_penalty(w)

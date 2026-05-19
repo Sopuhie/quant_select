@@ -174,7 +174,7 @@ def _experience_filter_cfg_mtime() -> float:
 def _sync_experience_filter_widget_state(ef_ui: dict, cfg_mtime: float) -> None:
     """
     与 config.json 同步经验风控输入框的 session_state。
-    配置文件变更时 pop 旧控件状态，禁止对已实例化控件 key 二次赋值（易导致 Tab 空白）。
+    配置文件变更时仅 pop 旧 key（须在本 Tab 任意 widget 实例化之前调用，否则易整页空白）。
     """
     prev_mtime = st.session_state.get("_quant_ef_cfg_mtime")
     if prev_mtime is None or float(prev_mtime) != float(cfg_mtime):
@@ -186,6 +186,20 @@ def _sync_experience_filter_widget_state(ef_ui: dict, cfg_mtime: float) -> None:
             st.session_state[state_key] = _experience_filter_display_str(
                 ef_ui, cfg_key
             )
+
+
+def _experience_filter_defaults() -> dict[str, str]:
+    mp, Mxp, mm, Mxm, mt, Mxt = get_experience_thresholds()
+    ef_ui = {
+        "min_price": mp,
+        "max_price": Mxp,
+        "min_mcap": mm,
+        "max_mcap": Mxm,
+        "min_turnover": mt,
+        "max_turnover": Mxt,
+    }
+    _sync_experience_filter_widget_state(ef_ui, _experience_filter_cfg_mtime())
+    return ef_ui
 
 
 # ================= 1. 全局页面配置 =================
@@ -677,6 +691,273 @@ def _pattern_range_from_plotly_state(
     return xs_u[0], xs_u[-1]
 
 
+@st.fragment
+def _render_system_console_tab() -> None:
+    """系统控制台 Tab 主体（fragment 隔离，避免其它 Tab 的 session_state 冲突导致空白）。"""
+    _experience_filter_defaults()
+    st.subheader("⚙️ 量化核心任务总控制台")
+    st.caption("无需打开终端，在这里一键调度并监视所有后台算法与数据任务。")
+
+    st.markdown(
+        f"""
+        <div style="background-color: rgba(13, 148, 136, 0.08); border: 2px dashed #0d9488; padding: 20px; border-radius: 10px; margin-bottom: 25px; text-align: center;">
+            <h3 style="color: #0f766e; margin-top: 0; font-family: monospace;">⚡ 一键贯通全套量化工作流</h3>
+            <p style="font-size: 0.85rem; color: #475569; margin-bottom: 8px;">
+                依次执行：<b>同步行情与行业</b> ➜ <b>重训双排序模型</b>（耗时视数据量）
+                ➜ <b>每日选股（含入选原因归因）</b> ➜ <b>滚动回测</b> ➜ <b>收益回填</b>。
+            </p>
+            <p style="font-size: 0.8rem; color: #64748b;">
+                定时：每个<b>交易日 {SCHEDULER_RUN_AT}</b>（本机时间）自动运行同一套流程；
+                修改请设环境变量 <code>QUANT_SCHEDULER_TIME</code>（如 <code>09:05</code>）并重启 Streamlit。
+                若不需后台调度，请设置环境变量 <code>QUANT_DISABLE_BACKGROUND_SCHEDULER=1</code>。
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    onekey_btn = st.button(
+        "🚀 启动一键全套工作流",
+        key="run_onekey_pipeline",
+        use_container_width=True,
+    )
+    if onekey_btn:
+        _pipe_cmd = [
+            sys.executable,
+            "-m",
+            "src.pipeline",
+        ]
+        with st.spinner("全套工作流已在独立子进程中执行，日志实时刷新…"):
+            ret_code, pipe_log = run_command_interactive(
+                _pipe_cmd,
+                task_name="页面手动一键执行(Pipeline子进程)",
+            )
+        ok_pipe = ret_code == 0
+        if ok_pipe:
+            st.success(
+                "🎉 全套工作流已顺序完成（详见上方输出与「系统运行日志」）。"
+            )
+        else:
+            st.error(
+                "❌ 工作流在某一步失败并已中止，请查看上方输出或 SQLite system_logs。"
+            )
+
+    row1_col1, row1_col2 = st.columns(2)
+    row2_col1, row2_col2 = st.columns(2)
+
+    with row1_col1:
+        st.markdown(
+            """
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
+                <h4 style="color: #0f766e; margin-top:0;">📊 任务 A：全量/增量行情同步</h4>
+                <p style="font-size: 0.85rem; color: #475569;">写入本地表 stock_daily_kline：无历史则拉约 365 自然日；已有则从最近日期次日增量 UPSERT。默认最多约 6000 只；勾选下方「全 A」则不限数量（收盘后补当日日线更完整，但更慢）。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        sync_full_a_market = st.checkbox(
+            "同步全 A（不限 6000 只，收盘后拉齐当日日线）",
+            value=False,
+            key="sync_full_market_kline",
+            help="等价于命令行 python scripts/update_local_data.py --all-stocks",
+        )
+        data_btn = st.button(
+            "🚀 运行本地行情同步", key="run_data_update", use_container_width=True
+        )
+        if data_btn:
+            with st.spinner("正在下载日线并写入本地 SQLite..."):
+                data_cmd = [sys.executable, str(SCRIPT_UPDATE_LOCAL_DATA)]
+                if sync_full_a_market:
+                    data_cmd.append("--all-stocks")
+                ret_code, _log = run_command_interactive(
+                    data_cmd,
+                    task_name="本地行情同步",
+                )
+                if ret_code == 0:
+                    st.success("✅ 本地行情同步完成！")
+                else:
+                    st.error("❌ 同步异常，请查看上方实时日志")
+
+    with row1_col2:
+        st.markdown(
+            """
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
+                <h4 style="color: #0f766e; margin-top:0;">🎯 任务 B：重新训练选股模型</h4>
+                <p style="font-size: 0.85rem; color: #475569;">读取本地 SQLite（stock_daily_kline）计算因子并重训 LightGBM LambdaRank（按交易日分组）。可选命令行 <code>--tune</code> 进行 Optuna 调参；默认使用库内全部日期；截止日可设环境变量 QUANT_TRAIN_END_DATE。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        train_btn = st.button(
+            "🚀 开始模型训练", key="run_train", use_container_width=True
+        )
+        if train_btn:
+            with st.spinner("正在重新计算因子并重训模型..."):
+                train_cmd = [
+                    sys.executable,
+                    str(SCRIPT_TRAIN_MODEL),
+                    "--fast-train",
+                    "--no-catboost",
+                ]
+                if _QUANT_TRAIN_END_DATE_ENV:
+                    train_cmd.extend(
+                        ["--train-end-date", _QUANT_TRAIN_END_DATE_ENV[:10]]
+                    )
+                ret_code, _log = run_command_interactive(
+                    train_cmd, task_name="模型训练"
+                )
+                if ret_code == 0:
+                    st.success("✅ 模型重训完成，最新模型权重已保存！")
+                else:
+                    st.error("❌ 训练执行异常，请查看日志")
+
+    with row2_col1:
+        st.markdown(
+            """
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
+                <h4 style="color: #0f766e; margin-top:0;">📡 任务 C：执行每日智能选股</h4>
+                <p style="font-size: 0.85rem; color: #475569;">K 线与因子计算均基于本地 stock_daily_kline；截面清洗与 LightGBM 打分后产出 Top 推荐。股票池默认取库内有足够历史的代码；需要成分池时可命令行加 --online-pool。可在下方「经验风控阈值」中设置价格/市值/换手硬过滤（写入 config.json，子进程 run_daily 自动读取）。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div style='margin-top: 10px;'></div>", unsafe_allow_html=True
+        )
+        col_cb1, col_cb2 = st.columns(2)
+        with col_cb1:
+            include_300 = st.checkbox(
+                "🟢 包含创业板 (300 / 301)",
+                value=False,
+                key="task_c_include_300",
+                help="未勾选时，选股池将排除代码以 300、301 开头的股票",
+            )
+        with col_cb2:
+            include_688 = st.checkbox(
+                "🔵 包含科创板 (688)",
+                value=False,
+                key="task_c_include_688",
+                help="未勾选时，选股池将排除代码以 688 开头的股票",
+            )
+
+        with st.expander(
+            "⚙️ 经验风控阈值（打分后、取 Top 前硬过滤；留空表示不限制）",
+            expanded=False,
+        ):
+            st.caption(
+                "单位：价格为元，市值为亿元，换手为百分比（%）。"
+                "无日线换手率列时用量比代理，与控制台日志说明一致。"
+                "下方展示为**当前实际生效**阈值（`config.json` 与 `src/config.py` 合并；"
+                "若曾保存过全空 JSON，会回退到代码默认）。"
+                "点击「运行每日预测」或「启动历史滚动回测」时会先写入项目根目录 config.json，再启动子进程。"
+            )
+            _ec1, _ec2, _ec3 = st.columns(3)
+            with _ec1:
+                st.text_input("最低价 (元)", key="task_c_ef_min_price")
+                st.text_input("最低市值 (亿元)", key="task_c_ef_min_mcap")
+                st.text_input("最低换手 (%)", key="task_c_ef_min_turnover")
+            with _ec2:
+                st.text_input("最高价 (元)", key="task_c_ef_max_price")
+                st.text_input("最高市值 (亿元)", key="task_c_ef_max_mcap")
+                st.text_input("最高换手 (%)", key="task_c_ef_max_turnover")
+            with _ec3:
+                st.markdown(
+                    "<p style='font-size:0.82rem;color:#475569;margin-top:0.2rem;'>"
+                    "也可直接编辑 <code>config.json</code> 中 <code>experience_filters</code>；"
+                    "仅改 <code>src/config.py</code> 时保存 JSON 或刷新页面后即可与界面同步。"
+                    "</p>",
+                    unsafe_allow_html=True,
+                )
+
+        predict_btn = st.button(
+            "🚀 运行每日预测", key="run_predict", use_container_width=True
+        )
+        if predict_btn:
+            with st.spinner("提取全市场实时因子，进行 LightGBM 测算中..."):
+                save_ok, err_ef = _persist_experience_filters_from_ui()
+                if not save_ok:
+                    st.error(f"❌ {err_ef}" if err_ef else "❌ 未启动选股。")
+                    st.stop()
+
+                cmd = [sys.executable, str(SCRIPT_RUN_DAILY)]
+                if include_300:
+                    cmd.append("--include-300")
+                if include_688:
+                    cmd.append("--include-688")
+                ret_code, _log = run_command_interactive(
+                    cmd, task_name="每日智能选股"
+                )
+                if ret_code == 0:
+                    st.success(
+                        "✅ 今日推荐选股计算完成！请前往「今日推荐」卡片查看。"
+                    )
+                else:
+                    st.error("❌ 预测执行异常，请查阅控制台")
+
+    with row2_col2:
+        st.markdown(
+            """
+            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
+                <h4 style="color: #0f766e; margin-top:0;">📈 任务 D：运行策略历史滚动回测</h4>
+                <p style="font-size: 0.85rem; color: #475569;">基于本地 stock_daily_kline；不传日期时默认回测区间为库内最早日至最晚日。基准 000300 优先读库。不足可加 --online-fallback。板块（创业板/科创板）与左侧勾选一致。点击启动时会先将左侧「经验风控阈值」写入 config.json，再运行回测（与「运行每日预测」一致）。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        backtest_btn = st.button(
+            "🚀 启动历史滚动回测",
+            key="run_backtest_tab",
+            use_container_width=True,
+        )
+        if backtest_btn:
+            with st.spinner("滚动回测执行中，请耐心等待..."):
+                save_bt, err_bt = _persist_experience_filters_from_ui()
+                if not save_bt:
+                    st.error(f"❌ {err_bt}" if err_bt else "❌ 未启动回测。")
+                    st.stop()
+                _bt_cmd = [sys.executable, str(SCRIPT_BACKTEST)]
+                if include_300:
+                    _bt_cmd.append("--include-300")
+                if include_688:
+                    _bt_cmd.append("--include-688")
+                ret_code, _log = run_command_interactive(
+                    _bt_cmd,
+                    task_name="历史滚动回测",
+                )
+                if ret_code == 0:
+                    st.success(
+                        f"✅ 回测完成！已生成 {DATA_DIR / 'backtest_results.csv'}"
+                    )
+                else:
+                    st.error("❌ 回测异常，请查阅上方调试日志")
+
+    st.markdown("---")
+    st.subheader("🔄 任务 E：历史选股收益回填")
+    st.caption("对数据库中的历史推荐股票进行持股收益率自动追踪和数据补全。")
+
+    col_ret1, col_ret2 = st.columns([3, 1])
+    with col_ret1:
+        st.info(
+            "回填工具会自动追踪历史选股后的 +1日收益率 和 +5日持有期累计收益率，从而精确评估算法胜率。"
+        )
+    with col_ret2:
+        return_btn = st.button(
+            "🚀 开始收益率回填",
+            key="run_return_update",
+            use_container_width=True,
+        )
+    if return_btn:
+        with st.spinner("正在调取接口，更新并回填历史选股收益率数据..."):
+            ret_code, _log = run_command_interactive(
+                [sys.executable, str(SCRIPT_UPDATE_RETURNS)],
+                task_name="历史收益回填",
+            )
+            if ret_code == 0:
+                st.success("✅ 历史收益率数据回填完成！")
+            else:
+                st.error("❌ 回填发生异常")
+
+
+
 # ================= 6. 选项卡定义 =================
 (
     tab_today,
@@ -703,6 +984,14 @@ def _pattern_range_from_plotly_state(
         "🔧 环境设置",
     ]
 )
+
+# ----------------- TAB: ⚙️ 系统控制台（置于最前，避免后续 Tab 异常导致本页无法渲染）-----------------
+with tab_data:
+    try:
+        _render_system_console_tab()
+    except Exception as _tab_data_exc:
+        st.error("⚙️ 系统控制台加载失败，请将下方错误信息反馈给开发者或重启 Streamlit。")
+        st.exception(_tab_data_exc)
 
 # ----------------- TAB 1: 今日推荐 -----------------
 with tab_today:
@@ -1683,284 +1972,6 @@ with tab_perf:
                 f"当日共 **{n_all}** 只股票参与排名；当前表格展示 **{cap}** 行（按名次升序）。"
             )
 
-def _render_system_console_tab() -> None:
-    """系统控制台 Tab 主体（独立函数便于 fragment / 异常隔离）。"""
-    st.subheader("⚙️ 量化核心任务总控制台")
-    st.caption("无需打开终端，在这里一键调度并监视所有后台算法与数据任务。")
-
-    st.markdown(
-        f"""
-        <div style="background-color: rgba(13, 148, 136, 0.08); border: 2px dashed #0d9488; padding: 20px; border-radius: 10px; margin-bottom: 25px; text-align: center;">
-            <h3 style="color: #0f766e; margin-top: 0; font-family: monospace;">⚡ 一键贯通全套量化工作流</h3>
-            <p style="font-size: 0.85rem; color: #475569; margin-bottom: 8px;">
-                依次执行：<b>同步行情与行业</b> ➜ <b>重训双排序模型</b>（耗时视数据量）
-                ➜ <b>每日选股（含入选原因归因）</b> ➜ <b>滚动回测</b> ➜ <b>收益回填</b>。
-            </p>
-            <p style="font-size: 0.8rem; color: #64748b;">
-                定时：每个<b>交易日 {SCHEDULER_RUN_AT}</b>（本机时间）自动运行同一套流程；
-                修改请设环境变量 <code>QUANT_SCHEDULER_TIME</code>（如 <code>09:05</code>）并重启 Streamlit。
-                若不需后台调度，请设置环境变量 <code>QUANT_DISABLE_BACKGROUND_SCHEDULER=1</code>。
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    onekey_btn = st.button(
-        "🚀 启动一键全套工作流",
-        key="run_onekey_pipeline",
-        use_container_width=True,
-    )
-    if onekey_btn:
-        _pipe_cmd = [
-            sys.executable,
-            "-m",
-            "src.pipeline",
-        ]
-        with st.spinner("全套工作流已在独立子进程中执行，日志实时刷新…"):
-            ret_code, pipe_log = run_command_interactive(
-                _pipe_cmd,
-                task_name="页面手动一键执行(Pipeline子进程)",
-            )
-        ok_pipe = ret_code == 0
-        if ok_pipe:
-            st.success(
-                "🎉 全套工作流已顺序完成（详见上方输出与「系统运行日志」）。"
-            )
-        else:
-            st.error(
-                "❌ 工作流在某一步失败并已中止，请查看上方输出或 SQLite system_logs。"
-            )
-
-    row1_col1, row1_col2 = st.columns(2)
-    row2_col1, row2_col2 = st.columns(2)
-
-    with row1_col1:
-        st.markdown(
-            """
-            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
-                <h4 style="color: #0f766e; margin-top:0;">📊 任务 A：全量/增量行情同步</h4>
-                <p style="font-size: 0.85rem; color: #475569;">写入本地表 stock_daily_kline：无历史则拉约 365 自然日；已有则从最近日期次日增量 UPSERT。默认最多约 6000 只；勾选下方「全 A」则不限数量（收盘后补当日日线更完整，但更慢）。</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        sync_full_a_market = st.checkbox(
-            "同步全 A（不限 6000 只，收盘后拉齐当日日线）",
-            value=False,
-            key="sync_full_market_kline",
-            help="等价于命令行 python scripts/update_local_data.py --all-stocks",
-        )
-        data_btn = st.button(
-            "🚀 运行本地行情同步", key="run_data_update", use_container_width=True
-        )
-        if data_btn:
-            with st.spinner("正在下载日线并写入本地 SQLite..."):
-                data_cmd = [sys.executable, str(SCRIPT_UPDATE_LOCAL_DATA)]
-                if sync_full_a_market:
-                    data_cmd.append("--all-stocks")
-                ret_code, _log = run_command_interactive(
-                    data_cmd,
-                    task_name="本地行情同步",
-                )
-                if ret_code == 0:
-                    st.success("✅ 本地行情同步完成！")
-                else:
-                    st.error("❌ 同步异常，请查看上方实时日志")
-
-    with row1_col2:
-        st.markdown(
-            """
-            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
-                <h4 style="color: #0f766e; margin-top:0;">🎯 任务 B：重新训练选股模型</h4>
-                <p style="font-size: 0.85rem; color: #475569;">读取本地 SQLite（stock_daily_kline）计算因子并重训 LightGBM LambdaRank（按交易日分组）。可选命令行 <code>--tune</code> 进行 Optuna 调参；默认使用库内全部日期；截止日可设环境变量 QUANT_TRAIN_END_DATE。</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        train_btn = st.button(
-            "🚀 开始模型训练", key="run_train", use_container_width=True
-        )
-        if train_btn:
-            with st.spinner("正在重新计算因子并重训模型..."):
-                train_cmd = [sys.executable, str(SCRIPT_TRAIN_MODEL)]
-                if _QUANT_TRAIN_END_DATE_ENV:
-                    train_cmd.extend(
-                        ["--train-end-date", _QUANT_TRAIN_END_DATE_ENV[:10]]
-                    )
-                ret_code, _log = run_command_interactive(
-                    train_cmd, task_name="模型训练"
-                )
-                if ret_code == 0:
-                    st.success("✅ 模型重训完成，最新模型权重已保存！")
-                else:
-                    st.error("❌ 训练执行异常，请查看日志")
-
-    with row2_col1:
-        st.markdown(
-            """
-            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
-                <h4 style="color: #0f766e; margin-top:0;">📡 任务 C：执行每日智能选股</h4>
-                <p style="font-size: 0.85rem; color: #475569;">K 线与因子计算均基于本地 stock_daily_kline；截面清洗与 LightGBM 打分后产出 Top 推荐。股票池默认取库内有足够历史的代码；需要成分池时可命令行加 --online-pool。可在下方「经验风控阈值」中设置价格/市值/换手硬过滤（写入 config.json，子进程 run_daily 自动读取）。</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            "<div style='margin-top: 10px;'></div>", unsafe_allow_html=True
-        )
-        col_cb1, col_cb2 = st.columns(2)
-        with col_cb1:
-            include_300 = st.checkbox(
-                "🟢 包含创业板 (300 / 301)",
-                value=False,
-                key="task_c_include_300",
-                help="未勾选时，选股池将排除代码以 300、301 开头的股票",
-            )
-        with col_cb2:
-            include_688 = st.checkbox(
-                "🔵 包含科创板 (688)",
-                value=False,
-                key="task_c_include_688",
-                help="未勾选时，选股池将排除代码以 688 开头的股票",
-            )
-
-        _mp, _Mxp, _mm, _Mxm, _mt, _Mxt = get_experience_thresholds()
-        _ef_ui = {
-            "min_price": _mp,
-            "max_price": _Mxp,
-            "min_mcap": _mm,
-            "max_mcap": _Mxm,
-            "min_turnover": _mt,
-            "max_turnover": _Mxt,
-        }
-        _sync_experience_filter_widget_state(_ef_ui, _experience_filter_cfg_mtime())
-
-        with st.expander(
-            "⚙️ 经验风控阈值（打分后、取 Top 前硬过滤；留空表示不限制）",
-            expanded=False,
-        ):
-            st.caption(
-                "单位：价格为元，市值为亿元，换手为百分比（%）。"
-                "无日线换手率列时用量比代理，与控制台日志说明一致。"
-                "下方展示为**当前实际生效**阈值（`config.json` 与 `src/config.py` 合并；"
-                "若曾保存过全空 JSON，会回退到代码默认）。"
-                "点击「运行每日预测」或「启动历史滚动回测」时会先写入项目根目录 config.json，再启动子进程。"
-            )
-            _ec1, _ec2, _ec3 = st.columns(3)
-            with _ec1:
-                st.text_input("最低价 (元)", key="task_c_ef_min_price")
-                st.text_input("最低市值 (亿元)", key="task_c_ef_min_mcap")
-                st.text_input("最低换手 (%)", key="task_c_ef_min_turnover")
-            with _ec2:
-                st.text_input("最高价 (元)", key="task_c_ef_max_price")
-                st.text_input("最高市值 (亿元)", key="task_c_ef_max_mcap")
-                st.text_input("最高换手 (%)", key="task_c_ef_max_turnover")
-            with _ec3:
-                st.markdown(
-                    "<p style='font-size:0.82rem;color:#475569;margin-top:0.2rem;'>"
-                    "也可直接编辑 <code>config.json</code> 中 <code>experience_filters</code>；"
-                    "仅改 <code>src/config.py</code> 时保存 JSON 或刷新页面后即可与界面同步。"
-                    "</p>",
-                    unsafe_allow_html=True,
-                )
-
-        predict_btn = st.button(
-            "🚀 运行每日预测", key="run_predict", use_container_width=True
-        )
-        if predict_btn:
-            with st.spinner("提取全市场实时因子，进行 LightGBM 测算中..."):
-                save_ok, err_ef = _persist_experience_filters_from_ui()
-                if not save_ok:
-                    st.error(f"❌ {err_ef}" if err_ef else "❌ 未启动选股。")
-                    st.stop()
-
-                cmd = [sys.executable, str(SCRIPT_RUN_DAILY)]
-                if include_300:
-                    cmd.append("--include-300")
-                if include_688:
-                    cmd.append("--include-688")
-                ret_code, _log = run_command_interactive(
-                    cmd, task_name="每日智能选股"
-                )
-                if ret_code == 0:
-                    st.success(
-                        "✅ 今日推荐选股计算完成！请前往「今日推荐」卡片查看。"
-                    )
-                else:
-                    st.error("❌ 预测执行异常，请查阅控制台")
-
-    with row2_col2:
-        st.markdown(
-            """
-            <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
-                <h4 style="color: #0f766e; margin-top:0;">📈 任务 D：运行策略历史滚动回测</h4>
-                <p style="font-size: 0.85rem; color: #475569;">基于本地 stock_daily_kline；不传日期时默认回测区间为库内最早日至最晚日。基准 000300 优先读库。不足可加 --online-fallback。板块（创业板/科创板）与左侧勾选一致。点击启动时会先将左侧「经验风控阈值」写入 config.json，再运行回测（与「运行每日预测」一致）。</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        backtest_btn = st.button(
-            "🚀 启动历史滚动回测",
-            key="run_backtest_tab",
-            use_container_width=True,
-        )
-        if backtest_btn:
-            with st.spinner("滚动回测执行中，请耐心等待..."):
-                save_bt, err_bt = _persist_experience_filters_from_ui()
-                if not save_bt:
-                    st.error(f"❌ {err_bt}" if err_bt else "❌ 未启动回测。")
-                    st.stop()
-                _bt_cmd = [sys.executable, str(SCRIPT_BACKTEST)]
-                if include_300:
-                    _bt_cmd.append("--include-300")
-                if include_688:
-                    _bt_cmd.append("--include-688")
-                ret_code, _log = run_command_interactive(
-                    _bt_cmd,
-                    task_name="历史滚动回测",
-                )
-                if ret_code == 0:
-                    st.success(
-                        f"✅ 回测完成！已生成 {DATA_DIR / 'backtest_results.csv'}"
-                    )
-                else:
-                    st.error("❌ 回测异常，请查阅上方调试日志")
-
-    st.markdown("---")
-    st.subheader("🔄 任务 E：历史选股收益回填")
-    st.caption("对数据库中的历史推荐股票进行持股收益率自动追踪和数据补全。")
-
-    col_ret1, col_ret2 = st.columns([3, 1])
-    with col_ret1:
-        st.info(
-            "回填工具会自动追踪历史选股后的 +1日收益率 和 +5日持有期累计收益率，从而精确评估算法胜率。"
-        )
-    with col_ret2:
-        return_btn = st.button(
-            "🚀 开始收益率回填",
-            key="run_return_update",
-            use_container_width=True,
-        )
-    if return_btn:
-        with st.spinner("正在调取接口，更新并回填历史选股收益率数据..."):
-            ret_code, _log = run_command_interactive(
-                [sys.executable, str(SCRIPT_UPDATE_RETURNS)],
-                task_name="历史收益回填",
-            )
-            if ret_code == 0:
-                st.success("✅ 历史收益率数据回填完成！")
-            else:
-                st.error("❌ 回填发生异常")
-
-
-# ----------------- TAB 5: ⚙️ 系统控制台 -----------------
-with tab_data:
-    try:
-        _render_system_console_tab()
-    except Exception as _tab_data_exc:
-        st.error("⚙️ 系统控制台加载失败，请将下方错误信息反馈给开发者或重启 Streamlit。")
-        st.exception(_tab_data_exc)
-
 # ----------------- TAB 6: 📋 系统运行日志 -----------------
 with tab_logs:
     st.subheader("📋 系统运行日志")
@@ -2160,29 +2171,51 @@ with tab_theme:
             st.session_state.theme_focus_select = _THEME_ALL_LABEL
             st.rerun()
 
+    if "theme_refresh_feedback" in st.session_state:
+        _fb_kind, _fb_text = st.session_state.pop("theme_refresh_feedback")
+        if _fb_kind == "success":
+            st.success(_fb_text)
+        elif _fb_kind == "warning":
+            st.warning(_fb_text)
+        else:
+            st.error(_fb_text)
+
     if st.button("♻️ 立即刷新热点题材与成份股", key="refresh_theme_em"):
         _cached_theme_board_setup.clear()
         with st.spinner("正在从东方财富拉取最新热门概念及成份股…"):
             try:
-                _theme_setup = (
-                    _cached_theme_board_setup(_theme_trade_date)
-                    if _theme_trade_date
-                    else ensure_hot_sectors_for_trade_date(
-                        None,
-                        sync_constituents=True,
-                        force_refresh=True,
-                        verbose=False,
-                    )
+                # 必须 force_refresh=True；走缓存函数时 force_refresh=False，
+                # 本地 date 已与 K 线末日一致时会跳过拉取，按钮形同虚设。
+                _theme_setup = ensure_hot_sectors_for_trade_date(
+                    _theme_trade_date or None,
+                    sync_constituents=True,
+                    force_refresh=True,
+                    verbose=False,
                 )
                 sync_concept_boards_from_json()
+                _n_tags = len(_theme_setup.get("tags") or [])
+                _n_boards = int(_theme_setup.get("boards_synced", 0))
                 if _theme_setup.get("error"):
-                    st.warning(f"同步完成但有提示：{_theme_setup['error']}")
+                    st.session_state.theme_refresh_feedback = (
+                        "warning",
+                        f"同步完成但有提示：{_theme_setup['error']} "
+                        f"（热门题材 {_n_tags} 个，板块成份 {_n_boards} 个）",
+                    )
+                elif not _theme_setup.get("tags_refreshed") and _n_boards == 0:
+                    st.session_state.theme_refresh_feedback = (
+                        "warning",
+                        "未从东方财富拉取到新数据，已沿用本地缓存；请检查网络/代理后重试。",
+                    )
                 else:
-                    st.success(
-                        f"已刷新 {int(_theme_setup.get('boards_synced', 0))} 个板块成份。"
+                    st.session_state.theme_refresh_feedback = (
+                        "success",
+                        f"已刷新热门题材 {_n_tags} 个、板块成份 {_n_boards} 个。",
                     )
             except Exception as exc:
-                st.error(f"题材同步失败：{exc}")
+                st.session_state.theme_refresh_feedback = (
+                    "error",
+                    f"题材同步失败：{exc}",
+                )
         st.rerun()
 
     if run_theme_btn:

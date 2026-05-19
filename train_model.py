@@ -58,6 +58,7 @@ from src.database import init_db, register_model_version
 from src.factor_calculator import (
     DEFAULT_INDUSTRY_LABEL,
     compute_factors_for_history,
+    compute_morphology_metrics_for_history,
     label_forward_return,
     normalize_industry_column,
     prepare_ranking_cross_section_pipeline,
@@ -206,12 +207,17 @@ def _load_local_kline_panel(
             skipped_short += 1
             continue
         facts = compute_factors_for_history(g)
+        morph = compute_morphology_metrics_for_history(g)
         meta_cols = ["date", "stock_code", "stock_name", "industry"]
         if "market_cap" in g.columns:
             meta_cols.append("market_cap")
         meta = g[meta_cols].copy()
         merged = pd.concat(
-            [meta.reset_index(drop=True), facts.reset_index(drop=True)],
+            [
+                meta.reset_index(drop=True),
+                facts.reset_index(drop=True),
+                morph.reset_index(drop=True),
+            ],
             axis=1,
         )
         merged["label_ret"] = label_forward_return(
