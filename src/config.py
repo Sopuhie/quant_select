@@ -380,6 +380,9 @@ THEME_VOL_RATIO_MIN_1D = 1.3
 THEME_KDJ_J_SLOPE_MIN = 5.0
 THEME_KDJ_LEVEL_1 = 100.0
 THEME_KDJ_LEVEL_2 = 110.0
+# 近 N 个交易日内须至少出现过一次涨停（按板块涨跌幅规则判定）
+THEME_LIMIT_UP_LOOKBACK_DAYS = 30
+THEME_LIMIT_UP_TOLERANCE = 0.005
 
 # 沪深300 大盘环境分低于该阈值时 run_daily 熔断空仓（与题材 tab 60 分一致）
 MARKET_REGIME_MIN_SCORE = max(

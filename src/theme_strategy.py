@@ -2,7 +2,7 @@
 热门题材高爆选股 — 规则 **v2.0**（单表：买入共振 + 「实盘决策建议结论」按 J 分层；阈值来自 ``config``）。
 
 在 SQLite 截面 + 单股历史（倒序取、升序算）上计算 MA/MACD/KDJ/量比；
-保留 SQL 关键词预筛与 ``run_theme_alpha_scan`` 的 ``theme_keywords`` 兼容。
+近 N 交易日涨停过滤；保留 SQL 关键词预筛与 ``run_theme_alpha_scan`` 的 ``theme_keywords`` 兼容。
 """
 from __future__ import annotations
 
@@ -20,12 +20,15 @@ from .config import (
     THEME_KDJ_J_SLOPE_MIN,
     THEME_KDJ_LEVEL_1,
     THEME_KDJ_LEVEL_2,
+    THEME_LIMIT_UP_LOOKBACK_DAYS,
+    THEME_LIMIT_UP_TOLERANCE,
     THEME_MA_LONG,
     THEME_MA_SHORT,
     THEME_VOL_RATIO_MIN_1D,
     THEME_VOL_RATIO_MIN_5D,
 )
 from .database import fetch_stocks_by_concept_board
+from .factor_calculator import had_limit_up_within_trading_days
 
 THEME_HIST_LIMIT = 250
 THEME_MIN_BARS = MIN_HISTORY_BARS
@@ -302,6 +305,13 @@ class ThemeAlphaStrategy:
 
             sig = self.compute_technical_signals(df_hist)
             if sig is None:
+                continue
+            if not had_limit_up_within_trading_days(
+                df_hist,
+                code,
+                lookback_days=THEME_LIMIT_UP_LOOKBACK_DAYS,
+                tolerance=THEME_LIMIT_UP_TOLERANCE,
+            ):
                 continue
             curr, prev = sig
 

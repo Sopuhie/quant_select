@@ -287,6 +287,48 @@ def is_bar_suspended(row: pd.Series) -> bool:
     return not (np.isfinite(v) and v > 0)
 
 
+def is_bar_limit_up(
+    close: float,
+    prev_close: float,
+    stock_code: str,
+    *,
+    tolerance: float = 0.005,
+) -> bool:
+    """收盘价触及涨停（按板块涨跌幅规则，容差 tolerance）。"""
+    try:
+        c = float(close)
+        p = float(prev_close)
+    except (TypeError, ValueError):
+        return False
+    if not (np.isfinite(c) and np.isfinite(p) and p > 0):
+        return False
+    limit_r = _limit_move_ratio(stock_code)
+    pct = (c - p) / p
+    return pct >= limit_r - float(tolerance)
+
+
+def had_limit_up_within_trading_days(
+    df_hist: pd.DataFrame,
+    stock_code: str,
+    *,
+    lookback_days: int = 30,
+    tolerance: float = 0.005,
+) -> bool:
+    """近 lookback_days 个交易日内是否出现过至少一次涨停。"""
+    if df_hist is None or len(df_hist) < 2:
+        return False
+    df = df_hist.sort_values("date").reset_index(drop=True)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    if close.notna().sum() < 2:
+        return False
+    pct = close.pct_change()
+    n = max(1, int(lookback_days))
+    recent = pct.iloc[-n:]
+    limit_r = _limit_move_ratio(stock_code)
+    thr = limit_r - float(tolerance)
+    return bool((recent >= thr).any())
+
+
 def is_bar_one_word_limit_up(
     row: pd.Series,
     prev_close: float,
