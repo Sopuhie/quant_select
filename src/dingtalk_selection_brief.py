@@ -268,6 +268,5 @@ def build_selection_brief_markdown(
     lines.append(_md_line("📋 组合提示"))
     for note in _portfolio_notes(enriched):
         lines.append(_md_line(f"　· {note}"))
-    lines.append("")
 
     return "\n".join(lines)
