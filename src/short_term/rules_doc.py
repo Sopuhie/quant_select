@@ -49,6 +49,7 @@ def short_term_rules_sections() -> list[dict[str, str]]:
             "规则": (
                 f"剔除 ST（{_on_off(SHORT_EXCLUDE_ST)}）；"
                 f"剔除北交所等（{_on_off(SHORT_EXCLUDE_BJ)}）；"
+                "默认剔除创业板（300/301）与科创板（688），界面或 CLI 可勾选纳入；"
                 f"信号日停牌剔除；涨停日剔除；"
                 f"近涨停剔除（{_on_off(SHORT_EXCLUDE_NEAR_LIMIT)}，见板块阈值）"
             ),

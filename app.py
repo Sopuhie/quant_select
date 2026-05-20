@@ -2305,6 +2305,22 @@ with tab_short:
             "及环境变量（如 QUANT_SHORT_TOP_N、QUANT_SHORT_MIN_MARKET_SCORE）。"
         )
 
+    _st_cb1, _st_cb2 = st.columns(2)
+    with _st_cb1:
+        short_include_300 = st.checkbox(
+            "🟢 包含创业板 (300 / 301)",
+            value=False,
+            key="short_include_300",
+            help="未勾选时，短线扫描池将排除代码以 300、301 开头的股票",
+        )
+    with _st_cb2:
+        short_include_688 = st.checkbox(
+            "🔵 包含科创板 (688)",
+            value=False,
+            key="short_include_688",
+            help="未勾选时，短线扫描池将排除代码以 688 开头的股票",
+        )
+
     _st_col_run, _st_col_push, _st_col_hist = st.columns([3, 2, 2])
     with _st_col_run:
         run_short_btn = st.button(
@@ -2352,6 +2368,8 @@ with tab_short:
                     force=True,
                     write_json=True,
                     skip_dingtalk=True,
+                    include_300=short_include_300,
+                    include_688=short_include_688,
                 )
             except Exception as exc:
                 st.error(f"扫描或落库失败：{exc}")

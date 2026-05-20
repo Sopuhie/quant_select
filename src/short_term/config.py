@@ -24,7 +24,7 @@ def _env_float(name: str, default: float) -> float:
 
 # 持有 1 个交易日：T 日收盘信号 → T+1 买 → T+2 卖
 SHORT_HOLDING_DAYS = 1
-SHORT_TOP_N = _env_int_bounded("QUANT_SHORT_TOP_N", 20, 1, 20)
+SHORT_TOP_N = _env_int_bounded("QUANT_SHORT_TOP_N", 5, 1, 20)
 
 SHORT_MIN_HISTORY_BARS = int(os.environ.get("QUANT_SHORT_MIN_BARS", "35"))
 SHORT_HIST_LIMIT = int(os.environ.get("QUANT_SHORT_HIST_LIMIT", "120"))

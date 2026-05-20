@@ -10,6 +10,7 @@ import pandas as pd
 from src.factor_calculator import is_bar_limit_up, is_bar_suspended
 from src.market_regime import market_environment_allows_trading
 
+from .board_filter import board_allowed
 from .config import (
     SHORT_EXCLUDE_BJ,
     SHORT_EXCLUDE_NEAR_LIMIT,
@@ -103,6 +104,8 @@ class ShortTermRuleStrategy:
         *,
         top_n: int | None = None,
         max_scan_stocks: int | None = None,
+        include_300: bool = False,
+        include_688: bool = False,
     ) -> tuple[pd.DataFrame, str, int]:
         top_n = int(top_n if top_n is not None else SHORT_TOP_N)
         cur = self.conn.cursor()
@@ -138,6 +141,15 @@ class ShortTermRuleStrategy:
         df_target["stock_code"] = (
             df_target["stock_code"].astype(str).str.strip().str.zfill(6)
         )
+        df_target = df_target[
+            df_target["stock_code"].map(
+                lambda c: board_allowed(
+                    c, include_300=include_300, include_688=include_688
+                )
+            )
+        ].copy()
+        if df_target.empty:
+            return (pd.DataFrame(columns=RESULT_COLUMNS), target_date, mkt_score)
         if max_scan_stocks is not None and int(max_scan_stocks) > 0:
             df_target = df_target.head(int(max_scan_stocks))
 
@@ -333,10 +345,14 @@ def run_short_term_scan(
     *,
     top_n: int | None = None,
     max_scan_stocks: int | None = None,
+    include_300: bool = False,
+    include_688: bool = False,
 ) -> tuple[pd.DataFrame, str, int]:
     engine = ShortTermRuleStrategy(connection)
     return engine.scan(
         target_date,
         top_n=top_n,
         max_scan_stocks=max_scan_stocks,
+        include_300=include_300,
+        include_688=include_688,
     )

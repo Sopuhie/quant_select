@@ -27,6 +27,8 @@ def run_short_daily_pipeline(
     force: bool = False,
     top_n: int | None = None,
     max_scan_stocks: int | None = None,
+    include_300: bool = False,
+    include_688: bool = False,
     write_json: bool = True,
     skip_dingtalk: bool = False,
 ) -> dict[str, Any]:
@@ -46,6 +48,8 @@ def run_short_daily_pipeline(
             trade_date,
             top_n=top_n,
             max_scan_stocks=max_scan_stocks,
+            include_300=include_300,
+            include_688=include_688,
         )
         if not td:
             return {
@@ -91,6 +95,8 @@ def run_short_daily_pipeline(
             "review_prices_updated": review_updated,
             "holding_days": SHORT_HOLDING_DAYS,
             "top_n": top_n,
+            "include_300": include_300,
+            "include_688": include_688,
             "signals": df.to_dict(orient="records") if not df.empty else [],
         }
 
@@ -113,6 +119,8 @@ def run_short_daily_pipeline(
                     "written": n_written,
                     "market_score": mkt_score,
                     "force": force,
+                    "include_300": include_300,
+                    "include_688": include_688,
                 },
                 ensure_ascii=False,
             ),

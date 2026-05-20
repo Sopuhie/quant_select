@@ -8,6 +8,7 @@
   python scripts/run_short_daily.py --top-n 8
   python scripts/run_short_daily.py --max-scan-stocks 800
   python scripts/run_short_daily.py --skip-dingtalk
+  python scripts/run_short_daily.py --include-300 --include-688
 """
 from __future__ import annotations
 
@@ -48,6 +49,18 @@ def main() -> int:
         action="store_true",
         help="不发送短线选股钉钉消息",
     )
+    parser.add_argument(
+        "--include-300",
+        dest="include_300",
+        action="store_true",
+        help="包含创业板代码（300、301 开头）；不传则从扫描池中剔除",
+    )
+    parser.add_argument(
+        "--include-688",
+        dest="include_688",
+        action="store_true",
+        help="包含代码以 688 开头的股票（科创板）；不传则从扫描池中剔除",
+    )
     args = parser.parse_args()
 
     summary = run_short_daily_pipeline(
@@ -55,6 +68,8 @@ def main() -> int:
         force=bool(args.force),
         top_n=args.top_n,
         max_scan_stocks=args.max_scan_stocks,
+        include_300=bool(args.include_300),
+        include_688=bool(args.include_688),
         write_json=not args.no_json,
         skip_dingtalk=bool(args.skip_dingtalk),
     )
