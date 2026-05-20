@@ -2098,7 +2098,7 @@ with tab_theme:
 
     _THEME_ALL_LABEL = "全市场（不限题材）"
 
-    @st.cache_data(ttl=3600, show_spinner="正在同步东方财富热门题材与成份股…")
+    @st.cache_data(ttl=3600, show_spinner="正在同步热门题材与成份股…")
     def _cached_theme_board_setup(_trade_date: str) -> dict:
         return ensure_hot_sectors_for_trade_date(
             _trade_date,
@@ -2121,8 +2121,16 @@ with tab_theme:
     _board_map_n = len(load_board_mapping())
     _tags_date = str(_theme_meta.get("date", "")).strip()[:10]
 
+    _tags_source = str(_theme_meta.get("source", "") or "").strip()
+    _src_label = {
+        "eastmoney": "东方财富",
+        "ths_fundflow": "同花顺资金流涨幅榜",
+        "ths_list": "同花顺概念列表",
+    }.get(_tags_source, _tags_source or "本地缓存")
+
     st.caption(
-        f"热点题材交易日：{_tags_date or '—'} · 已标注成份股 {_board_map_n} 只"
+        f"热点题材交易日：{_tags_date or '—'} · 数据源：{_src_label}"
+        f" · 已标注成份股 {_board_map_n} 只"
         " · 默认使用本地缓存；需最新榜单请点击下方「立即刷新热点题材与成份股」。"
     )
 
@@ -2137,13 +2145,13 @@ with tab_theme:
             "" if sel == _THEME_ALL_LABEL else str(sel)
         )
 
-    st.markdown("##### 🏷️ 今日全市场焦点题材推荐（东方财富概念涨幅榜）")
+    st.markdown("##### 🏷️ 今日全市场焦点题材推荐（概念涨幅榜）")
     st.selectbox(
         "从热点题材中选择",
         options=_theme_options,
         index=0,
         key="theme_focus_select",
-        help="每个交易日从东方财富概念板块行情刷新；选中后自动填入下方「题材核心关键词」。",
+        help="优先东方财富概念涨幅榜；不可用时自动降级同花顺资金流涨幅榜（环境变量 QUANT_HOT_CONCEPT_SOURCE）。",
         on_change=_sync_theme_keyword_from_select,
     )
 
@@ -2183,7 +2191,7 @@ with tab_theme:
 
     if st.button("♻️ 立即刷新热点题材与成份股", key="refresh_theme_em"):
         _cached_theme_board_setup.clear()
-        with st.spinner("正在从东方财富拉取最新热门概念及成份股…"):
+        with st.spinner("正在拉取最新热门概念及成份股（东财/同花顺）…"):
             try:
                 # 必须 force_refresh=True；走缓存函数时 force_refresh=False，
                 # 本地 date 已与 K 线末日一致时会跳过拉取，按钮形同虚设。
@@ -2205,12 +2213,18 @@ with tab_theme:
                 elif not _theme_setup.get("tags_refreshed") and _n_boards == 0:
                     st.session_state.theme_refresh_feedback = (
                         "warning",
-                        "未从东方财富拉取到新数据，已沿用本地缓存；请检查网络/代理后重试。",
+                        "未拉取到新数据，已沿用本地缓存。"
+                        "可设 QUANT_HOT_CONCEPT_SOURCE=ths_fundflow 强制走同花顺，或检查网络/代理。",
                     )
                 else:
+                    _src = str(_theme_setup.get("source") or "")
+                    _src_cn = {
+                        "eastmoney": "东方财富",
+                        "ths_fundflow": "同花顺",
+                    }.get(_src, _src or "未知")
                     st.session_state.theme_refresh_feedback = (
                         "success",
-                        f"已刷新热门题材 {_n_tags} 个、板块成份 {_n_boards} 个。",
+                        f"已刷新热门题材 {_n_tags} 个（{_src_cn}）、板块成份 {_n_boards} 个。",
                     )
             except Exception as exc:
                 st.session_state.theme_refresh_feedback = (

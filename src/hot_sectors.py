@@ -22,10 +22,13 @@ def save_tags(tags: list[str], metadata: dict | None = None) -> None:
     td = datetime.now().strftime("%Y-%m-%d")
     if metadata and metadata.get("trade_date"):
         td = str(metadata["trade_date"]).strip()[:10]
+    source = "eastmoney_akshare"
+    if metadata and metadata.get("source"):
+        source = str(metadata["source"])
     data: dict = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "date": td,
-        "source": "eastmoney_akshare",
+        "source": source,
         "tags": tags,
     }
     if metadata:

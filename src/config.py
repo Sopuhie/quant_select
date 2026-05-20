@@ -453,6 +453,9 @@ def get_quant_config_merged() -> dict[str, Any]:
 # 子进程启动脚本路径（供 pipeline / Streamlit 统一引用，避免硬编码）
 SCRIPT_UPDATE_LOCAL_DATA = PROJECT_ROOT / "scripts" / "update_local_data.py"
 SCRIPT_SYNC_HOT_CONCEPT = PROJECT_ROOT / "scripts" / "sync_hot_concept_boards.py"
+
+# 热门题材数据源：auto | em | ths_fundflow | ths_list（东财不可达时 auto 会降级同花顺）
+HOT_CONCEPT_SOURCE = os.environ.get("QUANT_HOT_CONCEPT_SOURCE", "auto").strip().lower()
 SCRIPT_TRAIN_MODEL = PROJECT_ROOT / "train_model.py"
 SCRIPT_RUN_DAILY = PROJECT_ROOT / "run_daily.py"
 SCRIPT_BACKTEST = PROJECT_ROOT / "scripts" / "backtest.py"

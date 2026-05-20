@@ -22,7 +22,7 @@ from src.config import DB_PATH
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="同步东方财富热门概念与成份股")
+    p = argparse.ArgumentParser(description="同步热门概念题材与成份股（东财/同花顺自动降级）")
     p.add_argument("--top-n", type=int, default=15, help="热门概念板块数量")
     p.add_argument("--force", action="store_true", help="强制刷新（忽略缓存日期）")
     p.add_argument(
@@ -41,6 +41,7 @@ def main() -> None:
     n = sync_concept_boards_from_json()
     print(
         f"完成: 交易日={stats.get('trade_date')} "
+        f"数据源={stats.get('source') or '—'} "
         f"题材刷新={stats.get('tags_refreshed')} "
         f"板块={stats.get('boards_synced')} "
         f"成份股映射={stats.get('stock_mappings')} "
@@ -51,8 +52,8 @@ def main() -> None:
         print(f"警告: {stats['error']}", flush=True)
     if not stats.get("tags_refreshed") and not stats.get("boards_synced"):
         print(
-            "提示: 未从东方财富拉取到新数据，已沿用本地缓存；"
-            "请检查网络/代理或稍后重试。",
+            "提示: 未拉取到新数据，已沿用本地缓存。"
+            "可执行: set QUANT_HOT_CONCEPT_SOURCE=ths_fundflow 后重试。",
             flush=True,
         )
 
