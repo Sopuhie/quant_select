@@ -1,5 +1,5 @@
 """
-从东方财富抓取热门概念板块名称（AkShare / 定时任务 JSON）。
+热门概念题材标签（默认同花顺资金流涨幅榜，JSON 缓存）。
 供 Streamlit「热门题材高爆选股」下拉使用。
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ def save_tags(tags: list[str], metadata: dict | None = None) -> None:
     td = datetime.now().strftime("%Y-%m-%d")
     if metadata and metadata.get("trade_date"):
         td = str(metadata["trade_date"]).strip()[:10]
-    source = "eastmoney_akshare"
+    source = "ths_fundflow"
     if metadata and metadata.get("source"):
         source = str(metadata["source"])
     data: dict = {

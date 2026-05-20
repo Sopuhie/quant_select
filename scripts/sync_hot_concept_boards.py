@@ -1,5 +1,7 @@
 """
-同步东方财富热门概念板块名称 + 成份股 → data/hot_sectors.json、board_stocks.json、SQLite。
+同步同花顺热门概念（资金流涨幅榜）+ 成份股 → data/hot_sectors.json、board_stocks.json、SQLite。
+
+默认数据源 ths_fundflow（见 config.HOT_CONCEPT_SOURCE / 环境变量 QUANT_HOT_CONCEPT_SOURCE）。
 
 用法（项目根目录）:
   python scripts/sync_hot_concept_boards.py
@@ -22,7 +24,7 @@ from src.config import DB_PATH
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="同步热门概念题材与成份股（东财/同花顺自动降级）")
+    p = argparse.ArgumentParser(description="同步同花顺热门概念题材与成份股")
     p.add_argument("--top-n", type=int, default=15, help="热门概念板块数量")
     p.add_argument("--force", action="store_true", help="强制刷新（忽略缓存日期）")
     p.add_argument(
@@ -53,7 +55,7 @@ def main() -> None:
     if not stats.get("tags_refreshed") and not stats.get("boards_synced"):
         print(
             "提示: 未拉取到新数据，已沿用本地缓存。"
-            "可执行: set QUANT_HOT_CONCEPT_SOURCE=ths_fundflow 后重试。",
+            "请检查网络或稍后重试（默认同花顺 ths_fundflow）。",
             flush=True,
         )
 

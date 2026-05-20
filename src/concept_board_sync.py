@@ -1,11 +1,9 @@
 """
 概念板块：热门题材列表 + 成份股 → JSON / SQLite。
 
-数据源（``QUANT_HOT_CONCEPT_SOURCE``）：
-  - ``auto``：东方财富 → 同花顺资金流涨幅榜 → 同花顺概念列表（无涨幅排序）
-  - ``em`` / ``ths`` / ``ths_fundflow``：指定单一来源
+默认数据源：同花顺概念资金流涨幅榜（``ths_fundflow``），按涨跌幅排序，网络稳定性优于东财 push2。
 
-东财 ``push2.eastmoney.com`` 在部分网络/代理环境下会连接被重置，``auto`` 会自动降级到同花顺。
+环境变量 ``QUANT_HOT_CONCEPT_SOURCE``：``ths_fundflow``（默认）| ``ths_list`` | ``em`` | ``auto``（同花顺优先，东财兜底）
 """
 from __future__ import annotations
 
@@ -23,7 +21,15 @@ import pandas as pd
 import requests
 
 from .board_stocks import BOARD_STOCKS_PATH, load_board_mapping, save_board_mapping
-from .config import DATA_DIR, DB_PATH, ensure_eastmoney_no_proxy_if_configured
+from .config import (
+    DATA_DIR,
+    DB_PATH,
+    HOT_CONCEPT_BOARD_SLEEP_SEC,
+    HOT_CONCEPT_CONS_MERGE,
+    HOT_CONCEPT_SOURCE,
+    HOT_CONCEPT_TOP_N,
+    ensure_eastmoney_no_proxy_if_configured,
+)
 from .database import sync_concept_boards_from_json
 from .hot_sectors import (
     HOT_SECTORS_PATH,
@@ -33,8 +39,8 @@ from .hot_sectors import (
     save_tags,
 )
 
-DEFAULT_HOT_TOP_N = 15
-DEFAULT_BOARD_SLEEP = 0.35
+DEFAULT_HOT_TOP_N = HOT_CONCEPT_TOP_N
+DEFAULT_BOARD_SLEEP = HOT_CONCEPT_BOARD_SLEEP_SEC
 _FETCH_RETRIES = 3
 _FETCH_RETRY_SLEEP = 2.0
 
@@ -61,7 +67,7 @@ _EM_CLIST_PARAMS = {
 
 
 def _hot_concept_source() -> str:
-    raw = os.environ.get("QUANT_HOT_CONCEPT_SOURCE", "auto").strip().lower()
+    raw = str(HOT_CONCEPT_SOURCE or "ths_fundflow").strip().lower()
     if raw in ("em", "eastmoney", "东财"):
         return "em"
     if raw in ("ths", "ths_fundflow", "同花顺", "10jqka"):
@@ -267,27 +273,38 @@ def fetch_hot_concept_names_ths_fundflow(top_n: int = DEFAULT_HOT_TOP_N) -> list
     r0 = requests.get(base_url.format(1), headers=headers, timeout=20)
     r0.raise_for_status()
     soup = BeautifulSoup(r0.text, features="lxml")
-    page_info = soup.find(name="span", attrs={"class": "page_info"})
-    if page_info is None:
-        raise RuntimeError("同花顺概念资金流：无法解析分页信息")
-    page_num = int(str(page_info.text).split("/")[1].strip())
+    def _parse_page(html: str) -> pd.DataFrame | None:
+        try:
+            part = pd.read_html(StringIO(html))[0]
+        except Exception:
+            return None
+        return part if part is not None and not part.empty else None
 
-    frames: list[pd.DataFrame] = []
-    for page in range(1, page_num + 1):
-        if page > 1:
-            time.sleep(random.uniform(0.15, 0.35))
-            v = _with_retries(_ths_v_cookie)
-            headers["hexin-v"] = v
+    page1 = _parse_page(r0.text)
+    if page1 is None:
+        raise RuntimeError("同花顺概念资金流：首页表格解析失败")
+
+    page_info = soup.find(name="span", attrs={"class": "page_info"})
+    page_num = 1
+    if page_info is not None:
+        try:
+            page_num = max(1, int(str(page_info.text).split("/")[1].strip()))
+        except Exception:
+            page_num = 1
+
+    frames: list[pd.DataFrame] = [page1]
+    # 按涨跌幅已排序，通常首页即可凑满 top_n；最多再拉 2 页作缓冲
+    max_pages = min(page_num, max(1, (n + 19) // 20) + 1, 3)
+    for page in range(2, max_pages + 1):
+        time.sleep(random.uniform(0.15, 0.35))
+        v = _with_retries(_ths_v_cookie)
+        headers["hexin-v"] = v
         rp = requests.get(base_url.format(page), headers=headers, timeout=20)
         rp.raise_for_status()
-        try:
-            part = pd.read_html(StringIO(rp.text))[0]
-        except Exception:
-            continue
-        if part is not None and not part.empty:
+        part = _parse_page(rp.text)
+        if part is not None:
             frames.append(part)
-    if not frames:
-        return []
+
     big = pd.concat(frames, ignore_index=True)
     name_col = next((c for c in big.columns if str(c).strip() == "行业"), None)
     if name_col is None:
@@ -344,10 +361,11 @@ def fetch_hot_concept_names(
     elif mode == "ths_list":
         chain = [("ths_list", fetch_hot_concept_names_ths_list)]
     else:
+        # auto：同花顺优先（稳定），东财仅作兜底
         chain = [
-            ("eastmoney", fetch_hot_concept_names_em),
             ("ths_fundflow", fetch_hot_concept_names_ths_fundflow),
             ("ths_list", fetch_hot_concept_names_ths_list),
+            ("eastmoney", fetch_hot_concept_names_em),
         ]
 
     errors: list[str] = []
@@ -386,44 +404,81 @@ def _parse_cons_codes(cons_df: pd.DataFrame) -> list[str]:
     return out
 
 
+def _resolve_ths_concept_code(board_name: str) -> str | None:
+    name = str(board_name).strip()
+    if not name:
+        return None
+    code_map = _ths_concept_name_code_map()
+    code = code_map.get(name)
+    if code:
+        return str(code)
+    for k, v in code_map.items():
+        if name in k or k in name:
+            return str(v)
+    return None
+
+
 def fetch_board_constituents_ths(
     board_name: str,
     *,
     sleep_sec: float = DEFAULT_BOARD_SLEEP,
 ) -> list[str]:
-    """同花顺概念详情页成份股（单页约 10 只，东财不可用时的降级）。"""
-    name = str(board_name).strip()
-    if not name:
-        return []
-    code_map = _ths_concept_name_code_map()
-    code = code_map.get(name)
-    if not code:
-        for k, v in code_map.items():
-            if name in k or k in name:
-                code = v
-                break
+    """同花顺概念详情页成份股（首屏表格；分页接口常 403，以详情页为准）。"""
+    code = _resolve_ths_concept_code(board_name)
     if not code:
         time.sleep(sleep_sec)
         return []
 
-    headers = _ths_request_headers(
-        referer=f"http://q.10jqka.com.cn/gn/detail/code/{code}/"
-    )
-    url = f"http://q.10jqka.com.cn/gn/detail/code/{code}/"
+    detail_url = f"http://q.10jqka.com.cn/gn/detail/code/{code}/"
+    headers = _ths_request_headers(referer=detail_url)
+    seen: set[str] = set()
+    out: list[str] = []
+
     try:
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        tables = pd.read_html(StringIO(r.text))
+        sess = requests.Session()
+        sess.get(detail_url, headers=headers, timeout=20)
+        ajax_tpl = (
+            "http://q.10jqka.com.cn/gn/detail/field/stocklist/{code}/"
+            "order/desc/ajax/1/page/{page}/free/1/"
+        )
+        for page in range(1, 31):
+            ajax_url = ajax_tpl.format(code=code, page=page)
+            h = dict(headers)
+            h["X-Requested-With"] = "XMLHttpRequest"
+            h["Referer"] = detail_url
+            r = sess.get(ajax_url, headers=h, timeout=20)
+            if r.status_code != 200 or len(r.text) < 80:
+                break
+            try:
+                part = _parse_cons_codes(pd.read_html(StringIO(r.text))[0])
+            except Exception:
+                break
+            if not part:
+                break
+            for c in part:
+                if c not in seen:
+                    seen.add(c)
+                    out.append(c)
+            if len(part) < 8:
+                break
+            time.sleep(0.15)
     except Exception:
-        time.sleep(sleep_sec)
-        return []
+        pass
+
+    if not out:
+        try:
+            r = requests.get(detail_url, headers=headers, timeout=20)
+            r.raise_for_status()
+            for tbl in pd.read_html(StringIO(r.text)):
+                for c in _parse_cons_codes(tbl):
+                    if c not in seen:
+                        seen.add(c)
+                        out.append(c)
+        except Exception:
+            pass
+
     time.sleep(sleep_sec)
-    best: list[str] = []
-    for tbl in tables:
-        codes = _parse_cons_codes(tbl)
-        if len(codes) > len(best):
-            best = codes
-    return best
+    return out
 
 
 def fetch_board_constituents_em(
@@ -451,13 +506,21 @@ def fetch_board_constituents(
     *,
     sleep_sec: float = DEFAULT_BOARD_SLEEP,
 ) -> tuple[list[str], str]:
-    """成份股：东财优先，失败则同花顺详情页（可能仅部分成份）。"""
+    """成份股：默认同花顺；``em`` 仅东财；``auto`` 同花顺优先、东财兜底。"""
+    mode = _hot_concept_source()
+    if mode == "em":
+        codes = fetch_board_constituents_em(board_name, sleep_sec=sleep_sec)
+        return (codes, "eastmoney") if codes else ([], "")
+
+    codes = fetch_board_constituents_ths(board_name, sleep_sec=sleep_sec)
+    if codes:
+        return codes, "ths"
+    if mode in ("ths_fundflow", "ths_list", "ths"):
+        return [], ""
+
     codes = fetch_board_constituents_em(board_name, sleep_sec=sleep_sec)
     if codes:
         return codes, "eastmoney"
-    codes = fetch_board_constituents_ths(board_name, sleep_sec=sleep_sec)
-    if codes:
-        return codes, "ths_detail"
     return [], ""
 
 
@@ -465,10 +528,11 @@ def sync_constituents_for_boards(
     board_names: list[str],
     *,
     sleep_sec: float = DEFAULT_BOARD_SLEEP,
-    replace: bool = True,
+    replace: bool = False,
     verbose: bool = True,
+    source_label: str | None = None,
 ) -> dict[str, int]:
-    """拉取指定概念板块成份股并写入 board_stocks.json。"""
+    """拉取指定概念板块成份股并写入 board_stocks.json（默认 merge 合并，避免覆盖旧成份）。"""
     names = [str(x).strip() for x in board_names if str(x).strip()]
     if not names:
         return {"boards": 0, "stocks": 0, "failed": 0}
@@ -483,7 +547,7 @@ def sync_constituents_for_boards(
             if verbose:
                 print(f"[ConceptSync] 跳过（无成份）: {board}", flush=True)
             continue
-        if src == "ths_detail" and len(codes) < 15:
+        if src == "ths" and len(codes) < 15:
             partial += 1
         mapping[board] = codes
         if verbose and i % 5 == 0:
@@ -495,7 +559,12 @@ def sync_constituents_for_boards(
     if not mapping:
         return {"boards": 0, "stocks": 0, "failed": failed, "partial": partial}
 
-    save_board_mapping(mapping, merge=not replace)
+    merge_boards = HOT_CONCEPT_CONS_MERGE if not replace else False
+    src = (source_label or "").strip()
+    if not src or src == "auto":
+        mode = _hot_concept_source()
+        src = "ths_fundflow" if mode in ("auto", "ths_fundflow", "ths", "ths_list") else mode
+    save_board_mapping(mapping, merge=merge_boards, source=src)
     n_stocks = len(load_board_mapping())
     return {
         "boards": len(mapping),
@@ -581,8 +650,9 @@ def ensure_hot_sectors_for_trade_date(
             try:
                 bstats = sync_constituents_for_boards(
                     tags,
-                    replace=True,
+                    replace=not HOT_CONCEPT_CONS_MERGE,
                     verbose=verbose,
+                    source_label=str(stats.get("source") or ""),
                 )
                 stats["boards_synced"] = int(bstats.get("boards", 0))
                 stats["boards_partial"] = int(bstats.get("partial", 0))

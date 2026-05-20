@@ -454,8 +454,17 @@ def get_quant_config_merged() -> dict[str, Any]:
 SCRIPT_UPDATE_LOCAL_DATA = PROJECT_ROOT / "scripts" / "update_local_data.py"
 SCRIPT_SYNC_HOT_CONCEPT = PROJECT_ROOT / "scripts" / "sync_hot_concept_boards.py"
 
-# 热门题材数据源：auto | em | ths_fundflow | ths_list（东财不可达时 auto 会降级同花顺）
-HOT_CONCEPT_SOURCE = os.environ.get("QUANT_HOT_CONCEPT_SOURCE", "auto").strip().lower()
+# 热门题材：默认同花顺资金流涨幅榜（东财 push2 在部分网络下不稳定）
+# 可选 ths_fundflow | ths_list | em | auto（同花顺优先，东财兜底）
+HOT_CONCEPT_SOURCE = os.environ.get("QUANT_HOT_CONCEPT_SOURCE", "ths_fundflow").strip().lower()
+HOT_CONCEPT_TOP_N = max(5, int(os.environ.get("QUANT_HOT_CONCEPT_TOP_N", "15")))
+HOT_CONCEPT_BOARD_SLEEP_SEC = float(os.environ.get("QUANT_HOT_CONCEPT_BOARD_SLEEP", "0.35"))
+# 成份股写入 JSON 时与已有板块合并（同花顺详情页单次约 10 只，合并可避免覆盖历史东财成份）
+HOT_CONCEPT_CONS_MERGE = os.environ.get("QUANT_HOT_CONCEPT_CONS_MERGE", "1") not in (
+    "0",
+    "false",
+    "False",
+)
 SCRIPT_TRAIN_MODEL = PROJECT_ROOT / "train_model.py"
 SCRIPT_RUN_DAILY = PROJECT_ROOT / "run_daily.py"
 SCRIPT_BACKTEST = PROJECT_ROOT / "scripts" / "backtest.py"

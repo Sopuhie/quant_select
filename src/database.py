@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS daily_selections (
     close_price REAL,
     next_day_return REAL,
     hold_5d_return REAL,
+    hold_10d_return REAL,
+    hold_60d_return REAL,
     selection_reason TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(trade_date, stock_code)
@@ -220,6 +222,20 @@ def _ensure_daily_selections_selection_reason(conn: sqlite3.Connection) -> None:
             pass
 
 
+def _ensure_daily_selections_hold_returns(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_selections'")
+    if cur.fetchone() is None:
+        return
+    cur = conn.execute("PRAGMA table_info(daily_selections)")
+    cols = {str(row[1]) for row in cur.fetchall()}
+    for col in ("hold_10d_return", "hold_60d_return"):
+        if col not in cols:
+            try:
+                conn.execute(f"ALTER TABLE daily_selections ADD COLUMN {col} REAL")
+            except Exception:
+                pass
+
+
 def _ensure_stock_daily_kline_market_cap(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_daily_kline'")
     if cur.fetchone() is None:
@@ -301,6 +317,7 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_stock_daily_kline_market_cap(conn)
         _ensure_stock_daily_kline_turnover_pe(conn)
         _ensure_daily_selections_selection_reason(conn)
+        _ensure_daily_selections_hold_returns(conn)
         _ensure_stock_concept_boards(conn)
         _ensure_market_hsgt_flow_daily(conn)
         _ensure_performance_indexes(conn)
@@ -591,11 +608,30 @@ def delete_daily_outputs_for_trade_date(trade_date: str, db_path: Path | None = 
         conn.execute("DELETE FROM daily_predictions WHERE trade_date = ?", (trade_date,))
 
 
-def update_selection_returns(trade_date: str, stock_code: str, next_day_return: float | None = None, hold_5d_return: float | None = None, db_path: Path | None = None) -> int:
+def update_selection_returns(
+    trade_date: str,
+    stock_code: str,
+    next_day_return: float | None = None,
+    hold_5d_return: float | None = None,
+    hold_10d_return: float | None = None,
+    hold_60d_return: float | None = None,
+    db_path: Path | None = None,
+) -> int:
     sets, vals = [], []
-    if next_day_return is not None: sets.append("next_day_return = ?"); vals.append(next_day_return)
-    if hold_5d_return is not None: sets.append("hold_5d_return = ?"); vals.append(hold_5d_return)
-    if not sets: return 0
+    if next_day_return is not None:
+        sets.append("next_day_return = ?")
+        vals.append(next_day_return)
+    if hold_5d_return is not None:
+        sets.append("hold_5d_return = ?")
+        vals.append(hold_5d_return)
+    if hold_10d_return is not None:
+        sets.append("hold_10d_return = ?")
+        vals.append(hold_10d_return)
+    if hold_60d_return is not None:
+        sets.append("hold_60d_return = ?")
+        vals.append(hold_60d_return)
+    if not sets:
+        return 0
     raw = str(stock_code).strip()
     code_key = raw.zfill(6) if raw.isdigit() else raw
     if code_key == raw:

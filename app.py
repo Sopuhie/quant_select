@@ -937,7 +937,7 @@ def _render_system_console_tab() -> None:
     col_ret1, col_ret2 = st.columns([3, 1])
     with col_ret1:
         st.info(
-            "回填工具会自动追踪历史选股后的 +1日收益率 和 +5日持有期累计收益率，从而精确评估算法胜率。"
+            "回填工具会自动追踪历史选股后的次日、5日、10日、60日持有期收益率，用于评估算法胜率。"
         )
     with col_ret2:
         return_btn = st.button(
@@ -1288,7 +1288,8 @@ with tab_hist:
                    THEN close_price * (1.0 + next_day_return)
                    ELSE NULL
                END AS next_day_close,
-               next_day_return, hold_5d_return, selection_reason
+               next_day_return, hold_5d_return, hold_10d_return, hold_60d_return,
+               selection_reason
         FROM daily_selections
         ORDER BY trade_date DESC, rank ASC
         """
@@ -1304,7 +1305,12 @@ with tab_hist:
             ins_at = cols.index("close_price") + 1
             cols = cols[:ins_at] + ["第二天收盘价"] + cols[ins_at:]
             display_df = display_df[cols]
-        for col in ["next_day_return", "hold_5d_return"]:
+        for col in [
+            "next_day_return",
+            "hold_5d_return",
+            "hold_10d_return",
+            "hold_60d_return",
+        ]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda x: f"{float(x):.2%}" if pd.notna(x) else "—"
@@ -1319,6 +1325,8 @@ with tab_hist:
             "第二天收盘价": "第二天收盘价",
             "next_day_return": "次日收益率",
             "hold_5d_return": "五日收益率",
+            "hold_10d_return": "十日收益率",
+            "hold_60d_return": "六十日收益率",
             "selection_reason": "入选原因",
         }
         display_df = display_df.rename(
@@ -1334,6 +1342,8 @@ with tab_hist:
             "第二天收盘价",
             "次日收益率",
             "五日收益率",
+            "十日收益率",
+            "六十日收益率",
             "入选原因",
         ]
         display_df = display_df[
@@ -2124,9 +2134,10 @@ with tab_theme:
     _tags_source = str(_theme_meta.get("source", "") or "").strip()
     _src_label = {
         "eastmoney": "东方财富",
-        "ths_fundflow": "同花顺资金流涨幅榜",
+        "ths_fundflow": "同花顺（资金流涨幅榜）",
         "ths_list": "同花顺概念列表",
-    }.get(_tags_source, _tags_source or "本地缓存")
+        "ths": "同花顺",
+    }.get(_tags_source, _tags_source or "同花顺/本地缓存")
 
     st.caption(
         f"热点题材交易日：{_tags_date or '—'} · 数据源：{_src_label}"
@@ -2145,13 +2156,13 @@ with tab_theme:
             "" if sel == _THEME_ALL_LABEL else str(sel)
         )
 
-    st.markdown("##### 🏷️ 今日全市场焦点题材推荐（概念涨幅榜）")
+    st.markdown("##### 🏷️ 今日全市场焦点题材推荐（同花顺概念涨幅榜）")
     st.selectbox(
         "从热点题材中选择",
         options=_theme_options,
         index=0,
         key="theme_focus_select",
-        help="优先东方财富概念涨幅榜；不可用时自动降级同花顺资金流涨幅榜（环境变量 QUANT_HOT_CONCEPT_SOURCE）。",
+        help="默认从同花顺数据中心「概念资金流」按涨跌幅排序；由 QUANT_HOT_CONCEPT_SOURCE 控制（默认 ths_fundflow）。",
         on_change=_sync_theme_keyword_from_select,
     )
 
@@ -2191,7 +2202,7 @@ with tab_theme:
 
     if st.button("♻️ 立即刷新热点题材与成份股", key="refresh_theme_em"):
         _cached_theme_board_setup.clear()
-        with st.spinner("正在拉取最新热门概念及成份股（东财/同花顺）…"):
+        with st.spinner("正在从同花顺拉取最新热门概念及成份股…"):
             try:
                 # 必须 force_refresh=True；走缓存函数时 force_refresh=False，
                 # 本地 date 已与 K 线末日一致时会跳过拉取，按钮形同虚设。
@@ -2214,7 +2225,7 @@ with tab_theme:
                     st.session_state.theme_refresh_feedback = (
                         "warning",
                         "未拉取到新数据，已沿用本地缓存。"
-                        "可设 QUANT_HOT_CONCEPT_SOURCE=ths_fundflow 强制走同花顺，或检查网络/代理。",
+                        "请检查网络后重试，或执行 scripts/sync_hot_concept_boards.py --force。",
                     )
                 else:
                     _src = str(_theme_setup.get("source") or "")

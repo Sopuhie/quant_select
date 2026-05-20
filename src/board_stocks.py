@@ -1,5 +1,5 @@
 """
-概念板块→成分股映射（东方财富成份，JSON + 供 database 同步 SQLite）。
+概念板块→成分股映射（默认同花顺，JSON + 供 database 同步 SQLite）。
 """
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ BOARD_STOCKS_PATH = DATA_DIR / "board_stocks.json"
 def save_board_mapping(
     mapping: dict[str, list[str]],
     merge: bool = True,
+    *,
+    source: str | None = None,
 ) -> None:
     """
     mapping: {"PLC概念": ["002979", ...], ...}
@@ -60,10 +62,11 @@ def save_board_mapping(
                 stock_to_boards[c6].append(board)
 
     total_codes = sum(len(v) for v in merged_boards.values())
+    src = (source or "ths_fundflow").strip() or "ths_fundflow"
     data = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "date": datetime.now().strftime("%Y-%m-%d"),
-        "source": "eastmoney_akshare",
+        "source": src,
         "board_count": len(merged_boards),
         "stock_count": len(stock_to_boards),
         "stock_board_entries": total_codes,

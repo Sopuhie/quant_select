@@ -127,7 +127,7 @@ def run_complete_pipeline(
     steps.extend(
         [
         {
-            "name": "2. 热门概念题材与成份股同步",
+            "name": "2. 同花顺热门题材与成份股同步",
             "args": [python_exe, str(SCRIPT_SYNC_HOT_CONCEPT)],
         },
         {
@@ -166,6 +166,7 @@ def run_complete_pipeline(
     full_log_accumulator.append(header)
 
     env = os.environ.copy()
+    env.setdefault("QUANT_HOT_CONCEPT_SOURCE", "ths_fundflow")
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("PYTHONIOENCODING", "utf-8")
     if sys.platform == "win32":
