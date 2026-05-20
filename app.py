@@ -1172,6 +1172,7 @@ def _render_system_console_tab() -> None:
     tab_today,
     tab_data,
     tab_theme,
+    tab_short,
     tab_match,
     tab_hist,
     tab_advisor,
@@ -1184,6 +1185,7 @@ def _render_system_console_tab() -> None:
         "🎯 今日推荐",
         "⚙️ 系统控制台",
         "🔥 热门题材高爆选股",
+        "⚡ 短线规则（1日）",
         "🎨 视觉图形选股",
         "📜 历史与股票K线查询",
         "🔬 智能诊股",
@@ -2251,6 +2253,111 @@ with tab_settings:
     if DB_PATH.exists():
         db_size = DB_PATH.stat().st_size / (1024 * 1024)
     col_s3.metric("SQLite 数据库大小", f"{db_size:.2f} MB")
+
+# ----------------- TAB: ⚡ 短线规则选股（1 日持有，独立模块）-----------------
+with tab_short:
+    st.markdown("### ⚡ 短线规则选股（持有 1 个交易日）")
+    st.caption(
+        "T 日收盘出信号 → T+1 开盘买入 → T+2 开盘卖出。"
+        "与中长线 LightGBM、题材 v2.0 独立；规则见 ``src/short_term/strategy.py``。"
+        "命令行：``python scripts/run_short_daily.py``。"
+    )
+    from src.short_term.config import SHORT_MIN_MARKET_SCORE, SHORT_TOP_N
+    from src.short_term.db import ensure_short_term_tables, load_short_selections_df
+    from src.short_term.strategy import ShortTermRuleStrategy
+
+    with get_connection(DB_PATH) as _st_conn:
+        ensure_short_term_tables(_st_conn)
+        _st_td_row = _st_conn.execute(
+            "SELECT MAX(date) FROM stock_daily_kline"
+        ).fetchone()
+        _st_db_row = _st_conn.execute(
+            "SELECT MAX(trade_date) FROM short_daily_selections"
+        ).fetchone()
+    _st_kline_date = (
+        str(_st_td_row[0]).strip()[:10] if _st_td_row and _st_td_row[0] else ""
+    )
+    _st_saved_date = (
+        str(_st_db_row[0]).strip()[:10] if _st_db_row and _st_db_row[0] else "—"
+    )
+    st.caption(
+        f"本地最新 K 线日：{_st_kline_date or '—'} · 库内最近短线记录：{_st_saved_date}"
+        f" · 默认 Top {SHORT_TOP_N} · 大盘环境分下限 {SHORT_MIN_MARKET_SCORE}"
+    )
+
+    _st_col_run, _st_col_push, _st_col_hist = st.columns([3, 2, 2])
+    with _st_col_run:
+        run_short_btn = st.button(
+            "🚀 运行短线规则扫描",
+            use_container_width=True,
+            key="run_short_term_scan",
+        )
+    with _st_col_push:
+        push_short_ding_btn = st.button(
+            "📲 推送库内记录到钉钉",
+            use_container_width=True,
+            key="push_short_dingtalk",
+        )
+    with _st_col_hist:
+        show_short_hist = st.checkbox(
+            "显示库内已保存记录",
+            value=True,
+            key="short_show_saved",
+        )
+
+    if push_short_ding_btn:
+        if not _st_saved_date or _st_saved_date == "—":
+            st.warning("库内无短线记录，请先运行 scripts/run_short_daily.py。")
+        else:
+            from src.short_term.dingtalk import maybe_push_short_selections
+            from src.market_regime import compute_market_regime_score
+
+            _mkt_push = compute_market_regime_score(_st_saved_date)
+            with st.spinner("正在推送钉钉…"):
+                _ding_ok = maybe_push_short_selections(
+                    _st_saved_date, market_score=_mkt_push
+                )
+            if _ding_ok:
+                st.success(f"已向钉钉推送 {_st_saved_date} 短线选股。")
+            else:
+                st.warning(
+                    "推送未成功：请检查 config.json 钉钉配置、"
+                    "notification.send_on_success，或控制台日志。"
+                )
+
+    if run_short_btn:
+        with st.spinner("正在扫描全市场短线共振信号…"):
+            try:
+                with get_connection(DB_PATH) as conn:
+                    scanner = ShortTermRuleStrategy(conn)
+                    short_df, scanned_date, mkt = scanner.scan()
+            except Exception as exc:
+                st.error(f"扫描失败：{exc}")
+            else:
+                if not scanned_date:
+                    st.warning("本地 stock_daily_kline 无可用日期，请先同步行情。")
+                elif mkt < SHORT_MIN_MARKET_SCORE:
+                    st.warning(
+                        f"📅 {scanned_date} 沪深300 环境分 {mkt} 低于 {SHORT_MIN_MARKET_SCORE}，"
+                        "本日不出短线信号。"
+                    )
+                elif short_df.empty:
+                    st.info(f"📅 {scanned_date} 暂无满足规则的短线标的。")
+                else:
+                    st.success(
+                        f"🎯 {scanned_date} 捕获 {len(short_df)} 只（环境分 {mkt}，未自动写库；"
+                        "落库请运行 scripts/run_short_daily.py）"
+                    )
+                    st.dataframe(short_df, use_container_width=True, hide_index=True)
+
+    if show_short_hist and _st_saved_date and _st_saved_date != "—":
+        with get_connection(DB_PATH) as conn:
+            hist_df = load_short_selections_df(conn, _st_saved_date)
+        if hist_df.empty:
+            st.caption("库内暂无 short_daily_selections 记录。")
+        else:
+            st.markdown(f"##### 库内记录 · {_st_saved_date}")
+            st.dataframe(hist_df, use_container_width=True, hide_index=True)
 
 # ----------------- TAB: 🔥 热门题材高爆选股（置于末尾，避免网络同步阻塞其它 Tab）-----------------
 with tab_theme:
