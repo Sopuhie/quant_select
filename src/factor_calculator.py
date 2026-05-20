@@ -1214,7 +1214,8 @@ def compute_factors_for_history(df: pd.DataFrame) -> pd.DataFrame:
     for c in FEATURE_COLUMNS:
         if c not in out.columns:
             out[c] = np.nan
-    tech = out[TECH_FEATURE_COLUMNS].ffill().bfill().fillna(0.0)
+    # 仅 ffill：禁止 bfill，避免用未来 K 线填充历史缺口（前视偏差）
+    tech = out[TECH_FEATURE_COLUMNS].ffill().fillna(0.0)
     alt = out[ALT_FEATURE_COLUMNS].ffill().fillna(0.0)
     out = pd.concat([tech, alt], axis=1)
     return out[FEATURE_COLUMNS]

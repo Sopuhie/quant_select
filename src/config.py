@@ -56,13 +56,33 @@ NEAR_LIMIT_PCT_THRESHOLD = float(os.environ.get("QUANT_NEAR_LIMIT_PCT", "0.095")
 # --- 前期涨幅/动量压制（截面清洗前按原始因子比较）---
 # ``QUANT_PREV_GAIN_SUPPRESSION=0`` 关闭；为 1/true 时同时作用于：全市场选股/回测/在线预测与「智能诊股」硬提示。
 ENABLE_PREV_GAIN_SUPPRESSION = os.environ.get(
-    "QUANT_PREV_GAIN_SUPPRESSION", "0"
-) in ("1", "true", "True")
+    "QUANT_PREV_GAIN_SUPPRESSION", "1"
+) not in ("0", "false", "False")
 MAX_ALLOWED_5D_RETURN = float(os.environ.get("QUANT_MAX_5D_RETURN", "0.12"))
 MAX_ALLOWED_20D_RETURN = float(os.environ.get("QUANT_MAX_20D_MOMENTUM", "0.30"))
 
-# 股票池：训练与预测时最多处理的股票数量（AkShare 全市场较慢，可先调小验证流程）
+# 股票池：训练、回测、run_daily 默认共用上限（AkShare 全市场较慢，可先调小验证流程）
 MAX_STOCKS_UNIVERSE = int(os.environ.get("QUANT_MAX_STOCKS", "400"))
+
+
+def resolve_run_daily_max_stocks(cli_value: int | None) -> int | None:
+    """
+    每日选股股票池上限：CLI ``--max-stocks`` 优先；
+    否则 ``QUANT_RUN_DAILY_MAX_STOCKS``（``0``/``none``/``all``=不限制）；
+    未设环境变量时与 ``MAX_STOCKS_UNIVERSE`` 对齐，保证与训练/回测可比。
+    """
+    if cli_value is not None:
+        return int(cli_value) if int(cli_value) > 0 else None
+    raw = (os.environ.get("QUANT_RUN_DAILY_MAX_STOCKS", "") or "").strip().lower()
+    if raw in ("0", "none", "all", "unlimited"):
+        return None
+    if not raw:
+        return int(MAX_STOCKS_UNIVERSE)
+    try:
+        v = int(raw)
+        return v if v > 0 else None
+    except ValueError:
+        return int(MAX_STOCKS_UNIVERSE)
 
 # AkShare HTTP 超时（秒）；超时或失败则跳过该股票，避免长时间卡死
 AKSHARE_REQUEST_TIMEOUT = float(os.environ.get("QUANT_AK_TIMEOUT", "30"))
@@ -224,9 +244,9 @@ RANK_SAMPLE_WEIGHT_NEG_THRESH = float(
 # 历史大幅回撤样本：在极端损失加权之上再乘倍数（与 quant.ranking 可合并）
 RANK_DRAWDOWN_WEIGHT_MULT = float(os.environ.get("QUANT_RANK_DD_WEIGHT_MULT", "2.0"))
 RANK_DRAWDOWN_WEIGHT_THRESH = float(os.environ.get("QUANT_RANK_DD_WEIGHT_THRESH", "-0.07"))
-# Meta 训练：训练集内按交易日 Walk-forward OOF 折数；0 或 1 表示关闭 OOF（与旧版同分布的 in-sample meta）
+# Meta 训练：训练集内按交易日 Walk-forward OOF 折数；0 或 1 表示关闭 OOF（in-sample meta，易过拟合）
 # OOF 折内并行见 model_trainer.walkforward_oof_base_predictions：QUANT_OOF_MAX_WORKERS、QUANT_OOF_WORKER_OMP_THREADS 等
-RANK_META_OOF_FOLDS = int(os.environ.get("QUANT_META_OOF_FOLDS", "0"))
+RANK_META_OOF_FOLDS = max(0, int(os.environ.get("QUANT_META_OOF_FOLDS", "3")))
 
 # PSI：验证集 vs 训练集预测分分布稳定性（仅记录告警，不阻断训练）
 PSI_SCORE_BINS = max(5, int(os.environ.get("QUANT_PSI_BINS", "12")))
@@ -397,6 +417,14 @@ THEME_LIMIT_UP_TOLERANCE = 0.005
 MARKET_REGIME_MIN_SCORE = max(
     0, min(100, int(os.environ.get("QUANT_MARKET_REGIME_MIN_SCORE", "60")))
 )
+# 本地 index_daily 无足够沪深300数据时使用的环境分（默认 50 < 60 → 保守熔断）
+MARKET_REGIME_MISSING_DATA_SCORE = max(
+    0,
+    min(
+        100,
+        int(os.environ.get("QUANT_MARKET_REGIME_MISSING_SCORE", "50")),
+    ),
+)
 
 
 def get_quant_config_merged() -> dict[str, Any]:
@@ -468,6 +496,7 @@ HOT_CONCEPT_CONS_MERGE = os.environ.get("QUANT_HOT_CONCEPT_CONS_MERGE", "1") not
 SCRIPT_TRAIN_MODEL = PROJECT_ROOT / "train_model.py"
 SCRIPT_RUN_DAILY = PROJECT_ROOT / "run_daily.py"
 SCRIPT_BACKTEST = PROJECT_ROOT / "scripts" / "backtest.py"
+SCRIPT_WALKFORWARD_BACKTEST = PROJECT_ROOT / "scripts" / "walkforward_backtest.py"
 SCRIPT_UPDATE_RETURNS = PROJECT_ROOT / "update_returns.py"
 SCRIPT_SYNC_AUXILIARY = PROJECT_ROOT / "scripts" / "sync_auxiliary_features.py"
 

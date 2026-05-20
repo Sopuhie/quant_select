@@ -5,7 +5,7 @@ Streamlit 复盘与全功能控制台（浅色清晰主题）。
   2. 模型重新训练
   3. 每日选股预测
   4. 历史收益回填
-  5. 2024 滚动回测
+  5. 历史滚动回测 / Walk-forward 滚动重训回测
   6. 🔥 热门题材高爆规则选股 v2.0（单表共振 + 实盘决策结论，MACD+KDJ）
   7. 🎨 视觉图形选股（本地 K 线形态相似度扫描）
 
@@ -48,6 +48,7 @@ from src.config import (
     MODEL_PATH,
     SCHEDULER_RUN_AT,
     SCRIPT_BACKTEST,
+    SCRIPT_WALKFORWARD_BACKTEST,
     SCRIPT_RUN_DAILY,
     SCRIPT_TRAIN_MODEL,
     SCRIPT_UPDATE_LOCAL_DATA,
@@ -691,6 +692,113 @@ def _pattern_range_from_plotly_state(
     return xs_u[0], xs_u[-1]
 
 
+BACKTEST_CSV_PATH = DATA_DIR / "backtest_results.csv"
+WALKFORWARD_CSV_PATH = DATA_DIR / "walkforward_backtest_results.csv"
+
+
+def _get_kline_date_bounds() -> tuple[str | None, str | None]:
+    """本地 stock_daily_kline 的最早/最晚交易日（YYYY-MM-DD）。"""
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT MIN(date), MAX(date) FROM stock_daily_kline"
+            ).fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return None, None
+        return str(row[0]).strip()[:10], str(row[1]).strip()[:10]
+    except Exception:
+        return None, None
+
+
+def _render_backtest_analysis(
+    csv_path: Path,
+    *,
+    title: str,
+    empty_hint: str,
+) -> None:
+    """展示回测净值 CSV：累计收益、MDD、对比沪深300曲线。"""
+    st.markdown(f"#### {title}")
+    if not csv_path.is_file():
+        st.info(empty_hint)
+        return
+    try:
+        df_res = pd.read_csv(csv_path)
+        if df_res.empty or "nav" not in df_res.columns:
+            st.warning("CSV 无有效 nav 列。")
+            return
+        td_col = "trade_date" if "trade_date" in df_res.columns else None
+        if td_col is None:
+            st.warning("CSV 缺少 trade_date 列。")
+            return
+
+        df_res = df_res.sort_values(td_col).reset_index(drop=True)
+        df_res["strategy_cum"] = (
+            df_res["nav"] / float(df_res["nav"].iloc[0]) - 1.0
+        ) * 100
+
+        has_bench = (
+            "benchmark_close" in df_res.columns
+            and df_res["benchmark_close"].notna().any()
+        )
+        if has_bench:
+            valid_bench = df_res["benchmark_close"].dropna()
+            if not valid_bench.empty:
+                df_res["bench_cum"] = (
+                    df_res["benchmark_close"] / float(valid_bench.iloc[0]) - 1.0
+                ) * 100
+
+        cum_ret = float(df_res["nav"].iloc[-1] / df_res["nav"].iloc[0] - 1.0)
+        peak = df_res["nav"].cummax()
+        mdd = float((df_res["nav"] / peak - 1.0).min())
+
+        if "wf_window" in df_res.columns:
+            n_win = int(df_res["wf_window"].nunique())
+            st.caption(f"Walk-forward 窗口数：{n_win}（列 wf_window / wf_train_end）")
+
+        col_m1, col_m2, col_m3 = st.columns(3)
+        with col_m1:
+            st.metric("策略累计收益", f"{cum_ret * 100:.2f}%")
+        with col_m2:
+            st.metric("最大回撤 (MDD)", f"{mdd * 100:.2f}%")
+        with col_m3:
+            st.metric("回测交易日数", f"{len(df_res)}")
+
+        fig = go.Figure()
+        draw_cyber_area_trace(
+            fig,
+            df_res,
+            x_col=td_col,
+            y_col="strategy_cum",
+            name="A-Quant 策略",
+        )
+        if has_bench and "bench_cum" in df_res.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_res[td_col],
+                    y=df_res["bench_cum"],
+                    mode="lines",
+                    name="沪深 300 基准",
+                    line=dict(color=COLOR_CYBER_ORANGE, width=2, dash="dash"),
+                )
+            )
+        fig.update_layout(
+            get_cyber_layout(f"{title} — 累计收益率 (%)"), height=550
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        buf_res = io.StringIO()
+        df_res.to_csv(buf_res, index=False)
+        st.download_button(
+            f"💾 导出 {csv_path.name}",
+            data=buf_res.getvalue().encode("utf-8-sig"),
+            file_name=csv_path.name,
+            mime="text/csv",
+            key=f"dl_{csv_path.name}",
+        )
+    except Exception as err:
+        st.error(f"解析回测数据出错: {err}")
+
+
 @st.fragment
 def _render_system_console_tab() -> None:
     """系统控制台 Tab 主体（fragment 隔离，避免其它 Tab 的 session_state 冲突导致空白）。"""
@@ -898,7 +1006,7 @@ def _render_system_console_tab() -> None:
             """
             <div style="background-color: #ffffff; border: 1px solid #e2e8f0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,0.06);">
                 <h4 style="color: #0f766e; margin-top:0;">📈 任务 D：运行策略历史滚动回测</h4>
-                <p style="font-size: 0.85rem; color: #475569;">基于本地 stock_daily_kline；不传日期时默认回测区间为库内最早日至最晚日。基准 000300 优先读库。不足可加 --online-fallback。板块（创业板/科创板）与左侧勾选一致。点击启动时会先将左侧「经验风控阈值」写入 config.json，再运行回测（与「运行每日预测」一致）。</p>
+                <p style="font-size: 0.85rem; color: #475569;">基于本地 stock_daily_kline；默认<strong>时点可得（PIT）股票池</strong>与 run_daily 一致的风控链。不传日期时回测区间为库内最早～最晚日。板块与任务 C 勾选一致。Walk-forward 见下方任务 D2。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -929,6 +1037,107 @@ def _render_system_console_tab() -> None:
                     )
                 else:
                     st.error("❌ 回测异常，请查阅上方调试日志")
+
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style="background-color: #fff7ed; border: 1px solid #fed7aa; padding: 18px; border-radius: 8px;">
+            <h4 style="color: #c2410c; margin-top:0;">📈 任务 D2：Walk-forward 滚动重训回测</h4>
+            <p style="font-size: 0.85rem; color: #475569;">
+                每 N 个交易日用<strong>样本外</strong>数据重训模型，再对下一段区间回测并拼接净值。
+                默认快速训练（--fast-train --no-catboost），耗时显著长于单次回测。
+                结果写入 <code>data/walkforward_backtest_results.csv</code>。
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    _db_lo, _db_hi = _get_kline_date_bounds()
+    _wf_default_start = _db_lo or "2024-01-01"
+    _wf_default_end = _db_hi or date.today().isoformat()
+    wf_c1, wf_c2, wf_c3, wf_c4 = st.columns(4)
+    with wf_c1:
+        wf_start = st.text_input(
+            "回测开始日",
+            value=_wf_default_start,
+            key="wf_bt_start",
+        )
+    with wf_c2:
+        wf_end = st.text_input(
+            "回测结束日",
+            value=_wf_default_end,
+            key="wf_bt_end",
+        )
+    with wf_c3:
+        wf_retrain = st.number_input(
+            "每 N 个交易日重训",
+            min_value=20,
+            max_value=120,
+            value=60,
+            step=5,
+            key="wf_bt_retrain_every",
+        )
+    with wf_c4:
+        wf_fast = st.checkbox(
+            "快速训练",
+            value=True,
+            key="wf_bt_fast_train",
+            help="勾选则 --fast-train；取消则全量训练（很慢）",
+        )
+    wf_cb1, wf_cb2 = st.columns(2)
+    with wf_cb1:
+        wf_inc_300 = st.checkbox(
+            "包含创业板 (300/301)",
+            value=include_300,
+            key="wf_bt_include_300",
+        )
+    with wf_cb2:
+        wf_inc_688 = st.checkbox(
+            "包含科创板 (688)",
+            value=include_688,
+            key="wf_bt_include_688",
+        )
+    wf_btn = st.button(
+        "🚀 启动 Walk-forward 回测",
+        key="run_walkforward_backtest",
+        use_container_width=True,
+    )
+    if wf_btn:
+        with st.spinner(
+            "Walk-forward 执行中（含多次重训，可能需数十分钟）…"
+        ):
+            save_wf, err_wf = _persist_experience_filters_from_ui()
+            if not save_wf:
+                st.error(f"❌ {err_wf}" if err_wf else "❌ 未启动。")
+                st.stop()
+            wf_cmd = [
+                sys.executable,
+                str(SCRIPT_WALKFORWARD_BACKTEST),
+                "--start-date",
+                str(wf_start).strip()[:10],
+                "--end-date",
+                str(wf_end).strip()[:10],
+                "--retrain-every",
+                str(int(wf_retrain)),
+            ]
+            if wf_fast:
+                wf_cmd.append("--fast-train")
+            else:
+                wf_cmd.append("--full-train")
+            if wf_inc_300:
+                wf_cmd.append("--include-300")
+            if wf_inc_688:
+                wf_cmd.append("--include-688")
+            ret_wf, _log_wf = run_command_interactive(
+                wf_cmd,
+                task_name="Walk-forward 滚动重训回测",
+            )
+            if ret_wf == 0:
+                st.success(
+                    f"✅ Walk-forward 完成！结果：{WALKFORWARD_CSV_PATH}"
+                )
+            else:
+                st.error("❌ Walk-forward 异常，请查阅上方调试日志")
 
     st.markdown("---")
     st.subheader("🔄 任务 E：历史选股收益回填")
@@ -1704,78 +1913,32 @@ with tab_match:
 # ----------------- TAB 5: 📈 历史回测 -----------------
 with tab_backtest:
     st.subheader("📈 策略历史回测分析")
-    st.caption("基于 LightGBM 历史滚动预测与周期换仓策略（2024 样本外滚动）。")
+    st.caption(
+        "单次回测：固定磁盘模型 + 默认时点可得（PIT）股票池。"
+        "Walk-forward：分段样本外重训后拼接净值。均在「系统控制台」启动。"
+    )
 
-    backtest_csv_path = DATA_DIR / "backtest_results.csv"
-
-    if not backtest_csv_path.exists():
-        st.info("📊 尚未生成历史回测数据。请前往「系统控制台」中运行历史回测。")
+    bt_view = st.radio(
+        "查看结果",
+        ["单次滚动回测", "Walk-forward 滚动重训"],
+        horizontal=True,
+        key="tab_backtest_view_mode",
+    )
+    if bt_view == "单次滚动回测":
+        _render_backtest_analysis(
+            BACKTEST_CSV_PATH,
+            title="单次滚动回测",
+            empty_hint="📊 尚未生成数据。请前往「系统控制台」→ 任务 D 启动历史滚动回测。",
+        )
     else:
-        try:
-            df_res = pd.read_csv(backtest_csv_path)
-            df_res["strategy_cum"] = (
-                df_res["nav"] / df_res["nav"].iloc[0] - 1.0
-            ) * 100
-
-            has_bench = (
-                "benchmark_close" in df_res.columns
-                and df_res["benchmark_close"].notna().any()
-            )
-            if has_bench:
-                valid_bench = df_res["benchmark_close"].dropna()
-                if not valid_bench.empty:
-                    df_res["bench_cum"] = (
-                        df_res["benchmark_close"] / valid_bench.iloc[0] - 1.0
-                    ) * 100
-
-            cum_ret = df_res["nav"].iloc[-1] / df_res["nav"].iloc[0] - 1.0
-            peak = df_res["nav"].cummax()
-            mdd = (df_res["nav"] / peak - 1.0).min()
-
-            col_m1, col_m2, col_m3 = st.columns(3)
-            with col_m1:
-                st.metric("策略累计收益", f"{cum_ret * 100:.2f}%")
-            with col_m2:
-                st.metric("最大回撤 (MDD)", f"{mdd * 100:.2f}%")
-            with col_m3:
-                st.metric("回测交易日数", f"{len(df_res)}")
-
-            fig = go.Figure()
-            draw_cyber_area_trace(
-                fig,
-                df_res,
-                x_col="trade_date",
-                y_col="strategy_cum",
-                name="A-Quant 策略",
-            )
-
-            if has_bench and "bench_cum" in df_res.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_res["trade_date"],
-                        y=df_res["bench_cum"],
-                        mode="lines",
-                        name="沪深 300 基准",
-                        line=dict(color=COLOR_CYBER_ORANGE, width=2, dash="dash"),
-                    )
-                )
-
-            fig.update_layout(
-                get_cyber_layout("策略 vs 沪深300 累计收益率 (%)"), height=550
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            buf_res = io.StringIO()
-            df_res.to_csv(buf_res, index=False)
-            st.download_button(
-                "💾 导出回测 CSV",
-                data=buf_res.getvalue().encode("utf-8-sig"),
-                file_name="backtest_results_export.csv",
-                mime="text/csv",
-            )
-
-        except Exception as err:
-            st.error(f"解析回测数据出错: {err}")
+        _render_backtest_analysis(
+            WALKFORWARD_CSV_PATH,
+            title="Walk-forward 滚动重训回测",
+            empty_hint=(
+                "📊 尚未生成 Walk-forward 结果。请前往「系统控制台」→ "
+                "任务 D2 启动（耗时较长）。"
+            ),
+        )
 
 # ----------------- TAB 4: 模型表现 -----------------
 with tab_perf:

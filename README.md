@@ -49,7 +49,41 @@ streamlit run app.py
 ## 配置
 
 - `src/config.py`：数据库路径、特征列、LightGBM 参数、`MAX_STOCKS_UNIVERSE` 等。
-- 环境变量 `QUANT_MAX_STOCKS` 可覆盖默认股票池上限。
+- 环境变量 `QUANT_MAX_STOCKS`：训练/回测/每日选股默认股票池上限（默认 **400**）。
+- `QUANT_RUN_DAILY_MAX_STOCKS`：仅选股；设为 `0` 表示不限制（全库）；未设时与 `QUANT_MAX_STOCKS` 一致。
+- `QUANT_META_OOF_FOLDS`：Meta Ridge 的 Walk-forward OOF 折数（默认 **3**，设 `0` 关闭）。
+- `QUANT_PREV_GAIN_SUPPRESSION`：前期涨幅硬过滤（默认 **开启**；设 `0` 关闭）。
+
+审核整改明细见 [docs/AUDIT_FIXES.md](docs/AUDIT_FIXES.md)。
+
+钉钉密钥建议用环境变量（勿提交 `config.json`）：
+
+```bash
+set QUANT_DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=...
+set QUANT_DINGTALK_SECRET=SEC...
+```
+
+配置模板：复制 `config.json.example` 为 `config.json` 后填写。
+
+### 回测
+
+```bash
+# 默认：时点可得股票池（PIT）+ 与 run_daily 一致的风控链
+python scripts/backtest.py --start-date 2025-01-01 --end-date 2025-12-31
+
+# 拒绝样本内回测（train_end_date 须早于 start_date）
+python scripts/backtest.py --enforce-sample-out ...
+
+# 滚动重训 walk-forward（较慢）
+python scripts/walkforward_backtest.py --start-date 2025-01-01 --end-date 2025-12-31
+```
+
+## 测试
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/test_audit_fixes.py -q
+```
 
 ## 数据说明
 

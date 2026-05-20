@@ -22,6 +22,9 @@
     低于 ``MARKET_REGIME_MIN_SCORE``（默认 60）当日强制空仓、当日收益率为 0、不计佣金/印花税/滑点。
   - **熔断复苏换仓**：环境分重新回到安全线以上的首个交易日，不受 ``holding_days`` 周期约束，
     立即执行一轮 LTR 打分换仓，避免解除熔断后踏空至下一调仓日。
+  - **局限（审计说明）**：全回测期使用同一套磁盘模型（非 walk-forward 重训）；股票池默认取
+    ``end_date`` 成分快照；打分链已与 ``run_daily`` 对齐 ``apply_pre_score_hard_risk_filters``。
+    回测收益勿直接等同于实盘预期，需配合样本外滚动重训验证。
 """
 from __future__ import annotations
 
@@ -60,6 +63,11 @@ from src.config import (  # noqa: E402
     get_quant_config_merged,
 )
 from src.market_regime import compute_market_regime_score  # noqa: E402
+from src.backtest_universe import (  # noqa: E402
+    assert_sample_out_backtest,
+    build_fixed_snapshot_universe_fn,
+    build_point_in_time_universe_fn,
+)
 from src.data_fetcher import fetch_daily_hist, get_stock_pool  # noqa: E402
 from src.database import get_active_model_version  # noqa: E402
 from src.factor_calculator import (  # noqa: E402
@@ -76,6 +84,7 @@ from src.model_trainer import (  # noqa: E402
 from src.predictor import (  # noqa: E402
     MAX_STOCKS_PER_INDUSTRY,
     apply_experience_trading_filters,
+    apply_pre_score_hard_risk_filters,
     apply_volume_stagnation_experience_filter,
     blend_ranker_scores_with_optional_meta,
     filter_predictions,
@@ -570,6 +579,9 @@ def _score_universe_for_date(
     feat_df = pd.DataFrame(rows)
     feat_df = prune_zero_volume_rows(feat_df)
     feat_df = feat_df.drop(columns=["volume"], errors="ignore")
+    if feat_df.empty:
+        return [], {}
+    feat_df = apply_pre_score_hard_risk_filters(feat_df)
     if feat_df.empty:
         return [], {}
     feat_df = prepare_ranking_cross_section_pipeline(feat_df, date_col="trade_date")
@@ -1278,6 +1290,16 @@ def main() -> None:
         default=str(DATA_DIR / "backtest_results.csv"),
         help="净值曲线输出路径",
     )
+    parser.add_argument(
+        "--fixed-universe-snapshot",
+        action="store_true",
+        help="全期固定 end_date 股票池（旧行为）；默认使用时点可得 PIT universe",
+    )
+    parser.add_argument(
+        "--enforce-sample-out",
+        action="store_true",
+        help="若激活模型 train_end_date >= 回测 start_date 则拒绝运行",
+    )
     args = parser.parse_args()
 
     qbt = get_quant_config_merged().get("backtest", {})
@@ -1340,6 +1362,13 @@ def main() -> None:
     else:
         print("当前激活模型版本:", mv.get("version"), "train_end_date=", mv.get("train_end_date"))
 
+    if args.enforce_sample_out:
+        assert_sample_out_backtest(
+            start_date,
+            train_end_date=(mv or {}).get("train_end_date"),
+            active_version=(mv or {}).get("version"),
+        )
+
     lgb_m, xgb_m, cat_m = load_active_models()
 
     # 股票池：优先结束日成分（可能需联网）；失败则用本地库内代码
@@ -1396,10 +1425,25 @@ def main() -> None:
     if len(trade_dates) < args.holding_days + 5:
         raise SystemExit("回测区间内有效交易日过少，请放宽日期或检查行情完整性。")
 
-    # 与拉取行情使用同一股票池快照（按 end_date 选成份）。逐日 get_stock_pool(as_of=当日) 在指数源
-    # 仅提供「最新变更日」一行成份时，会导致回测前期全日空池、无法建仓。
-    def universe_fn(_d: str) -> list[tuple[str, str]]:
-        return pairs
+    if not args.fixed_universe_snapshot:
+        universe_fn = build_point_in_time_universe_fn(
+            pairs,
+            bars,
+            min_history_bars=MIN_HISTORY_BARS,
+            max_stocks=args.max_stocks,
+            include_300=args.include_300,
+            include_688=args.include_688,
+        )
+        print(
+            "股票池：时点可得（PIT）universe — 信号日仅纳入当日有 K 线且历史长度足够的标的。",
+            flush=True,
+        )
+    else:
+        universe_fn = build_fixed_snapshot_universe_fn(pairs)
+        print(
+            "股票池：全期固定 end_date 成分快照（--fixed-universe-snapshot，存在成分前视风险）。",
+            flush=True,
+        )
 
     engine = BacktestEngine(
         bars=bars,

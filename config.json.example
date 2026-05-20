@@ -1,0 +1,25 @@
+{
+  "dingtalk": {
+    "enabled": false,
+    "webhook_url": "",
+    "secret": "",
+    "send_time": "18:00"
+  },
+  "notification": {
+    "send_on_success": true,
+    "send_on_error": true
+  },
+  "experience_filters": {
+    "min_turnover": 1.2
+  },
+  "quant": {
+    "backtest": {
+      "commission_rate": 0.0003,
+      "stamp_duty_sell_rate": 0.001,
+      "slippage_rate": 0.001
+    },
+    "ranking": {
+      "meta_oof_folds": 3
+    }
+  }
+}

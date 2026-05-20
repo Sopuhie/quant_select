@@ -33,12 +33,14 @@ import pandas as pd
 from src.config import (
     FEATURE_COLUMNS,
     MARKET_REGIME_MIN_SCORE,
+    MAX_STOCKS_UNIVERSE,
     MIN_HISTORY_BARS,
     MODEL_PATH,
     PREDICT_FETCH_WORKERS,
     STOCK_POOL,
     SINGLE_DAY_CRASH_PCT_THRESHOLD,
     TOP_N_SELECTION,
+    resolve_run_daily_max_stocks,
 )
 from src.data_fetcher import get_stock_pool
 from src.database import (
@@ -727,7 +729,10 @@ def main() -> None:
         "--max-stocks",
         type=int,
         default=None,
-        help="最多参与预测的股票数量；默认不限制，使用本地库内全部满足 K 线长度的股票",
+        help=(
+            f"最多参与预测的股票数量；默认与训练/回测一致为 {MAX_STOCKS_UNIVERSE} "
+            "（可用 QUANT_RUN_DAILY_MAX_STOCKS=0 恢复全库）"
+        ),
     )
     parser.add_argument("--pool", type=str, default=STOCK_POOL)
     parser.add_argument(
@@ -779,12 +784,13 @@ def main() -> None:
         help="选股完成后不推送钉钉（供一键流水线等在上游步骤结束后再统一推送）",
     )
     args = parser.parse_args()
+    max_stocks = resolve_run_daily_max_stocks(args.max_stocks)
 
     init_db()
 
     if args.only_data:
         run_only_data_probe(
-            max_stocks=args.max_stocks,
+            max_stocks=max_stocks,
             pool_type=args.pool,
             max_workers=args.workers,
             verbose=not args.quiet,
@@ -814,9 +820,12 @@ def main() -> None:
         print("QUANT_RUN_DAILY_SKIPPED=non_trading_day", flush=True)
         sys.exit(0)
 
+    if not args.quiet and max_stocks is not None:
+        print(f"本次选股股票池上限: {max_stocks} 只（与 QUANT_MAX_STOCKS 训练/回测默认对齐）", flush=True)
+
     predict_daily(
         trade_date=target_date,
-        max_stocks=args.max_stocks,
+        max_stocks=max_stocks,
         pool_type=args.pool,
         force=not args.skip_if_exists,
         max_workers=args.workers,

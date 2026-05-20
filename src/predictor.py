@@ -63,15 +63,63 @@ from .model_trainer import (
 from .utils import is_kline_too_stale_vs_prediction
 
 
+def _blend_weights_from_hs300_closes(
+    cl: pd.Series,
+    *,
+    source: str,
+) -> tuple[float, float, dict[str, Any]]:
+    """由沪深300收盘价序列计算 LGB/XGB 动态权重。"""
+    meta: dict[str, Any] = {
+        "regime": "fallback",
+        "bear": False,
+        "high_vol": False,
+        "index_source": source,
+    }
+    wl, wx = 0.55, 0.45
+    if cl is None or len(cl) < 65:
+        return wl, wx, meta
+    tail = cl.astype(float).tail(120).reset_index(drop=True)
+    ma20 = tail.rolling(20, min_periods=10).mean()
+    ma60 = tail.rolling(60, min_periods=30).mean()
+    ret1 = tail.pct_change()
+    vol20 = float(ret1.tail(20).std(ddof=0)) if len(ret1) >= 20 else float("nan")
+    i = len(tail) - 1
+    bear = bool(
+        np.isfinite(ma20.iloc[i])
+        and np.isfinite(ma60.iloc[i])
+        and ma20.iloc[i] < ma60.iloc[i]
+        and tail.iloc[i] < ma20.iloc[i]
+    )
+    high_vol = bool(np.isfinite(vol20) and vol20 > 0.014)
+    meta["bear"] = bear
+    meta["high_vol"] = high_vol
+    if bear:
+        wl, wx = 0.45, 0.55
+        meta["regime"] = "bear_trend"
+    elif high_vol:
+        wl, wx = 0.58, 0.42
+        meta["regime"] = "high_vol"
+    else:
+        meta["regime"] = "neutral"
+    return wl, wx, meta
+
+
 def compute_market_regime_blend_weights(
     as_of_trade_date: str | None = None,
 ) -> tuple[float, float, dict[str, Any]]:
     """
     环境感知动态 LGB/XGB 权重：指数均线空头略抬高 XGB；高波动略抬高 LGB。
-    失败时退回 (0.55, 0.45)。
+    优先本地 ``index_daily``（与熔断同源），失败再试 AkShare；均失败时退回 (0.55, 0.45)。
     """
     meta: dict[str, Any] = {"regime": "fallback", "bear": False, "high_vol": False}
     wl, wx = 0.55, 0.45
+    from .market_regime import load_hs300_index_daily_local
+
+    local = load_hs300_index_daily_local(as_of_trade_date, limit=200)
+    if not local.empty and len(local) >= 65:
+        return _blend_weights_from_hs300_closes(
+            local["close"], source="index_daily_local"
+        )
     try:
         from .config import ensure_eastmoney_no_proxy_if_configured
 
@@ -80,6 +128,7 @@ def compute_market_regime_blend_weights(
 
         df = ak.stock_zh_index_daily_em(symbol="沪深300")
         if df is None or getattr(df, "empty", True):
+            meta["index_source"] = "none"
             return wl, wx, meta
         c0 = next(
             (c for c in df.columns if str(c).strip() in ("收盘", "close", "Close")),
@@ -98,33 +147,14 @@ def compute_market_regime_blend_weights(
             cut = pd.Timestamp(str(as_of_trade_date)[:10])
             sub = sub.loc[sub["dt"] <= cut]
         if len(sub) < 65:
+            meta["index_source"] = "akshare_short"
             return wl, wx, meta
-        tail = sub.tail(120).reset_index(drop=True)
-        cl = tail["cl"].astype(float)
-        ma20 = cl.rolling(20, min_periods=10).mean()
-        ma60 = cl.rolling(60, min_periods=30).mean()
-        ret1 = cl.pct_change()
-        vol20 = float(ret1.tail(20).std(ddof=0)) if len(ret1) >= 20 else float("nan")
-        i = len(tail) - 1
-        bear = bool(
-            np.isfinite(ma20.iloc[i])
-            and np.isfinite(ma60.iloc[i])
-            and ma20.iloc[i] < ma60.iloc[i]
-            and cl.iloc[i] < ma20.iloc[i]
+        return _blend_weights_from_hs300_closes(
+            sub["cl"].astype(float), source="akshare_online"
         )
-        high_vol = bool(np.isfinite(vol20) and vol20 > 0.014)
-        meta["bear"] = bear
-        meta["high_vol"] = high_vol
-        if bear:
-            wl, wx = 0.45, 0.55
-            meta["regime"] = "bear_trend"
-        elif high_vol:
-            wl, wx = 0.58, 0.42
-            meta["regime"] = "high_vol"
-        else:
-            meta["regime"] = "neutral"
     except Exception as exc:
         meta["error"] = str(exc)
+        meta["index_source"] = "error"
     return wl, wx, meta
 
 
@@ -461,7 +491,7 @@ def analyze_stock_reasons(
     importances: list[float],
     feature_cols: list[str],
 ) -> str:
-    """按因子贡献 Top3 生成可读「入选原因」文案。"""
+    """按因子贡献 Top3 生成可读「入选原因」文案（统计相关，非因果结论）。"""
     templates = {
         "factor_ratio_5_20": "短期与中期均线距离拉开，呈现健康的经典多头形态形态",
         "factor_ratio_10_60": "中长期均线系统发散向上，呈现典型的黄金多头排列形态",
@@ -1271,6 +1301,7 @@ def predict_universe_scores(
     mcap_by_code = fetch_latest_market_cap_by_codes(pool_codes)
 
     raw_rows: list[dict[str, Any]] = []
+    fetch_failures: list[tuple[str, str]] = []
     total = len(stock_pairs)
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1288,14 +1319,28 @@ def predict_universe_scores(
         }
         for fut in as_completed(futs):
             done += 1
+            code, _name = futs[fut]
             if verbose and done % 40 == 0:
                 print(f"拉取进度: {done}/{total}", flush=True)
             try:
                 r = fut.result()
-            except Exception:
+            except Exception as exc:
+                fetch_failures.append((code, f"{type(exc).__name__}: {exc}"))
                 continue
             if r:
                 raw_rows.append(r)
+            else:
+                fetch_failures.append((code, "无有效因子行（K线不足/停牌/接口失败）"))
+    if fetch_failures and verbose:
+        n_fail = len(fetch_failures)
+        print(
+            f"[选股拉取] {n_fail}/{total} 只股票未进入截面（展示前 8 条）:",
+            flush=True,
+        )
+        for fc, msg in fetch_failures[:8]:
+            print(f"  - {fc}: {msg}", flush=True)
+        if n_fail > 8:
+            print(f"  ... 另有 {n_fail - 8} 只", flush=True)
     if not raw_rows:
         raise RuntimeError(
             f"未能拉取到任何有效 K 线（本次股票池共 {total} 只，全部未得到可用因子行）。"
