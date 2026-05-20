@@ -13,6 +13,7 @@ from src.database import get_connection, init_db, insert_system_log
 from .config import SHORT_HOLDING_DAYS, SHORT_TODAY_JSON, SHORT_TOP_N
 from .db import (
     delete_short_selections_for_date,
+    ensure_short_term_tables,
     insert_short_daily_selections,
     short_selection_exists,
 )
@@ -37,6 +38,8 @@ def run_short_daily_pipeline(
     top_n = int(top_n if top_n is not None else SHORT_TOP_N)
 
     with get_connection(DB_PATH) as conn:
+        ensure_short_term_tables(conn)
+
         engine = ShortTermRuleStrategy(conn)
         df, td, mkt_score = engine.scan(
             trade_date,
@@ -61,12 +64,20 @@ def run_short_daily_pipeline(
             }
 
         rows = engine.get_last_persist_rows()
-        if force:
-            delete_short_selections_for_date(conn, td)
-
         n_written = 0
-        if rows:
-            n_written = insert_short_daily_selections(conn, td, rows)
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if force:
+                delete_short_selections_for_date(conn, td, commit=False)
+            if rows:
+                n_written = insert_short_daily_selections(
+                    conn, td, rows, commit=False
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         summary = {
             "ok": True,

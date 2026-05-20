@@ -49,19 +49,27 @@ def short_selection_exists(conn: sqlite3.Connection, trade_date: str) -> bool:
     return row is not None
 
 
-def delete_short_selections_for_date(conn: sqlite3.Connection, trade_date: str) -> None:
+def delete_short_selections_for_date(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    *,
+    commit: bool = True,
+) -> None:
     ensure_short_term_tables(conn)
     conn.execute(
         "DELETE FROM short_daily_selections WHERE trade_date = ?",
         (str(trade_date).strip()[:10],),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def insert_short_daily_selections(
     conn: sqlite3.Connection,
     trade_date: str,
     rows: list[dict[str, Any]],
+    *,
+    commit: bool = True,
 ) -> int:
     ensure_short_term_tables(conn)
     td = str(trade_date).strip()[:10]
@@ -96,7 +104,8 @@ def insert_short_daily_selections(
             ),
         )
         n += 1
-    conn.commit()
+    if commit:
+        conn.commit()
     return n
 
 
