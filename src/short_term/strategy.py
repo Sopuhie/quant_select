@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-短线规则选股（持有 1 个交易日）。
-
-信号日 T 收盘后筛选 → 计划 T+1 开盘买入 → T+2 开盘卖出。
-多板块动态涨跌幅/近涨停阈值；面板向量化扫描。
-"""
 from __future__ import annotations
 
 import sqlite3
@@ -27,10 +21,8 @@ from .config import (
     SHORT_MA_FAST,
     SHORT_MA_SLOW,
     SHORT_MAX_5D_RETURN,
-    SHORT_MIN_AMOUNT,
     SHORT_MIN_HISTORY_BARS,
     SHORT_MIN_MARKET_SCORE,
-    SHORT_MIN_TURNOVER,
     SHORT_TOP_N,
     SHORT_VOL_RATIO_1D_MIN,
     SHORT_VOL_RATIO_5D_MIN,
@@ -62,10 +54,6 @@ def _is_st_name(name: str) -> bool:
 
 
 def _get_sector_limits(code: str) -> tuple[float, float, float]:
-    """
-    返回 (最小日涨幅, 最大日涨幅, 近涨停剔除阈值)。
-    主板约 ±7.5% / 9.5%；创业板/科创板 ±15% / 19.2%；北交所 ±25% / 29.2%。
-    """
     c = str(code).strip().zfill(6)
     if c.startswith(("300", "301", "688")):
         return 0.005, 0.15, 0.192
@@ -77,15 +65,6 @@ def _get_sector_limits(code: str) -> tuple[float, float, float]:
 def _exclude_code_prefix(code: str) -> bool:
     c = str(code).strip().zfill(6)
     if SHORT_EXCLUDE_BJ and c.startswith(("8", "4", "83", "87", "92")):
-        return True
-    return False
-
-
-def _passes_liquidity_filter(amount: float, turnover: float) -> bool:
-    """成交额或换手率至少满足一项（均为信号日截面）。"""
-    if amount >= float(SHORT_MIN_AMOUNT):
-        return True
-    if turnover >= float(SHORT_MIN_TURNOVER):
         return True
     return False
 
@@ -144,16 +123,10 @@ class ShortTermRuleStrategy:
         cur_cols_query = cur.execute("PRAGMA table_info(stock_daily_kline)").fetchall()
         cur_cols = {str(row[1]) for row in cur_cols_query}
         amount_col = "volume * close" if "amount" not in cur_cols else "amount"
-        turnover_col = (
-            "turnover_rate" if "turnover_rate" in cur_cols else "NULL"
-        )
+        turnover_col = "turnover_rate" if "turnover_rate" in cur_cols else "NULL"
 
         df_target = pd.read_sql_query(
-            f"""
-            SELECT stock_code, stock_name, close, volume,
-                   {amount_col} AS amount, {turnover_col} AS turnover
-            FROM stock_daily_kline WHERE date = ?
-            """,
+            f"SELECT stock_code, stock_name, close, volume, {amount_col} AS amount, {turnover_col} AS turnover FROM stock_daily_kline WHERE date = ?",
             self.conn,
             params=[target_date],
         )
@@ -167,12 +140,7 @@ class ShortTermRuleStrategy:
             df_target = df_target.head(int(max_scan_stocks))
 
         panel_df = pd.read_sql_query(
-            """
-            SELECT stock_code, date, open, high, low, close, volume
-            FROM stock_daily_kline
-            WHERE date <= ?
-            ORDER BY stock_code, date ASC
-            """,
+            "SELECT stock_code, date, open, high, low, close, volume FROM stock_daily_kline WHERE date <= ? ORDER BY stock_code, date ASC",
             self.conn,
             params=[target_date],
         )
@@ -185,14 +153,8 @@ class ShortTermRuleStrategy:
 
         target_meta_map: dict[str, dict[str, Any]] = {}
         for _, r in df_target.iterrows():
-            try:
-                amt = float(r["amount"]) if pd.notna(r.get("amount")) else 0.0
-            except (TypeError, ValueError):
-                amt = 0.0
-            try:
-                to_val = float(r["turnover"]) if pd.notna(r.get("turnover")) else 0.0
-            except (TypeError, ValueError):
-                to_val = 0.0
+            amt = float(r["amount"]) if r["amount"] is not None else 0.0
+            to_val = float(r["turnover"]) if r["turnover"] is not None else 0.0
             target_meta_map[r["stock_code"]] = {
                 "name": str(r["stock_name"] or "未知").strip(),
                 "close": float(r["close"]),
@@ -216,16 +178,15 @@ class ShortTermRuleStrategy:
             if SHORT_EXCLUDE_ST and _is_st_name(name):
                 continue
 
-            if not _passes_liquidity_filter(
-                float(meta["amount"]), float(meta["turnover"])
-            ):
+            # 硬性流动性安全锁：剔除全天成交额低于5000万且换手率低于2%的僵尸微盘股
+            if meta["amount"] < 50000000.0 and meta["turnover"] < 2.0:
                 continue
 
             if len(sub_df) < min_bars:
                 continue
 
             last_row = sub_df.iloc[-1]
-            if str(last_row["date"]).strip()[:10] != target_date:
+            if str(last_row["date"])[:10] != target_date:
                 continue
             if is_bar_suspended(last_row):
                 continue
@@ -234,7 +195,6 @@ class ShortTermRuleStrategy:
             high_arr = pd.to_numeric(sub_df["high"], errors="coerce")
             low_arr = pd.to_numeric(sub_df["low"], errors="coerce")
             vol_arr = pd.to_numeric(sub_df["volume"], errors="coerce")
-            open_arr = pd.to_numeric(sub_df["open"], errors="coerce")
 
             ma_f = close_arr.rolling(SHORT_MA_FAST).mean()
             ma_s = close_arr.rolling(SHORT_MA_SLOW).mean()
@@ -264,16 +224,12 @@ class ShortTermRuleStrategy:
             c_close = float(close_arr.iloc[-1])
             prev_close = float(close_arr.iloc[-2])
 
-            if not (np.isfinite(c_close) and np.isfinite(prev_close)):
-                continue
-
             if is_bar_limit_up(c_close, prev_close, code):
                 continue
 
+            # 动态板块规则对齐：根据代码前缀自动分流分配涨幅边界与触板熔断上限
             min_ret, max_ret, near_limit_thr = _get_sector_limits(code)
             chg = float(change_pct.iloc[-1])
-            if not np.isfinite(chg):
-                continue
             if SHORT_EXCLUDE_NEAR_LIMIT and chg >= near_limit_thr:
                 continue
 
@@ -287,26 +243,6 @@ class ShortTermRuleStrategy:
             k_now, d_now = float(k.iloc[-1]), float(d.iloc[-1])
             cd, ca = float(diff.iloc[-1]), float(dea.iloc[-1])
             cbar, pbar = float(macd_bar.iloc[-1]), float(macd_bar.iloc[-2])
-
-            if not all(
-                np.isfinite(x)
-                for x in (
-                    c_ma_f,
-                    c_ma_s,
-                    ret5,
-                    vr5,
-                    vr1,
-                    j_now,
-                    j_prev,
-                    k_now,
-                    d_now,
-                    cd,
-                    ca,
-                    cbar,
-                    pbar,
-                )
-            ):
-                continue
 
             checks = {
                 "trend_ma": c_close > c_ma_f and c_ma_f >= c_ma_s,
@@ -336,11 +272,6 @@ class ShortTermRuleStrategy:
                 "vol_ratio_1d": vr1,
                 "kdj_j": j_now,
                 "macd_bar": cbar,
-                "sector_limits": {
-                    "min_day_ret": min_ret,
-                    "max_day_ret": max_ret,
-                    "near_limit": near_limit_thr,
-                },
             }
 
             candidates.append(
@@ -371,7 +302,6 @@ class ShortTermRuleStrategy:
             )
 
         if not candidates:
-            self._last_persist_rows = []
             return (pd.DataFrame(columns=RESULT_COLUMNS), target_date, mkt_score)
 
         candidates.sort(key=lambda x: float(x["rule_score"]), reverse=True)
@@ -390,7 +320,7 @@ class ShortTermRuleStrategy:
         return out_df, target_date, mkt_score
 
     def get_last_persist_rows(self) -> list[dict[str, Any]]:
-        return list(self._last_persist_rows)
+        return getattr(self, "_last_persist_rows", [])
 
 
 def run_short_term_scan(
