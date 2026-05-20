@@ -2260,7 +2260,7 @@ with tab_short:
     st.caption(
         "T 日收盘出信号 → T+1 开盘买入 → T+2 开盘卖出。"
         "与中长线 LightGBM、题材 v2.0 独立；规则见 ``src/short_term/strategy.py``。"
-        "命令行：``python scripts/run_short_daily.py``。"
+        "命令行：``python scripts/run_short_daily.py``；T1/T2 复盘价回填：``python scripts/update_short_review.py``。"
     )
     from src.short_term.config import SHORT_MIN_MARKET_SCORE, SHORT_TOP_N
     from src.short_term.db import ensure_short_term_tables, load_short_selections_df

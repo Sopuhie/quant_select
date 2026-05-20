@@ -2,8 +2,8 @@
 """
 短线规则选股（持有 1 个交易日）。
 
-信号日 T 收盘后筛选 → 计划 T+1 开盘买入 → T+2 开盘卖出（A 股 T+1，不可当日回转）。
-与中长线 LightGBM、题材 v2.0 策略独立；全市场面板向量化扫描，避免逐股 SQL 与指标前视。
+信号日 T 收盘后筛选 → 计划 T+1 开盘买入 → T+2 开盘卖出。
+多板块动态涨跌幅/近涨停阈值；面板向量化扫描。
 """
 from __future__ import annotations
 
@@ -27,11 +27,10 @@ from .config import (
     SHORT_MA_FAST,
     SHORT_MA_SLOW,
     SHORT_MAX_5D_RETURN,
-    SHORT_MAX_DAY_RETURN,
-    SHORT_MIN_DAY_RETURN,
+    SHORT_MIN_AMOUNT,
     SHORT_MIN_HISTORY_BARS,
     SHORT_MIN_MARKET_SCORE,
-    SHORT_NEAR_LIMIT_PCT,
+    SHORT_MIN_TURNOVER,
     SHORT_TOP_N,
     SHORT_VOL_RATIO_1D_MIN,
     SHORT_VOL_RATIO_5D_MIN,
@@ -62,24 +61,33 @@ def _is_st_name(name: str) -> bool:
     return "ST" in n or "*ST" in n
 
 
+def _get_sector_limits(code: str) -> tuple[float, float, float]:
+    """
+    返回 (最小日涨幅, 最大日涨幅, 近涨停剔除阈值)。
+    主板约 ±7.5% / 9.5%；创业板/科创板 ±15% / 19.2%；北交所 ±25% / 29.2%。
+    """
+    c = str(code).strip().zfill(6)
+    if c.startswith(("300", "301", "688")):
+        return 0.005, 0.15, 0.192
+    if c.startswith(("8", "4", "83", "87", "92")):
+        return 0.005, 0.25, 0.292
+    return 0.005, 0.075, 0.095
+
+
 def _exclude_code_prefix(code: str) -> bool:
     c = str(code).strip().zfill(6)
-    if SHORT_EXCLUDE_BJ and c.startswith(("8", "4")):
+    if SHORT_EXCLUDE_BJ and c.startswith(("8", "4", "83", "87", "92")):
         return True
     return False
 
 
-def _near_limit_up_signal(close: float, prev_close: float, code: str) -> bool:
-    if not SHORT_EXCLUDE_NEAR_LIMIT:
-        return False
-    try:
-        c, p = float(close), float(prev_close)
-    except (TypeError, ValueError):
-        return False
-    if not (np.isfinite(c) and np.isfinite(p) and p > 0):
-        return False
-    pct = (c - p) / p
-    return pct >= float(SHORT_NEAR_LIMIT_PCT)
+def _passes_liquidity_filter(amount: float, turnover: float) -> bool:
+    """成交额或换手率至少满足一项（均为信号日截面）。"""
+    if amount >= float(SHORT_MIN_AMOUNT):
+        return True
+    if turnover >= float(SHORT_MIN_TURNOVER):
+        return True
+    return False
 
 
 class ShortTermRuleStrategy:
@@ -92,11 +100,12 @@ class ShortTermRuleStrategy:
         chg: float, vr5: float, bar_now: float, bar_prev: float, j_slope: float
     ) -> float:
         bar_delta = bar_now - bar_prev
+        bounded_j_slope = max(0.0, min(float(j_slope), 35.0))
         return float(
-            40.0 * min(chg / 0.05, 1.5)
+            20.0 * min(chg / 0.05, 1.5)
             + 25.0 * min(vr5 / 3.0, 2.0)
-            + 20.0 * min(max(bar_delta, 0) * 50.0, 2.0)
-            + 15.0 * min(max(j_slope, 0) / 15.0, 2.0)
+            + 25.0 * min(max(bar_delta, 0) * 50.0, 2.0)
+            + 15.0 * min(bounded_j_slope / 15.0, 2.0)
         )
 
     @staticmethod
@@ -132,8 +141,19 @@ class ShortTermRuleStrategy:
         if not allows:
             return (pd.DataFrame(columns=RESULT_COLUMNS), target_date, mkt_score)
 
+        cur_cols_query = cur.execute("PRAGMA table_info(stock_daily_kline)").fetchall()
+        cur_cols = {str(row[1]) for row in cur_cols_query}
+        amount_col = "volume * close" if "amount" not in cur_cols else "amount"
+        turnover_col = (
+            "turnover_rate" if "turnover_rate" in cur_cols else "NULL"
+        )
+
         df_target = pd.read_sql_query(
-            "SELECT stock_code, stock_name, close, volume FROM stock_daily_kline WHERE date = ?",
+            f"""
+            SELECT stock_code, stock_name, close, volume,
+                   {amount_col} AS amount, {turnover_col} AS turnover
+            FROM stock_daily_kline WHERE date = ?
+            """,
             self.conn,
             params=[target_date],
         )
@@ -165,10 +185,20 @@ class ShortTermRuleStrategy:
 
         target_meta_map: dict[str, dict[str, Any]] = {}
         for _, r in df_target.iterrows():
+            try:
+                amt = float(r["amount"]) if pd.notna(r.get("amount")) else 0.0
+            except (TypeError, ValueError):
+                amt = 0.0
+            try:
+                to_val = float(r["turnover"]) if pd.notna(r.get("turnover")) else 0.0
+            except (TypeError, ValueError):
+                to_val = 0.0
             target_meta_map[r["stock_code"]] = {
                 "name": str(r["stock_name"] or "未知").strip(),
                 "close": float(r["close"]),
                 "volume": float(r["volume"]),
+                "amount": amt,
+                "turnover": to_val,
             }
 
         candidates: list[dict[str, Any]] = []
@@ -186,12 +216,16 @@ class ShortTermRuleStrategy:
             if SHORT_EXCLUDE_ST and _is_st_name(name):
                 continue
 
+            if not _passes_liquidity_filter(
+                float(meta["amount"]), float(meta["turnover"])
+            ):
+                continue
+
             if len(sub_df) < min_bars:
                 continue
 
             last_row = sub_df.iloc[-1]
-            last_date = str(last_row["date"]).strip()[:10]
-            if last_date != target_date:
+            if str(last_row["date"]).strip()[:10] != target_date:
                 continue
             if is_bar_suspended(last_row):
                 continue
@@ -219,29 +253,32 @@ class ShortTermRuleStrategy:
             j = 3.0 * k - 2.0 * d
 
             vol_ratio_5d = vol_arr / (vol_arr.rolling(5).mean() + 1e-6)
-            vol_ratio_1d = vol_arr / (vol_arr.shift(1) + 1e-6)
+
+            vol_prev = vol_arr.shift(1)
+            vol_ratio_1d = np.where(vol_prev > 0, vol_arr / (vol_prev + 1e-6), 1.0)
+            vol_ratio_1d = pd.Series(vol_ratio_1d, index=sub_df.index)
+
             change_pct = close_arr.pct_change()
             return_5d = close_arr.pct_change(5)
 
             c_close = float(close_arr.iloc[-1])
             prev_close = float(close_arr.iloc[-2])
-            c_open = float(open_arr.iloc[-1])
 
-            if not (
-                np.isfinite(c_close)
-                and np.isfinite(prev_close)
-                and np.isfinite(c_open)
-            ):
+            if not (np.isfinite(c_close) and np.isfinite(prev_close)):
                 continue
 
-            if is_bar_limit_up(c_close, prev_close, code) or _near_limit_up_signal(
-                c_close, prev_close, code
-            ):
+            if is_bar_limit_up(c_close, prev_close, code):
+                continue
+
+            min_ret, max_ret, near_limit_thr = _get_sector_limits(code)
+            chg = float(change_pct.iloc[-1])
+            if not np.isfinite(chg):
+                continue
+            if SHORT_EXCLUDE_NEAR_LIMIT and chg >= near_limit_thr:
                 continue
 
             c_ma_f = float(ma_f.iloc[-1])
             c_ma_s = float(ma_s.iloc[-1])
-            chg = float(change_pct.iloc[-1])
             ret5 = float(return_5d.iloc[-1])
             vr5 = float(vol_ratio_5d.iloc[-1])
             vr1 = float(vol_ratio_1d.iloc[-1])
@@ -256,7 +293,6 @@ class ShortTermRuleStrategy:
                 for x in (
                     c_ma_f,
                     c_ma_s,
-                    chg,
                     ret5,
                     vr5,
                     vr1,
@@ -274,12 +310,15 @@ class ShortTermRuleStrategy:
 
             checks = {
                 "trend_ma": c_close > c_ma_f and c_ma_f >= c_ma_s,
-                "bullish_bar": c_close >= c_open,
-                "day_return_band": SHORT_MIN_DAY_RETURN <= chg <= SHORT_MAX_DAY_RETURN,
+                "bullish_return": c_close > prev_close,
+                "day_return_band": min_ret <= chg <= max_ret,
                 "momentum_5d_cap": ret5 <= SHORT_MAX_5D_RETURN,
                 "volume": vr5 >= SHORT_VOL_RATIO_5D_MIN
                 and vr1 >= SHORT_VOL_RATIO_1D_MIN,
-                "macd": cd > ca and cbar >= pbar,
+                "macd_cross": cd > ca,
+                "macd_slope_relaxed": cbar >= (pbar * 0.8)
+                if pbar > 0
+                else cbar >= pbar,
                 "kdj": k_now > d_now
                 and SHORT_KDJ_J_MIN <= j_now <= SHORT_KDJ_J_MAX
                 and (j_now - j_prev) >= SHORT_KDJ_J_SLOPE_MIN,
@@ -297,6 +336,11 @@ class ShortTermRuleStrategy:
                 "vol_ratio_1d": vr1,
                 "kdj_j": j_now,
                 "macd_bar": cbar,
+                "sector_limits": {
+                    "min_day_ret": min_ret,
+                    "max_day_ret": max_ret,
+                    "near_limit": near_limit_thr,
+                },
             }
 
             candidates.append(

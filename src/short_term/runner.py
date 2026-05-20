@@ -15,6 +15,7 @@ from .db import (
     delete_short_selections_for_date,
     ensure_short_term_tables,
     insert_short_daily_selections,
+    refresh_short_review_prices,
     short_selection_exists,
 )
 from .strategy import ShortTermRuleStrategy
@@ -79,12 +80,15 @@ def run_short_daily_pipeline(
             conn.rollback()
             raise
 
+        review_updated = refresh_short_review_prices(conn, td, commit=True)
+
         summary = {
             "ok": True,
             "skipped": False,
             "trade_date": td,
             "market_score": mkt_score,
             "count": n_written,
+            "review_prices_updated": review_updated,
             "holding_days": SHORT_HOLDING_DAYS,
             "top_n": top_n,
             "signals": df.to_dict(orient="records") if not df.empty else [],
