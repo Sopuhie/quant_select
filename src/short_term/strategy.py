@@ -21,8 +21,10 @@ from .config import (
     SHORT_MA_FAST,
     SHORT_MA_SLOW,
     SHORT_MAX_5D_RETURN,
+    SHORT_MIN_AMOUNT,
     SHORT_MIN_HISTORY_BARS,
     SHORT_MIN_MARKET_SCORE,
+    SHORT_MIN_TURNOVER,
     SHORT_TOP_N,
     SHORT_VOL_RATIO_1D_MIN,
     SHORT_VOL_RATIO_5D_MIN,
@@ -178,8 +180,10 @@ class ShortTermRuleStrategy:
             if SHORT_EXCLUDE_ST and _is_st_name(name):
                 continue
 
-            # 硬性流动性安全锁：剔除全天成交额低于5000万且换手率低于2%的僵尸微盘股
-            if meta["amount"] < 50000000.0 and meta["turnover"] < 2.0:
+            # 流动性：成交额与换手率均不达标则剔除（与 config 及界面规则说明一致）
+            amt = float(meta["amount"])
+            tr = float(meta["turnover"]) if meta["turnover"] is not None else 0.0
+            if amt < float(SHORT_MIN_AMOUNT) and tr < float(SHORT_MIN_TURNOVER):
                 continue
 
             if len(sub_df) < min_bars:

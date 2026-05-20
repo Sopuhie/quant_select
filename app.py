@@ -2260,11 +2260,12 @@ with tab_short:
     st.caption(
         "T 日收盘出信号 → T+1 开盘买入 → T+2 开盘卖出。"
         "与中长线 LightGBM、题材 v2.0 独立；规则见 ``src/short_term/strategy.py``。"
-        "命令行：``python scripts/run_short_daily.py``；T1/T2 复盘价回填：``python scripts/update_short_review.py``。"
+        "扫描结果写入 ``short_daily_selections`` 与项目根目录 ``short_today.json``；"
+        "钉钉推送请点右侧按钮。命令行：``python scripts/run_short_daily.py``。"
     )
     from src.short_term.config import SHORT_MIN_MARKET_SCORE, SHORT_TOP_N
     from src.short_term.db import ensure_short_term_tables, load_short_selections_df
-    from src.short_term.strategy import ShortTermRuleStrategy
+    from src.short_term.runner import run_short_daily_pipeline
 
     with get_connection(DB_PATH) as _st_conn:
         ensure_short_term_tables(_st_conn)
@@ -2284,6 +2285,25 @@ with tab_short:
         f"本地最新 K 线日：{_st_kline_date or '—'} · 库内最近短线记录：{_st_saved_date}"
         f" · 默认 Top {SHORT_TOP_N} · 大盘环境分下限 {SHORT_MIN_MARKET_SCORE}"
     )
+
+    from src.short_term.rules_doc import (
+        CHECK_LABELS,
+        format_short_term_rules_markdown,
+        short_term_rules_sections,
+    )
+
+    with st.expander("📋 短线选股规则说明（复盘对照）", expanded=False):
+        st.markdown(format_short_term_rules_markdown())
+        st.markdown("##### 规则一览表")
+        st.dataframe(
+            pd.DataFrame(short_term_rules_sections()),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "说明与 ``src/short_term/strategy.py`` 一致；阈值来自 ``src/short_term/config.py`` "
+            "及环境变量（如 QUANT_SHORT_TOP_N、QUANT_SHORT_MIN_MARKET_SCORE）。"
+        )
 
     _st_col_run, _st_col_push, _st_col_hist = st.columns([3, 2, 2])
     with _st_col_run:
@@ -2326,29 +2346,46 @@ with tab_short:
                 )
 
     if run_short_btn:
-        with st.spinner("正在扫描全市场短线共振信号…"):
+        with st.spinner("正在扫描全市场短线共振信号并写入数据库…"):
             try:
-                with get_connection(DB_PATH) as conn:
-                    scanner = ShortTermRuleStrategy(conn)
-                    short_df, scanned_date, mkt = scanner.scan()
+                summary = run_short_daily_pipeline(
+                    force=True,
+                    write_json=True,
+                    skip_dingtalk=True,
+                )
             except Exception as exc:
-                st.error(f"扫描失败：{exc}")
+                st.error(f"扫描或落库失败：{exc}")
             else:
-                if not scanned_date:
-                    st.warning("本地 stock_daily_kline 无可用日期，请先同步行情。")
-                elif mkt < SHORT_MIN_MARKET_SCORE:
-                    st.warning(
-                        f"📅 {scanned_date} 沪深300 环境分 {mkt} 低于 {SHORT_MIN_MARKET_SCORE}，"
-                        "本日不出短线信号。"
-                    )
-                elif short_df.empty:
-                    st.info(f"📅 {scanned_date} 暂无满足规则的短线标的。")
+                if summary.get("error"):
+                    st.warning(str(summary.get("error")))
+                elif summary.get("skipped"):
+                    st.info(str(summary.get("message", "当日记录已存在，未覆盖。")))
                 else:
-                    st.success(
-                        f"🎯 {scanned_date} 捕获 {len(short_df)} 只（环境分 {mkt}，未自动写库；"
-                        "落库请运行 scripts/run_short_daily.py）"
-                    )
-                    st.dataframe(short_df, use_container_width=True, hide_index=True)
+                    scanned_date = str(summary.get("trade_date") or "")
+                    mkt = int(summary.get("market_score") or 0)
+                    n_written = int(summary.get("count") or 0)
+                    signals = summary.get("signals") or []
+                    if not scanned_date:
+                        st.warning("本地 stock_daily_kline 无可用日期，请先同步行情。")
+                    elif mkt < SHORT_MIN_MARKET_SCORE:
+                        st.warning(
+                            f"📅 {scanned_date} 沪深300 环境分 {mkt} 低于 "
+                            f"{SHORT_MIN_MARKET_SCORE}，本日不出短线信号（已更新库内记录为空）。"
+                        )
+                    elif n_written == 0:
+                        st.info(f"📅 {scanned_date} 暂无满足规则的短线标的（已写入空记录）。")
+                    else:
+                        st.success(
+                            f"🎯 {scanned_date} 已落库 {n_written} 只（环境分 {mkt}），"
+                            "已更新 short_today.json。"
+                        )
+                        if signals:
+                            st.dataframe(
+                                pd.DataFrame(signals),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                    st.rerun()
 
     if show_short_hist and _st_saved_date and _st_saved_date != "—":
         with get_connection(DB_PATH) as conn:
@@ -2358,6 +2395,47 @@ with tab_short:
         else:
             st.markdown(f"##### 库内记录 · {_st_saved_date}")
             st.dataframe(hist_df, use_container_width=True, hide_index=True)
+            with st.expander("🔍 入选明细：各票规则校验项（复盘）", expanded=False):
+                import json as _json
+
+                with get_connection(DB_PATH) as conn:
+                    detail_rows = conn.execute(
+                        """
+                        SELECT stock_code, stock_name, rank, detail_json
+                        FROM short_daily_selections
+                        WHERE trade_date = ?
+                        ORDER BY rank
+                        """,
+                        (_st_saved_date,),
+                    ).fetchall()
+                if not detail_rows:
+                    st.caption("无 detail_json 明细（旧记录可能未写入校验项）。")
+                else:
+                    recap: list[dict[str, object]] = []
+                    for code, name, rank, dj in detail_rows:
+                        checks: dict[str, bool] = {}
+                        if dj:
+                            try:
+                                payload = _json.loads(dj)
+                                checks = payload.get("checks") or {}
+                            except Exception:
+                                checks = {}
+                        row_out: dict[str, object] = {
+                            "rank": rank,
+                            "代码": code,
+                            "名称": name,
+                        }
+                        for key, label in CHECK_LABELS.items():
+                            if not checks:
+                                row_out[label] = "—"
+                            else:
+                                row_out[label] = "✓" if checks.get(key) else "✗"
+                        recap.append(row_out)
+                    st.dataframe(
+                        pd.DataFrame(recap),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
 # ----------------- TAB: 🔥 热门题材高爆选股（置于末尾，避免网络同步阻塞其它 Tab）-----------------
 with tab_theme:
