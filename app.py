@@ -2258,10 +2258,10 @@ with tab_settings:
 with tab_short:
     st.markdown("### ⚡ 短线规则选股（持有 1 个交易日）")
     st.caption(
-        "T 日收盘出信号 → T+1 开盘买入 → T+2 开盘卖出。"
-        "与中长线 LightGBM、题材 v2.0 独立；规则见 ``src/short_term/strategy.py``。"
-        "扫描结果写入 ``short_daily_selections`` 与项目根目录 ``short_today.json``；"
-        "钉钉推送请点右侧按钮。命令行：``python scripts/run_short_daily.py``。"
+        "T 日收盘确认信号并以收盘价买入（纯日线模拟）；"
+        "T+1 用最低价评估 -3% 硬止损，未触发则按配置在 T+1/T+2 收盘平仓。"
+        "落库 ``short_daily_selections`` + ``short_order_tracker`` + ``short_today.json``。"
+        "命令行：``python scripts/run_short_daily.py``；回填复盘：``python scripts/update_short_review.py``。"
     )
     from src.short_term.config import SHORT_MIN_MARKET_SCORE, SHORT_TOP_N
     from src.short_term.db import ensure_short_term_tables, load_short_selections_df

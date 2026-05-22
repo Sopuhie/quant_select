@@ -11,7 +11,7 @@ from src.config_manager import CONFIG_PATH, config_manager
 from src.dingtalk_notifier import DingTalkNotifier
 from src.utils import display_trading_date_for_push
 
-from .config import SHORT_HOLDING_DAYS, SHORT_TOP_N
+from .config import SHORT_HOLD_PLAN, SHORT_TOP_N
 from .db import ensure_short_term_tables
 
 
@@ -36,11 +36,15 @@ def fetch_short_rows_for_dingtalk(
     td = str(trade_date).strip()[:10]
     df = pd.read_sql_query(
         """
-        SELECT rank, stock_code, stock_name, rule_score, close_price,
-               day_change_pct, vol_ratio_5d, kdj_j, advice_text, hold_plan
+        SELECT rank, stock_code, stock_name,
+               COALESCE(final_score, rule_score) AS rule_score,
+               close_price,
+               COALESCE(pct_change, day_change_pct) AS day_change_pct,
+               COALESCE(volume_ratio_5d, vol_ratio_5d) AS vol_ratio_5d,
+               kdj_j, advice_text, hold_plan
         FROM short_daily_selections
         WHERE trade_date = ?
-        ORDER BY rank ASC
+        ORDER BY COALESCE(final_score, rule_score) DESC, rank ASC
         LIMIT ?
         """,
         conn,
@@ -90,10 +94,7 @@ def build_short_selection_markdown(
     if market_score is not None:
         mkt_line = f"**大盘环境分：{int(market_score)}**  \n"
 
-    plan = (
-        f"T 日收盘信号 → T+1 开盘买 → T+{1 + SHORT_HOLDING_DAYS} 开盘卖"
-        f"（持有 {SHORT_HOLDING_DAYS} 个交易日）"
-    )
+    plan = SHORT_HOLD_PLAN
     lines: list[str] = [
         f"⚡ **{title}**  ",
         f"**信号日：{td_esc}**  ",

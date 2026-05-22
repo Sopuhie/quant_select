@@ -306,6 +306,13 @@ def _ensure_stock_concept_boards(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_scb_date ON stock_concept_boards(updated_date)")
 
 
+def _ensure_short_term_tables(conn: sqlite3.Connection) -> None:
+    """短线选股与模拟订单表（``short_daily_selections`` / ``short_order_tracker``）。"""
+    from src.short_term.db import ensure_short_term_tables as _ensure_short
+
+    _ensure_short(conn)
+
+
 def init_db(db_path: Path | None = None) -> None:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,6 +328,7 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_stock_concept_boards(conn)
         _ensure_market_hsgt_flow_daily(conn)
         _ensure_performance_indexes(conn)
+        _ensure_short_term_tables(conn)
         conn.commit()
     finally:
         conn.close()

@@ -18,10 +18,13 @@ if str(ROOT) not in sys.path:
 from src.config import DB_PATH
 from src.database import get_connection, init_db
 from src.short_term.db import ensure_short_term_tables, refresh_short_review_prices
+from src.short_term.execution import refresh_holding_short_orders
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="回填短线 T1/T2 复盘价")
+    parser = argparse.ArgumentParser(
+        description="回填短线 T1/T2 复盘价，并重新评估 HOLDING 订单的止损/平仓"
+    )
     parser.add_argument("--trade-date", type=str, default=None, help="仅更新该信号日")
     args = parser.parse_args()
 
@@ -29,7 +32,8 @@ def main() -> int:
     with get_connection(DB_PATH) as conn:
         ensure_short_term_tables(conn)
         n = refresh_short_review_prices(conn, args.trade_date)
-    print(f"已更新 {n} 条短线记录的 T1/T2 开收盘价。")
+        h = refresh_holding_short_orders(conn, args.trade_date)
+    print(f"已更新 {n} 条短线记录的 T1/T2 开收盘价；重新评估 {h} 笔 HOLDING 订单。")
     return 0
 
 

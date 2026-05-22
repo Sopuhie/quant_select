@@ -22,8 +22,19 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# 持有 1 个交易日：T 日收盘信号 → T+1 买 → T+2 卖
+# 逻辑持有交易日数（文案/钉钉）；实际平仓日见 SHORT_SELL_OFFSET
 SHORT_HOLDING_DAYS = 1
+
+# 纯日线执行：T 日收盘价买入；未触发止损时的平仓日偏移（1=T+1 收盘，2=T+2 收盘）
+SHORT_SELL_OFFSET = _env_int_bounded("QUANT_SHORT_SELL_OFFSET", 1, 1, 2)
+# 盘中 -3% 硬止损（用 T+1 最低价模拟）：卖出价 = 买入价 × (1 - 该比例)
+SHORT_STOP_LOSS_RATIO = _env_float("QUANT_SHORT_STOP_LOSS", 0.03)
+
+SHORT_HOLD_PLAN = (
+    f"T 日收盘确认信号并以收盘价买入 → "
+    f"T+1 用最低价模拟 -{SHORT_STOP_LOSS_RATIO * 100:.0f}% 硬止损 → "
+    f"未触发则 T+{SHORT_SELL_OFFSET} 收盘平仓"
+)
 SHORT_TOP_N = _env_int_bounded("QUANT_SHORT_TOP_N", 5, 1, 20)
 
 SHORT_MIN_HISTORY_BARS = int(os.environ.get("QUANT_SHORT_MIN_BARS", "35"))

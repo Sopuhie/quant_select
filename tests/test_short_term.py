@@ -14,35 +14,38 @@ def test_is_st_name():
     assert not _is_st_name("贵州茅台")
 
 
-def test_get_sector_limits_main_board():
-    from src.short_term.strategy import _get_sector_limits
+def test_get_sector_near_limit_main_board():
+    from src.short_term.strategy import get_sector_near_limit_threshold
 
-    _, max_r, near = _get_sector_limits("000001")
-    assert max_r == 0.075
-    assert near == 0.095
+    assert get_sector_near_limit_threshold("000001") == 0.095
 
 
-def test_get_sector_limits_gem():
-    from src.short_term.strategy import _get_sector_limits
+def test_get_sector_near_limit_gem():
+    from src.short_term.strategy import get_sector_near_limit_threshold
 
-    _, max_r, near = _get_sector_limits("300001")
-    assert max_r == 0.15
-    assert near == 0.192
+    assert get_sector_near_limit_threshold("300001") == 0.192
 
 
 def test_rule_score_positive():
-    score = ShortTermRuleStrategy._rule_score(0.03, 1.5, 0.08, 0.05, 8.0)
+    score = ShortTermRuleStrategy._rule_score(0.03, 1.5, 0.08, 0.05, 8.0, 50.0)
     assert score > 0
 
 
-def test_rule_score_caps_extreme_j_slope():
-    at_cap = ShortTermRuleStrategy._rule_score(0.03, 1.5, 0.08, 0.05, 35.0)
-    over_cap = ShortTermRuleStrategy._rule_score(0.03, 1.5, 0.08, 0.05, 200.0)
-    assert at_cap == over_cap
+def test_rule_score_j_overbought_penalty():
+    low_j = ShortTermRuleStrategy._rule_score(0.04, 1.5, 0.08, 0.05, 8.0, 50.0)
+    high_j = ShortTermRuleStrategy._rule_score(0.04, 1.5, 0.08, 0.05, 8.0, 90.0)
+    assert high_j < low_j
 
 
 def test_advice_text_high_j():
     assert "J 偏高" in ShortTermRuleStrategy.advice_text(90.0, 0.02)
+
+
+def test_hold_plan_uses_t_close_buy():
+    from src.short_term.config import SHORT_HOLD_PLAN
+
+    assert "收盘" in SHORT_HOLD_PLAN
+    assert "开盘买入" not in SHORT_HOLD_PLAN
 
 
 def test_resolve_t1_t2_dates_chain():

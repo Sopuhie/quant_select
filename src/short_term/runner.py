@@ -10,14 +10,25 @@ from typing import Any
 from src.config import DB_PATH
 from src.database import get_connection, init_db, insert_system_log
 
-from .config import SHORT_HOLDING_DAYS, SHORT_TODAY_JSON, SHORT_TOP_N
+from .config import (
+    SHORT_HOLD_PLAN,
+    SHORT_HOLDING_DAYS,
+    SHORT_SELL_OFFSET,
+    SHORT_STOP_LOSS_RATIO,
+    SHORT_TODAY_JSON,
+    SHORT_TOP_N,
+)
 from .db import (
+    delete_short_orders_for_buy_date,
     delete_short_selections_for_date,
     ensure_short_term_tables,
     insert_short_daily_selections,
+    load_short_orders_for_buy_date,
+    mark_selections_executed_for_buy_date,
     refresh_short_review_prices,
     short_selection_exists,
 )
+from .execution import refresh_holding_short_orders, sync_short_orders_for_signal_day
 from .strategy import ShortTermRuleStrategy
 
 
@@ -71,11 +82,16 @@ def run_short_daily_pipeline(
         rows = engine.get_last_persist_rows()
         n_written = 0
 
+        execution_summary: dict[str, Any] = {}
         try:
             conn.execute("BEGIN IMMEDIATE")
             if force:
                 delete_short_selections_for_date(conn, td, commit=False)
+                delete_short_orders_for_buy_date(conn, td, commit=False)
             if rows:
+                execution_summary = sync_short_orders_for_signal_day(
+                    conn, td, rows, commit=False
+                )
                 n_written = insert_short_daily_selections(
                     conn, td, rows, commit=False
                 )
@@ -84,7 +100,10 @@ def run_short_daily_pipeline(
             conn.rollback()
             raise
 
+        mark_selections_executed_for_buy_date(conn, td, commit=True)
         review_updated = refresh_short_review_prices(conn, td, commit=True)
+        holding_refreshed = refresh_holding_short_orders(conn, commit=True)
+        orders_db = load_short_orders_for_buy_date(conn, td)
 
         summary = {
             "ok": True,
@@ -93,15 +112,21 @@ def run_short_daily_pipeline(
             "market_score": mkt_score,
             "count": n_written,
             "review_prices_updated": review_updated,
+            "holding_orders_refreshed": holding_refreshed,
             "holding_days": SHORT_HOLDING_DAYS,
+            "hold_plan": SHORT_HOLD_PLAN,
+            "sell_offset": SHORT_SELL_OFFSET,
+            "stop_loss_ratio": SHORT_STOP_LOSS_RATIO,
             "top_n": top_n,
             "include_300": include_300,
             "include_688": include_688,
+            "execution": execution_summary,
+            "orders": orders_db,
             "signals": df.to_dict(orient="records") if not df.empty else [],
         }
 
         if write_json:
-            _write_short_today_json(summary)
+            _write_short_today_json(summary, conn=conn)
 
         ding_ok = False
         if not skip_dingtalk and n_written > 0:
@@ -129,15 +154,28 @@ def run_short_daily_pipeline(
         return summary
 
 
-def _write_short_today_json(summary: dict[str, Any]) -> None:
+def _write_short_today_json(
+    summary: dict[str, Any],
+    *,
+    conn: Any | None = None,
+) -> None:
     path = Path(SHORT_TODAY_JSON)
+    orders = summary.get("orders") or []
+    if not orders and conn is not None and summary.get("trade_date"):
+        orders = load_short_orders_for_buy_date(conn, str(summary["trade_date"]))
+
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "trade_date": summary.get("trade_date"),
         "market_score": summary.get("market_score"),
         "holding_days": summary.get("holding_days"),
+        "hold_plan": summary.get("hold_plan") or SHORT_HOLD_PLAN,
+        "sell_offset": summary.get("sell_offset", SHORT_SELL_OFFSET),
+        "stop_loss_ratio": summary.get("stop_loss_ratio", SHORT_STOP_LOSS_RATIO),
         "count": summary.get("count"),
         "signals": summary.get("signals") or [],
+        "orders": orders,
+        "execution": summary.get("execution") or {},
     }
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
