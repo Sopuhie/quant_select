@@ -20,7 +20,8 @@ from .review_prices import REVIEW_PRICE_KEYS, enrich_rows_with_review_prices, fe
 # 建表 DDL（与 A_Quant_Lite_Short_Term_Optimization_Guide 对齐）
 # ---------------------------------------------------------------------------
 
-SHORT_DAILY_SELECTIONS_DDL = """
+# 仅建表（勿在同一段 script 里建依赖新列的索引，旧库会先命中 IF NOT EXISTS 而跳过建表）
+SHORT_DAILY_SELECTIONS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS short_daily_selections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     trade_date TEXT NOT NULL,
@@ -49,16 +50,9 @@ CREATE TABLE IF NOT EXISTS short_daily_selections (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(trade_date, stock_code)
 );
-CREATE INDEX IF NOT EXISTS idx_short_sel_date ON short_daily_selections(trade_date);
-CREATE INDEX IF NOT EXISTS idx_short_date_score
-    ON short_daily_selections(trade_date, final_score DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS uidx_short_date_code
-    ON short_daily_selections(trade_date, stock_code);
-CREATE INDEX IF NOT EXISTS idx_short_sel_date_rank
-    ON short_daily_selections(trade_date, rank);
 """
 
-SHORT_ORDER_TRACKER_DDL = """
+SHORT_ORDER_TRACKER_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS short_order_tracker (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
     stock_code TEXT NOT NULL,
@@ -78,8 +72,6 @@ CREATE TABLE IF NOT EXISTS short_order_tracker (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(buy_date, stock_code)
 );
-CREATE INDEX IF NOT EXISTS idx_short_order_status ON short_order_tracker(status);
-CREATE INDEX IF NOT EXISTS idx_short_order_buy_date ON short_order_tracker(buy_date);
 """
 
 # 旧库增量列（先建表再 ALTER，兼容历史库）
@@ -139,6 +131,59 @@ def _add_column_if_missing(
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
 
 
+def _drop_broken_short_selection_indexes(conn: sqlite3.Connection) -> None:
+    """
+    删除可能由旧版 DDL 在半迁移状态下创建的无效索引。
+    （旧脚本在尚无 final_score 列时创建 idx_short_date_score 会导致后续 init 失败。）
+    """
+    for name in (
+        "idx_short_date_score",
+        "uidx_short_date_code",
+        "idx_short_sel_date_rank",
+        "idx_short_sel_date",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
+
+
+def _ensure_selection_indexes(conn: sqlite3.Connection) -> None:
+    """列迁移完成后再建索引，避免旧库缺少 final_score 时报错。"""
+    cols = _table_columns(conn, "short_daily_selections")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_short_sel_date "
+        "ON short_daily_selections(trade_date)"
+    )
+    if "final_score" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_short_date_score "
+            "ON short_daily_selections(trade_date, final_score DESC)"
+        )
+    elif "rule_score" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_short_date_score "
+            "ON short_daily_selections(trade_date, rule_score DESC)"
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_short_date_code "
+        "ON short_daily_selections(trade_date, stock_code)"
+    )
+    if "rank" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_short_sel_date_rank "
+            "ON short_daily_selections(trade_date, rank)"
+        )
+
+
+def _ensure_order_indexes(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_short_order_status "
+        "ON short_order_tracker(status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_short_order_buy_date "
+        "ON short_order_tracker(buy_date)"
+    )
+
+
 def _backfill_selection_legacy_columns(conn: sqlite3.Connection) -> None:
     """将历史列 day_change_pct / rule_score / vol_ratio_5d 回填到新字段。"""
     cols = _table_columns(conn, "short_daily_selections")
@@ -171,9 +216,15 @@ def _backfill_selection_legacy_columns(conn: sqlite3.Connection) -> None:
 def ensure_short_term_tables(conn: sqlite3.Connection) -> None:
     """
     创建/升级短线相关表与索引（幂等，可供 ``init_db`` 与业务层重复调用）。
+
+    顺序：建表 → ALTER 补列 → 回填 → 建索引（旧库必须先补 final_score 再建 score 索引）。
     """
-    conn.executescript(SHORT_DAILY_SELECTIONS_DDL)
-    conn.executescript(SHORT_ORDER_TRACKER_DDL)
+    # 旧库可能残留无效索引，必须先删再建表/补列
+    if _table_columns(conn, "short_daily_selections"):
+        _drop_broken_short_selection_indexes(conn)
+
+    conn.executescript(SHORT_DAILY_SELECTIONS_TABLE_DDL)
+    conn.executescript(SHORT_ORDER_TRACKER_TABLE_DDL)
 
     sel_cols = _table_columns(conn, "short_daily_selections")
     for col, typ in _SELECTION_MIGRATE_COLS:
@@ -186,6 +237,8 @@ def ensure_short_term_tables(conn: sqlite3.Connection) -> None:
         order_cols.add(col)
 
     _backfill_selection_legacy_columns(conn)
+    _ensure_selection_indexes(conn)
+    _ensure_order_indexes(conn)
     conn.commit()
 
 
@@ -409,14 +462,22 @@ def load_short_selections_df(
         SELECT trade_date AS 信号日, stock_code AS 股票代码, stock_name AS 股票名称,
                rank AS 排名,
                COALESCE(final_score, rule_score) AS 规则得分,
-               close_price AS 信号日收盘价,
                COALESCE(pct_change, day_change_pct) AS 日涨幅,
                COALESCE(volume_ratio_5d, vol_ratio_5d) AS 五日量比,
                macd_bar_improve AS MACD柱改善, j_slope AS J斜率,
                is_executed AS 已执行,
                kdj_j AS KDJ_J, macd_bar AS MACD柱,
+               close_price AS 信号日收盘价,
                t1_open AS T1开盘价, t1_close AS T1收盘价,
                t2_open AS T2开盘价, t2_close AS T2收盘价,
+               CASE
+                 WHEN t2_close IS NOT NULL
+                  AND COALESCE(t1_open, t1_close) IS NOT NULL
+                  AND COALESCE(t1_open, t1_close) > 0
+                 THEN (t2_close - COALESCE(t1_open, t1_close))
+                      / COALESCE(t1_open, t1_close)
+                 ELSE NULL
+               END AS T1买T2卖涨跌幅,
                hold_plan AS 持仓计划, advice_text AS 实盘建议
         FROM short_daily_selections
         WHERE trade_date = ?

@@ -21,10 +21,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.short_term import db as _short_db
 from src.short_term.runner import run_short_daily_pipeline
 
 
 def main() -> int:
+    # 便于确认加载的是当前工程内的 db 模块（排查旧代码/缓存）
+    print(f"[short_term.db] {_short_db.__file__}", flush=True)
+
     parser = argparse.ArgumentParser(description="短线规则选股（1 日持有）")
     parser.add_argument("--trade-date", type=str, default=None, help="信号日 YYYY-MM-DD")
     parser.add_argument(

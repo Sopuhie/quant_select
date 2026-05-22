@@ -25,10 +25,10 @@ from .db import (
     insert_short_daily_selections,
     load_short_orders_for_buy_date,
     mark_selections_executed_for_buy_date,
-    refresh_short_review_prices,
     short_selection_exists,
 )
 from .execution import refresh_holding_short_orders, sync_short_orders_for_signal_day
+from .review_prices import auto_fill_review_prices
 from .strategy import ShortTermRuleStrategy
 
 
@@ -101,7 +101,8 @@ def run_short_daily_pipeline(
             raise
 
         mark_selections_executed_for_buy_date(conn, td, commit=True)
-        review_updated = refresh_short_review_prices(conn, td, commit=True)
+        review_fill = auto_fill_review_prices(conn, td, commit=False)
+        review_fill_all = auto_fill_review_prices(conn, None, commit=True)
         holding_refreshed = refresh_holding_short_orders(conn, commit=True)
         orders_db = load_short_orders_for_buy_date(conn, td)
 
@@ -111,7 +112,8 @@ def run_short_daily_pipeline(
             "trade_date": td,
             "market_score": mkt_score,
             "count": n_written,
-            "review_prices_updated": review_updated,
+            "review_prices_updated": review_fill.get("rows", 0),
+            "review_prices_fill_all": review_fill_all,
             "holding_orders_refreshed": holding_refreshed,
             "holding_days": SHORT_HOLDING_DAYS,
             "hold_plan": SHORT_HOLD_PLAN,

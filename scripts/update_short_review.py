@@ -17,8 +17,9 @@ if str(ROOT) not in sys.path:
 
 from src.config import DB_PATH
 from src.database import get_connection, init_db
-from src.short_term.db import ensure_short_term_tables, refresh_short_review_prices
+from src.short_term.db import ensure_short_term_tables
 from src.short_term.execution import refresh_holding_short_orders
+from src.short_term.review_prices import auto_fill_review_prices
 
 
 def main() -> int:
@@ -31,9 +32,12 @@ def main() -> int:
     init_db(DB_PATH)
     with get_connection(DB_PATH) as conn:
         ensure_short_term_tables(conn)
-        n = refresh_short_review_prices(conn, args.trade_date)
+        fill = auto_fill_review_prices(conn, args.trade_date)
         h = refresh_holding_short_orders(conn, args.trade_date)
-    print(f"已更新 {n} 条短线记录的 T1/T2 开收盘价；重新评估 {h} 笔 HOLDING 订单。")
+    print(
+        f"已回填 T1/T2：处理 {fill.get('dates', 0)} 个信号日、"
+        f"更新 {fill.get('rows', 0)} 条；重新评估 {h} 笔 HOLDING 订单。"
+    )
     return 0
 
 

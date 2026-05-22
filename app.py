@@ -2264,7 +2264,11 @@ with tab_short:
         "命令行：``python scripts/run_short_daily.py``；回填复盘：``python scripts/update_short_review.py``。"
     )
     from src.short_term.config import SHORT_MIN_MARKET_SCORE, SHORT_TOP_N
-    from src.short_term.db import ensure_short_term_tables, load_short_selections_df
+    from src.short_term.db import ensure_short_term_tables
+    from src.short_term.history_review import (
+        list_short_selection_trade_dates,
+        load_short_review_bundle,
+    )
     from src.short_term.runner import run_short_daily_pipeline
 
     with get_connection(DB_PATH) as _st_conn:
@@ -2287,7 +2291,6 @@ with tab_short:
     )
 
     from src.short_term.rules_doc import (
-        CHECK_LABELS,
         format_short_term_rules_markdown,
         short_term_rules_sections,
     )
@@ -2301,8 +2304,8 @@ with tab_short:
             hide_index=True,
         )
         st.caption(
-            "说明与 ``src/short_term/strategy.py`` 一致；阈值来自 ``src/short_term/config.py`` "
-            "及环境变量（如 QUANT_SHORT_TOP_N、QUANT_SHORT_MIN_MARKET_SCORE）。"
+            "与 ``strategy.py``（选股/打分）、``execution.py``（T日收盘买/T+1止损模拟）、"
+            "``config.py`` 及环境变量同步；复盘表 checks 见入选明细展开区。"
         )
 
     _st_cb1, _st_cb2 = st.columns(2)
@@ -2321,7 +2324,7 @@ with tab_short:
             help="未勾选时，短线扫描池将排除代码以 688 开头的股票",
         )
 
-    _st_col_run, _st_col_push, _st_col_hist = st.columns([3, 2, 2])
+    _st_col_run, _st_col_push = st.columns([3, 2])
     with _st_col_run:
         run_short_btn = st.button(
             "🚀 运行短线规则扫描",
@@ -2330,31 +2333,26 @@ with tab_short:
         )
     with _st_col_push:
         push_short_ding_btn = st.button(
-            "📲 推送库内记录到钉钉",
+            "📲 推送所选信号日到钉钉",
             use_container_width=True,
             key="push_short_dingtalk",
         )
-    with _st_col_hist:
-        show_short_hist = st.checkbox(
-            "显示库内已保存记录",
-            value=True,
-            key="short_show_saved",
-        )
 
     if push_short_ding_btn:
-        if not _st_saved_date or _st_saved_date == "—":
-            st.warning("库内无短线记录，请先运行 scripts/run_short_daily.py。")
+        _push_td = st.session_state.get("short_history_trade_date") or _st_saved_date
+        if not _push_td or _push_td == "—":
+            st.warning("库内无短线记录，请先运行短线规则扫描。")
         else:
             from src.short_term.dingtalk import maybe_push_short_selections
             from src.market_regime import compute_market_regime_score
 
-            _mkt_push = compute_market_regime_score(_st_saved_date)
+            _mkt_push = compute_market_regime_score(_push_td)
             with st.spinner("正在推送钉钉…"):
                 _ding_ok = maybe_push_short_selections(
-                    _st_saved_date, market_score=_mkt_push
+                    _push_td, market_score=_mkt_push
                 )
             if _ding_ok:
-                st.success(f"已向钉钉推送 {_st_saved_date} 短线选股。")
+                st.success(f"已向钉钉推送 {_push_td} 短线选股。")
             else:
                 st.warning(
                     "推送未成功：请检查 config.json 钉钉配置、"
@@ -2405,55 +2403,55 @@ with tab_short:
                             )
                     st.rerun()
 
-    if show_short_hist and _st_saved_date and _st_saved_date != "—":
-        with get_connection(DB_PATH) as conn:
-            hist_df = load_short_selections_df(conn, _st_saved_date)
-        if hist_df.empty:
-            st.caption("库内暂无 short_daily_selections 记录。")
-        else:
-            st.markdown(f"##### 库内记录 · {_st_saved_date}")
-            st.dataframe(hist_df, use_container_width=True, hide_index=True)
-            with st.expander("🔍 入选明细：各票规则校验项（复盘）", expanded=False):
-                import json as _json
+    st.divider()
+    st.markdown("### 📚 历史选股复盘")
+    st.caption(
+        "从 ``short_daily_selections`` / ``short_order_tracker`` 读取已落库记录，"
+        "按信号日回看选股、规则校验与模拟盈亏。"
+    )
 
-                with get_connection(DB_PATH) as conn:
-                    detail_rows = conn.execute(
-                        """
-                        SELECT stock_code, stock_name, rank, detail_json
-                        FROM short_daily_selections
-                        WHERE trade_date = ?
-                        ORDER BY rank
-                        """,
-                        (_st_saved_date,),
-                    ).fetchall()
-                if not detail_rows:
-                    st.caption("无 detail_json 明细（旧记录可能未写入校验项）。")
-                else:
-                    recap: list[dict[str, object]] = []
-                    for code, name, rank, dj in detail_rows:
-                        checks: dict[str, bool] = {}
-                        if dj:
-                            try:
-                                payload = _json.loads(dj)
-                                checks = payload.get("checks") or {}
-                            except Exception:
-                                checks = {}
-                        row_out: dict[str, object] = {
-                            "rank": rank,
-                            "代码": code,
-                            "名称": name,
-                        }
-                        for key, label in CHECK_LABELS.items():
-                            if not checks:
-                                row_out[label] = "—"
-                            else:
-                                row_out[label] = "✓" if checks.get(key) else "✗"
-                        recap.append(row_out)
-                    st.dataframe(
-                        pd.DataFrame(recap),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+    with get_connection(DB_PATH) as _hist_conn:
+        ensure_short_term_tables(_hist_conn)
+        _short_dates = list_short_selection_trade_dates(_hist_conn)
+
+    if not _short_dates:
+        st.info("暂无历史短线记录。请先运行「短线规则扫描」或执行 ``python scripts/run_short_daily.py --force``。")
+    else:
+        _default_date = _short_dates[0]
+        if _st_saved_date and _st_saved_date in _short_dates:
+            _default_date = _st_saved_date
+
+        _review_date = st.selectbox(
+            "选择信号日（复盘）",
+            options=_short_dates,
+            index=_short_dates.index(_default_date),
+            key="short_history_trade_date",
+        )
+
+        from src.market_regime import compute_market_regime_score
+
+        _review_mkt = compute_market_regime_score(_review_date)
+
+        with get_connection(DB_PATH) as _hist_conn:
+            _bundle = load_short_review_bundle(_hist_conn, _review_date)
+
+        _sel_df = _bundle["selections_display"]
+        _n_sel = int(_bundle["count"])
+
+        st.caption(
+            "T1/T2 开收盘价在打开复盘时从本地 K 线自动补齐。"
+            " **T1买T2卖涨跌幅** = (T2收盘 − T+1开盘，无开盘则用T+1收盘) / 买入价。"
+        )
+
+        _m1, _m2, _m3 = st.columns(3)
+        _m1.metric("信号日", _review_date)
+        _m2.metric("大盘环境分", _review_mkt)
+        _m3.metric("入选数量", _n_sel)
+
+        if _sel_df.empty:
+            st.warning(f"{_review_date} 当日无入选记录（可能大盘熔断或规则未命中）。")
+        else:
+            st.dataframe(_sel_df, use_container_width=True, hide_index=True)
 
 # ----------------- TAB: 🔥 热门题材高爆选股（置于末尾，避免网络同步阻塞其它 Tab）-----------------
 with tab_theme:

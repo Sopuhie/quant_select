@@ -37,7 +37,7 @@ def fetch_post_signal_ohlc(
         ``{"t1": {"open","low","close"}, "t2": {...}}``，无 K 线则对应键为空 dict。
     """
     code = str(stock_code).strip().zfill(6)
-    t1, t2 = resolve_t1_t2_dates(signal_trade_date)
+    t1, t2 = resolve_t1_t2_dates(signal_trade_date, conn)
     out: dict[str, dict[str, float | None]] = {
         "t1": {"open": None, "low": None, "close": None},
         "t2": {"open": None, "low": None, "close": None},
