@@ -30,6 +30,22 @@ def test_stop_loss_triggered_on_t1_low():
     assert out["exit_reason"] == "t1_intraday_stop_loss"
 
 
+def test_limit_down_sealed_bar_uses_close():
+    """一字跌停：open==low==close，开盘即封死，按收盘价计提。"""
+    buy = 10.0
+    out = evaluate_daily_exit(
+        buy,
+        t1_bar={"open": 9.0, "low": 9.0, "close": 9.0},
+        t2_bar={},
+        t1_date="2026-05-16",
+        t2_date=None,
+        sell_offset=1,
+    )
+    assert out["exit_reason"] == "t1_open_below_stop_limit"
+    assert out["sell_price"] == 9.0
+    assert out["pnl_ratio"] == -0.1
+
+
 def test_stop_loss_gap_down_uses_t1_close_not_stop_px():
     """T+1 开盘已在止损线下方：不能按 -3% 价成交，按收盘价计提。"""
     buy = 10.0

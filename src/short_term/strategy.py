@@ -37,6 +37,7 @@ from .config import (
     SHORT_TOP_N,
     SHORT_VOL_RATIO_1D_MIN,
     SHORT_VOL_RATIO_5D_MIN,
+    SHORT_VOL_RATIO_CLIP_MAX,
 )
 
 RESULT_COLUMNS = [
@@ -57,8 +58,6 @@ _HOLD_PLAN = SHORT_HOLD_PLAN
 
 # 共振项最少通过数量（4 项中至少 3 项）
 _RESONANCE_MIN_PASS = 3
-# 量比硬性上限：防停牌复牌/僵尸股畸变污染打分
-_VOL_RATIO_CLIP_MAX = 10.0
 # J 超买惩罚阈值与扣分
 _J_OVERBOUGHT_THRESHOLD = 88.0
 _J_OVERBOUGHT_PENALTY = 30.0
@@ -349,11 +348,11 @@ class ShortTermRuleStrategy:
 
             vol_ratio_5d = (
                 vol_arr / (vol_arr.rolling(5).mean() + 1e-6)
-            ).clip(upper=_VOL_RATIO_CLIP_MAX)
+            ).clip(upper=SHORT_VOL_RATIO_CLIP_MAX)
             vol_prev = vol_arr.shift(1)
             vol_ratio_1d = np.where(vol_prev > 0, vol_arr / (vol_prev + 1e-6), 1.0)
             vol_ratio_1d = pd.Series(vol_ratio_1d, index=sub_df.index).clip(
-                upper=_VOL_RATIO_CLIP_MAX
+                upper=SHORT_VOL_RATIO_CLIP_MAX
             )
 
             change_pct = close_arr.pct_change()

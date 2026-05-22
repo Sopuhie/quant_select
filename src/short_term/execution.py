@@ -88,8 +88,14 @@ def evaluate_daily_exit(
     """
     纯日线模拟平仓结果。
 
-    优先在 T+1 用 ``low`` 判断是否触发 -3% 硬止损；
-    未触发则按 ``sell_offset``（默认 SHORT_SELL_OFFSET）在 T+1 或 T+2 以 ``close`` 平仓。
+    止损评估顺序（仅依赖日线 OHLC）：
+    1. T+1 ``low`` 跌破止损线且 ``open <= 止损价``：开盘已在 -3% 下方或一字跌停，
+       无法在止损价成交，按 T+1 **收盘价**（封死跌停）或开盘价计提，
+       ``exit_reason=t1_open_below_stop_limit``。
+    2. T+1 ``low`` 跌破止损线且 ``open > 止损价``：盘中触及止损，按止损价平仓，
+       ``exit_reason=t1_intraday_stop_loss``。
+    3. 未触发止损：按 ``SHORT_SELL_OFFSET`` 在 T+1 或 T+2 以 ``close`` 平仓。
+
     T+1 K 线尚未入库时返回 HOLDING。
     """
     offset = int(sell_offset if sell_offset is not None else SHORT_SELL_OFFSET)

@@ -50,6 +50,8 @@ SHORT_MAX_5D_RETURN = _env_float("QUANT_SHORT_MAX_5D_RET", 0.22)
 
 SHORT_VOL_RATIO_5D_MIN = _env_float("QUANT_SHORT_VR5_MIN", 1.25)
 SHORT_VOL_RATIO_1D_MIN = _env_float("QUANT_SHORT_VR1_MIN", 1.08)
+# 5/1 日量比硬性上限，防停牌复牌畸变污染打分（见 modfy 审计项 2）
+SHORT_VOL_RATIO_CLIP_MAX = _env_float("QUANT_SHORT_VOL_RATIO_CLIP", 10.0)
 
 SHORT_KDJ_J_MIN = _env_float("QUANT_SHORT_KDJ_J_MIN", 25.0)
 SHORT_KDJ_J_MAX = _env_float("QUANT_SHORT_KDJ_J_MAX", 90.0)

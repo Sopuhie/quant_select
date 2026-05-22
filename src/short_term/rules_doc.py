@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from .config import (
     SHORT_HOLD_PLAN,
+    SHORT_STOP_LOSS_RATIO,
+    SHORT_VOL_RATIO_CLIP_MAX,
     SHORT_EXCLUDE_BJ,
     SHORT_EXCLUDE_NEAR_LIMIT,
     SHORT_EXCLUDE_ST,
@@ -37,9 +39,17 @@ def short_term_rules_sections() -> list[dict[str, str]]:
         {
             "类别": "纯日线模拟",
             "规则": (
-                "买入价=信号日收盘价；T+1 用 low 模拟 -3% 止损（触发则卖价=买价×0.97）；"
-                "未触发则 T+1 或 T+2 收盘平仓（QUANT_SHORT_SELL_OFFSET）；"
-                "订单表 short_order_tracker"
+                f"买入价=信号日收盘价；T+1 用 low 模拟 -{SHORT_STOP_LOSS_RATIO * 100:.0f}% 止损；"
+                "若 T+1 开盘≤止损线（一字跌停/大幅低开），按 T+1 收盘价真实计提，"
+                "不可按止损价美化；否则盘中跌破可按止损价平仓；"
+                "未触发则 T+1/T+2 收盘平仓；订单表 short_order_tracker"
+            ),
+        },
+        {
+            "类别": "量比防畸变",
+            "规则": (
+                f"5日/1日量比计算后上限截断为 {SHORT_VOL_RATIO_CLIP_MAX:.0f} 倍"
+                "（QUANT_SHORT_VOL_RATIO_CLIP），防停牌复牌污染打分"
             ),
         },
         {"类别": "输出数量", "规则": f"按规则得分降序取 Top {SHORT_TOP_N}（环境变量 QUANT_SHORT_TOP_N）"},
@@ -142,6 +152,10 @@ def format_short_term_rules_markdown() -> str:
         "",
         "**排序得分**",
         "涨幅非线性(20%) + 量比(25%) + MACD改善(25%) + J斜率(15%)；J≥88 扣30分",
+        f"量比上限 {SHORT_VOL_RATIO_CLIP_MAX:.0f} 倍截断（防复牌畸变）",
+        "",
+        "**止损边界**",
+        f"T+1 开盘≤止损线 → 按收盘真实计提；盘中跌破 → 按 -{SHORT_STOP_LOSS_RATIO * 100:.0f}% 价",
     ]
     return "\n".join(lines)
 
