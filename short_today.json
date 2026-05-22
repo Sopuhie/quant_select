@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-22 12:53:30",
+  "generated_at": "2026-05-22 13:38:55",
   "trade_date": "2026-05-21",
   "market_score": 50,
   "holding_days": 1,
@@ -76,7 +76,7 @@
   ],
   "orders": [
     {
-      "order_id": 51,
+      "order_id": 61,
       "stock_code": "605488",
       "stock_name": "福莱新材",
       "buy_date": "2026-05-21",
@@ -92,7 +92,7 @@
       "exit_reason": "await_t1_kline"
     },
     {
-      "order_id": 52,
+      "order_id": 62,
       "stock_code": "603009",
       "stock_name": "北特科技",
       "buy_date": "2026-05-21",
@@ -108,7 +108,7 @@
       "exit_reason": "await_t1_kline"
     },
     {
-      "order_id": 53,
+      "order_id": 63,
       "stock_code": "603197",
       "stock_name": "保隆科技",
       "buy_date": "2026-05-21",
@@ -124,7 +124,7 @@
       "exit_reason": "await_t1_kline"
     },
     {
-      "order_id": 54,
+      "order_id": 64,
       "stock_code": "600199",
       "stock_name": "金种子酒",
       "buy_date": "2026-05-21",
@@ -140,7 +140,7 @@
       "exit_reason": "await_t1_kline"
     },
     {
-      "order_id": 55,
+      "order_id": 65,
       "stock_code": "605303",
       "stock_name": "园林股份",
       "buy_date": "2026-05-21",
