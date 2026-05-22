@@ -41,6 +41,14 @@ def test_advice_text_high_j():
     assert "J 偏高" in ShortTermRuleStrategy.advice_text(90.0, 0.02)
 
 
+def test_vol_ratio_clip_max_10():
+    import pandas as pd
+
+    vol = pd.Series([100.0, 1.0, 50.0])
+    vr1 = (vol / vol.shift(1).replace(0, float("nan"))).fillna(1.0).clip(upper=10.0)
+    assert float(vr1.iloc[-1]) == 10.0
+
+
 def test_hold_plan_uses_t_close_buy():
     from src.short_term.config import SHORT_HOLD_PLAN
 

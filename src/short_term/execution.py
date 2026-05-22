@@ -97,6 +97,7 @@ def evaluate_daily_exit(
     buy_price = float(buy_price)
     stop_px = stop_loss_trigger_price(buy_price)
 
+    t1_open = t1_bar.get("open")
     t1_low = t1_bar.get("low")
     t1_close = t1_bar.get("close")
     t2_close = t2_bar.get("close")
@@ -115,9 +116,35 @@ def evaluate_daily_exit(
         }
 
     t1_low_f = float(t1_low)
+    t1_open_f: float | None = None
+    if t1_open is not None and np.isfinite(float(t1_open)):
+        t1_open_f = float(t1_open)
 
-    # T+1 盘中硬止损（low 跌破止损线）
+    # T+1 触及止损区（low 跌破止损线）
     if t1_low_f < stop_px and t1_date:
+        # 开盘已在止损线下方或一字跌停：实盘无法在 -3% 价位成交，按 T+1 收盘/开盘计提
+        if t1_open_f is not None and t1_open_f <= stop_px:
+            if t1_close is not None and np.isfinite(float(t1_close)):
+                sell_px = float(t1_close)
+            elif t1_open_f is not None:
+                sell_px = t1_open_f
+            else:
+                sell_px = stop_px
+            pnl = (sell_px - buy_price) / buy_price if buy_price > 0 else None
+            return {
+                "status": ORDER_STATUS_CLOSED,
+                "sell_date": t1_date,
+                "sell_price": sell_px,
+                "hold_days": 1,
+                "pnl_ratio": pnl,
+                "stop_loss_triggered": 1,
+                "stop_loss_price": stop_px,
+                "exit_reason": "t1_open_below_stop_limit",
+                "t1_open": t1_open_f,
+                "t1_low": t1_low_f,
+            }
+
+        # 开盘正常、盘中跌破止损线：可按止损价 -3% 平仓（纯日线等价成交）
         pnl = (stop_px - buy_price) / buy_price if buy_price > 0 else None
         return {
             "status": ORDER_STATUS_CLOSED,
@@ -128,6 +155,7 @@ def evaluate_daily_exit(
             "stop_loss_triggered": 1,
             "stop_loss_price": stop_px,
             "exit_reason": "t1_intraday_stop_loss",
+            "t1_open": t1_open_f,
             "t1_low": t1_low_f,
         }
 
