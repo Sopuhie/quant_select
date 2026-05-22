@@ -130,8 +130,10 @@ def evaluate_daily_exit(
     if t1_low_f < stop_px and t1_date:
         # 开盘已在止损线下方或一字跌停：实盘无法在 -3% 价位成交，按 T+1 收盘/开盘计提
         if t1_open_f is not None and t1_open_f <= stop_px:
-            if t1_close is not None and np.isfinite(float(t1_close)):
-                sell_px = float(t1_close)
+            # 收盘价缺失时降级为开盘价，避免 float(None) 引发 TypeError
+            t1_close_f = float(t1_close) if t1_close is not None else t1_open_f
+            if t1_close_f is not None and np.isfinite(float(t1_close_f)):
+                sell_px = float(t1_close_f)
             elif t1_open_f is not None:
                 sell_px = t1_open_f
             else:

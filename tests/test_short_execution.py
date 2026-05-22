@@ -30,6 +30,21 @@ def test_stop_loss_triggered_on_t1_low():
     assert out["exit_reason"] == "t1_intraday_stop_loss"
 
 
+def test_gap_down_falls_back_to_open_when_t1_close_missing():
+    """开盘≤止损且 T+1 收盘缺失时，平仓价降级为开盘价。"""
+    buy = 10.0
+    out = evaluate_daily_exit(
+        buy,
+        t1_bar={"open": 9.5, "low": 9.5, "close": None},
+        t2_bar={},
+        t1_date="2026-05-16",
+        t2_date=None,
+        sell_offset=1,
+    )
+    assert out["exit_reason"] == "t1_open_below_stop_limit"
+    assert out["sell_price"] == 9.5
+
+
 def test_limit_down_sealed_bar_uses_close():
     """一字跌停：open==low==close，开盘即封死，按收盘价计提。"""
     buy = 10.0
