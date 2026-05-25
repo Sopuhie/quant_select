@@ -2634,11 +2634,87 @@ with tab_theme:
                         )
                 else:
                     n = len(theme_df)
+                    from src.theme.db import ensure_theme_tables, save_theme_selections
+
+                    with get_connection(DB_PATH) as _theme_save_conn:
+                        ensure_theme_tables(_theme_save_conn)
+                        _theme_mkt = scanner.get_market_score(scanned_date)
+                        _n_saved = save_theme_selections(
+                            _theme_save_conn,
+                            scanned_date,
+                            theme_df,
+                            market_score=_theme_mkt,
+                            filter_keyword=keyword.strip() or None,
+                        )
                     st.success(
-                        f"🎯 成功在 {scanned_date} 捕获到 {n} 个交易员经验状态拐点股:"
+                        f"🎯 成功在 {scanned_date} 捕获到 {n} 个交易员经验状态拐点股"
+                        f"（已落库 {_n_saved} 条，可在下方历史复盘查看 1/5/10/60 日收益）:"
                     )
                     st.dataframe(
                         theme_df,
                         use_container_width=True,
                         hide_index=True,
                     )
+
+    st.divider()
+    st.markdown("### 📚 历史选股复盘")
+    st.caption(
+        "从 ``theme_daily_selections`` 读取已落库记录；"
+        "收益按信号日收盘价为基准，取之后第 1/5/10/60 个交易日收盘价计算（打开复盘时自动回填）。"
+    )
+
+    from src.theme.history_review import (
+        list_theme_selection_trade_dates,
+        load_theme_review_bundle,
+    )
+    from src.theme.db import ensure_theme_tables
+
+    with get_connection(DB_PATH) as _theme_hist_conn:
+        ensure_theme_tables(_theme_hist_conn)
+        _theme_dates = list_theme_selection_trade_dates(_theme_hist_conn)
+        _theme_db_row = _theme_hist_conn.execute(
+            "SELECT MAX(trade_date) FROM theme_daily_selections"
+        ).fetchone()
+    _theme_saved_date = (
+        str(_theme_db_row[0]).strip()[:10]
+        if _theme_db_row and _theme_db_row[0]
+        else ""
+    )
+
+    if not _theme_dates:
+        st.info(
+            "暂无历史题材选股记录。请先点击上方「开始全市场共振扫描」并成功入选后自动落库。"
+        )
+    else:
+        _theme_default = _theme_dates[0]
+        if _theme_saved_date and _theme_saved_date in _theme_dates:
+            _theme_default = _theme_saved_date
+
+        _theme_review_date = st.selectbox(
+            "选择信号日（复盘）",
+            options=_theme_dates,
+            index=_theme_dates.index(_theme_default),
+            key="theme_history_trade_date",
+        )
+
+        with get_connection(DB_PATH) as _theme_hist_conn:
+            _theme_bundle = load_theme_review_bundle(
+                _theme_hist_conn, _theme_review_date
+            )
+
+        _theme_sel_df = _theme_bundle["selections_display"]
+        _theme_n_sel = int(_theme_bundle["count"])
+        _theme_mkt_review = _theme_bundle.get("market_score")
+
+        _tm1, _tm2, _tm3 = st.columns(3)
+        _tm1.metric("信号日", _theme_review_date)
+        _tm2.metric(
+            "大盘环境分",
+            _theme_mkt_review if _theme_mkt_review is not None else "—",
+        )
+        _tm3.metric("入选数量", _theme_n_sel)
+
+        if _theme_sel_df.empty:
+            st.warning(f"{_theme_review_date} 当日无入选记录。")
+        else:
+            st.dataframe(_theme_sel_df, use_container_width=True, hide_index=True)

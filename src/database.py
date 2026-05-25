@@ -313,6 +313,13 @@ def _ensure_short_term_tables(conn: sqlite3.Connection) -> None:
     _ensure_short(conn)
 
 
+def _ensure_theme_tables(conn: sqlite3.Connection) -> None:
+    """热门题材选股历史表（``theme_daily_selections``）。"""
+    from src.theme.db import ensure_theme_tables as _ensure_theme
+
+    _ensure_theme(conn)
+
+
 def init_db(db_path: Path | None = None) -> None:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,6 +336,7 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_market_hsgt_flow_daily(conn)
         _ensure_performance_indexes(conn)
         _ensure_short_term_tables(conn)
+        _ensure_theme_tables(conn)
         conn.commit()
     finally:
         conn.close()
@@ -652,9 +660,16 @@ def update_selection_returns(
         return int(conn.execute(f"UPDATE daily_selections SET {', '.join(sets)} WHERE {where}", vals).rowcount or 0)
 
 
-def fetch_stock_daily_bars_until(stock_code: str, end_date: str, *, db_path: Path | None = None) -> pd.DataFrame:
+def fetch_stock_daily_bars_until(
+    stock_code: str,
+    end_date: str,
+    *,
+    db_path: Path | None = None,
+    connection: sqlite3.Connection | None = None,
+) -> pd.DataFrame:
     code, end = str(stock_code).strip().zfill(6), str(end_date).strip()[:10]
-    with get_connection(db_path or DB_PATH) as conn:
+
+    def _query(conn: sqlite3.Connection) -> pd.DataFrame:
         df = pd.read_sql_query(
             "SELECT date, open, high, low, close, volume, industry, market_cap, "
             "turnover_rate, pe_ttm FROM stock_daily_kline WHERE stock_code = ? AND date <= ? "
@@ -662,12 +677,20 @@ def fetch_stock_daily_bars_until(stock_code: str, end_date: str, *, db_path: Pat
             conn,
             params=(code, end),
         )
-    if df.empty: return df
-    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    for col in ("open", "high", "low", "close", "volume", "market_cap", "turnover_rate", "pe_ttm"):
-        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "industry" in df.columns: df["industry"] = df["industry"].fillna("").astype(str)
-    return df.dropna(subset=["close"]).reset_index(drop=True)
+        if df.empty:
+            return df
+        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+        for col in ("open", "high", "low", "close", "volume", "market_cap", "turnover_rate", "pe_ttm"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "industry" in df.columns:
+            df["industry"] = df["industry"].fillna("").astype(str)
+        return df.dropna(subset=["close"]).reset_index(drop=True)
+
+    if connection is not None:
+        return _query(connection)
+    with get_connection(db_path or DB_PATH) as conn:
+        return _query(conn)
 
 
 def fetch_latest_industry_by_codes(stock_codes: Iterable[str], *, db_path: Path | None = None) -> dict[str, str]:
