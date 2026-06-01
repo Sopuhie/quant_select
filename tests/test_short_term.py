@@ -3,8 +3,17 @@ from __future__ import annotations
 
 import sqlite3
 
+import pandas as pd
+import pytest
+
 from src.short_term.dingtalk import build_short_selection_markdown
-from src.short_term.review_prices import enrich_rows_with_review_prices, resolve_t1_t2_dates
+from src.short_term.history_review import format_selections_display_df
+from src.short_term.review_prices import (
+    calc_t1_day_return,
+    calc_t2_day_return,
+    enrich_rows_with_review_prices,
+    resolve_t1_t2_dates,
+)
 from src.short_term.strategy import ShortTermRuleStrategy, _is_st_name
 
 
@@ -58,6 +67,31 @@ def test_hold_plan_uses_t_close_buy():
 
     assert "收盘" in SHORT_HOLD_PLAN
     assert "开盘买入" not in SHORT_HOLD_PLAN
+
+
+def test_calc_t1_t2_day_returns():
+    assert calc_t1_day_return(10.0, 10.5) == 0.05
+    assert calc_t2_day_return(10.5, 11.2) == pytest.approx((11.2 - 10.5) / 10.5)
+    assert calc_t1_day_return(None, 10.5) is None
+    assert calc_t2_day_return(10.5, None) is None
+
+
+def test_format_selections_display_includes_t1_t2_pct():
+    raw = {
+        "排名": [1],
+        "股票代码": ["000001"],
+        "股票名称": ["测试"],
+        "信号日收盘价": [10.0],
+        "T1收盘价": [10.5],
+        "T2收盘价": [11.2],
+        "T1日涨幅": [0.05],
+        "T2日涨幅": [(11.2 - 10.5) / 10.5],
+        "T1买T2卖涨跌幅": [0.12],
+    }
+    disp = format_selections_display_df(pd.DataFrame(raw))
+    assert "T1日涨幅" in disp.columns
+    assert disp.loc[0, "T1日涨幅"] == "5.00%"
+    assert "T2日涨幅" in disp.columns
 
 
 def test_resolve_t1_t2_dates_chain():

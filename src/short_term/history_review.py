@@ -170,12 +170,13 @@ def format_selections_display_df(df: pd.DataFrame) -> pd.DataFrame:
             if pd.notna(x) and abs(float(x)) < 2
             else (f"{float(x):.2f}%" if pd.notna(x) else "—")
         )
-    if "T1买T2卖涨跌幅" in out.columns:
-        out["T1买T2卖涨跌幅"] = out["T1买T2卖涨跌幅"].apply(
-            lambda x: f"{float(x) * 100:.2f}%"
-            if pd.notna(x) and abs(float(x)) < 2
-            else (f"{float(x):.2f}%" if pd.notna(x) else "—")
-        )
+    for pct_col in ("T1日涨幅", "T2日涨幅", "T1买T2卖涨跌幅"):
+        if pct_col in out.columns:
+            out[pct_col] = out[pct_col].apply(
+                lambda x: f"{float(x) * 100:.2f}%"
+                if pd.notna(x) and abs(float(x)) < 2
+                else (f"{float(x):.2f}%" if pd.notna(x) else "—")
+            )
     for col in ("规则得分", "五日量比", "MACD柱改善", "J斜率", "KDJ_J", "MACD柱"):
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(4)
@@ -186,7 +187,31 @@ def format_selections_display_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in ("信号日收盘价", "T1开盘价", "T1收盘价", "T2开盘价", "T2收盘价"):
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
-    return out
+    order = [
+        "信号日",
+        "排名",
+        "股票代码",
+        "股票名称",
+        "规则得分",
+        "日涨幅",
+        "五日量比",
+        "MACD柱改善",
+        "J斜率",
+        "KDJ_J",
+        "MACD柱",
+        "已执行",
+        "信号日收盘价",
+        "T1开盘价",
+        "T1收盘价",
+        "T1日涨幅",
+        "T2开盘价",
+        "T2收盘价",
+        "T2日涨幅",
+        "T1买T2卖涨跌幅",
+        "持仓计划",
+        "实盘建议",
+    ]
+    return out[[c for c in order if c in out.columns]]
 
 
 def load_short_review_bundle(

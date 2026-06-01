@@ -12,6 +12,40 @@ from src.utils import next_trade_day_after
 REVIEW_PRICE_KEYS = ("t1_open", "t1_close", "t2_open", "t2_close")
 
 
+def calc_t1_day_return(
+    signal_close: float | None,
+    t1_close: float | None,
+) -> float | None:
+    """T1 日涨幅：相对信号日收盘价的小数涨跌幅。"""
+    if signal_close is None or t1_close is None:
+        return None
+    try:
+        base = float(signal_close)
+        close = float(t1_close)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(base) or not np.isfinite(close) or base <= 0:
+        return None
+    return (close - base) / base
+
+
+def calc_t2_day_return(
+    t1_close: float | None,
+    t2_close: float | None,
+) -> float | None:
+    """T2 日涨幅：相对 T1 收盘价的小数涨跌幅。"""
+    if t1_close is None or t2_close is None:
+        return None
+    try:
+        base = float(t1_close)
+        close = float(t2_close)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(base) or not np.isfinite(close) or base <= 0:
+        return None
+    return (close - base) / base
+
+
 def calc_t1_buy_t2_sell_return(
     t1_open: float | None,
     t1_close: float | None,

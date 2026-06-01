@@ -48,6 +48,7 @@ from src.config import (
     MODEL_PATH,
     SCHEDULER_RUN_AT,
     SCRIPT_BACKTEST,
+    SCRIPT_SHORT_TERM_BACKTEST,
     SCRIPT_WALKFORWARD_BACKTEST,
     SCRIPT_RUN_DAILY,
     SCRIPT_TRAIN_MODEL,
@@ -2404,6 +2405,135 @@ with tab_short:
                     st.rerun()
 
     st.divider()
+    st.markdown("### 📈 策略历史滚动回测")
+    st.caption(
+        "对区间内每个交易日重跑短线规则扫描，并用 ``execution.evaluate_daily_exit`` "
+        "模拟 T 收盘买 / T+1 止损 / T+N 收盘卖（与实盘执行引擎一致，**不写库**）。"
+        "信号日 Top N 等权汇总当日收益，再复利拼接净值；默认不计佣金/印花税。"
+        "全市场逐日扫描较慢，建议先缩短区间或命令行加 ``--max-scan-stocks``。"
+    )
+    from src.short_term.backtest import (
+        SHORT_TERM_BACKTEST_DAILY_CSV,
+        SHORT_TERM_BACKTEST_SUMMARY_JSON,
+    )
+    from src.short_term.config import SHORT_SELL_OFFSET, SHORT_STOP_LOSS_RATIO
+
+    _st_bt_lo, _st_bt_hi = _get_kline_date_bounds()
+    _st_bt_default_start = _st_bt_lo or "2025-01-01"
+    _st_bt_default_end = _st_bt_hi or date.today().isoformat()
+    _st_btc1, _st_btc2, _st_btc3 = st.columns(3)
+    with _st_btc1:
+        short_bt_start = st.text_input(
+            "回测开始日",
+            value=_st_bt_default_start,
+            key="short_bt_start",
+        )
+    with _st_btc2:
+        short_bt_end = st.text_input(
+            "回测结束日",
+            value=_st_bt_default_end,
+            key="short_bt_end",
+        )
+    with _st_btc3:
+        short_bt_max_scan = st.number_input(
+            "扫描股票上限（0=不限）",
+            min_value=0,
+            max_value=8000,
+            value=0,
+            step=500,
+            key="short_bt_max_scan",
+            help="仅加速用；0 表示扫描当日池内全部股票",
+        )
+    short_bt_btn = st.button(
+        "🚀 启动短线策略滚动回测",
+        key="run_short_term_backtest",
+        use_container_width=True,
+    )
+    if short_bt_btn:
+        with st.spinner("短线滚动回测执行中（逐日全市场扫描，请耐心等待）…"):
+            _st_bt_cmd = [
+                sys.executable,
+                str(SCRIPT_SHORT_TERM_BACKTEST),
+                "--start-date",
+                str(short_bt_start).strip()[:10],
+                "--end-date",
+                str(short_bt_end).strip()[:10],
+            ]
+            if short_include_300:
+                _st_bt_cmd.append("--include-300")
+            if short_include_688:
+                _st_bt_cmd.append("--include-688")
+            if int(short_bt_max_scan) > 0:
+                _st_bt_cmd.extend(["--max-scan-stocks", str(int(short_bt_max_scan))])
+            _st_bt_ret, _st_bt_log = run_command_interactive(
+                _st_bt_cmd,
+                task_name="短线策略滚动回测",
+            )
+            if _st_bt_ret == 0:
+                st.success(
+                    f"✅ 回测完成！明细见 {SHORT_TERM_BACKTEST_DAILY_CSV.parent}"
+                )
+            else:
+                st.error("❌ 回测异常，请查阅上方调试日志")
+
+    if SHORT_TERM_BACKTEST_SUMMARY_JSON.exists():
+        try:
+            _st_sum = json.loads(
+                SHORT_TERM_BACKTEST_SUMMARY_JSON.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            _st_sum = {}
+        if _st_sum:
+            _sm1, _sm2, _sm3, _sm4 = st.columns(4)
+            _sm1.metric(
+                "复利收益",
+                f"{float(_st_sum.get('cum_return_pct') or 0):.2f}%"
+                if _st_sum.get("cum_return_pct") is not None
+                else "—",
+            )
+            _sm2.metric(
+                "胜率",
+                f"{float(_st_sum.get('win_rate') or 0) * 100:.1f}%"
+                if _st_sum.get("win_rate") is not None
+                else "—",
+            )
+            _sm3.metric("平仓笔数", int(_st_sum.get("closed_trades") or 0))
+            _sm4.metric(
+                "最大回撤",
+                f"{float(_st_sum.get('max_drawdown_pct') or 0):.2f}%"
+                if _st_sum.get("max_drawdown_pct") is not None
+                else "—",
+            )
+            st.caption(
+                f"最近回测：{_st_sum.get('start_date', '—')} ~ {_st_sum.get('scan_end_date', '—')}"
+                f"（K 线至 {_st_sum.get('end_date', '—')}）· "
+                f"信号日 {_st_sum.get('signal_days', 0)} · "
+                f"熔断日 {_st_sum.get('fused_days', 0)} · "
+                f"空扫描 {_st_sum.get('empty_days', 0)} · "
+                f"Top {_st_sum.get('top_n', SHORT_TOP_N)} · "
+                f"T+{_st_sum.get('sell_offset', SHORT_SELL_OFFSET)} 平仓 · "
+                f"止损 {float(_st_sum.get('stop_loss_ratio', SHORT_STOP_LOSS_RATIO)) * 100:.0f}%"
+            )
+            if SHORT_TERM_BACKTEST_DAILY_CSV.exists():
+                _st_daily_bt = pd.read_csv(SHORT_TERM_BACKTEST_DAILY_CSV)
+                _nav_s = pd.to_numeric(_st_daily_bt.get("cum_nav"), errors="coerce").dropna()
+                if not _nav_s.empty:
+                    _nav_chart = _st_daily_bt.loc[_nav_s.index].copy()
+                    _nav_chart["signal_date"] = _nav_chart["signal_date"].astype(str)
+                    st.line_chart(
+                        _nav_chart.set_index("signal_date")["cum_nav"],
+                        use_container_width=True,
+                    )
+            with st.expander("回测明细（最近一批）", expanded=False):
+                if SHORT_TERM_BACKTEST_DAILY_CSV.exists():
+                    st.markdown("**按信号日汇总**")
+                    st.dataframe(
+                        pd.read_csv(SHORT_TERM_BACKTEST_DAILY_CSV),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+    st.divider()
     st.markdown("### 📚 历史选股复盘")
     st.caption(
         "从 ``short_daily_selections`` / ``short_order_tracker`` 读取已落库记录，"
@@ -2440,6 +2570,8 @@ with tab_short:
 
         st.caption(
             "T1/T2 开收盘价在打开复盘时从本地 K 线自动补齐。"
+            " **T1日涨幅** = (T+1收盘 − 信号日收盘) / 信号日收盘；"
+            " **T2日涨幅** = (T+2收盘 − T+1收盘) / T+1收盘；"
             " **T1买T2卖涨跌幅** = (T2收盘 − T+1开盘，无开盘则用T+1收盘) / 买入价。"
         )
 

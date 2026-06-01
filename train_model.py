@@ -1,17 +1,138 @@
 """
-使用本地 SQLite（stock_daily_kline）中的日线计算因子并重训排序模型：
-LightGBM LambdaRank + XGBoost XGBRanker（rank:pairwise）+ 可选 CatBoost YetiRank，
-落盘 lgb_model.pkl / xgb_model.pkl /（可选）cat_ranker.cbm；元学习器 Ridge 默认使用训练集 Walk-forward OOF（可用 ``QUANT_META_OOF_FOLDS=0`` 关闭以加速）。
-不依赖在线行情拉取；预测侧仍使用 factor_calculator 中同一套因子定义。
+任务 B：重新训练选股模型 — 实现说明
+====================================
 
-用法（在 quant_select 目录下）:
+本脚本是 Streamlit 控制台「🎯 任务 B：重新训练选股模型」的子进程入口
+（``src.config.SCRIPT_TRAIN_MODEL``）。中长线每日选股（任务 C）依赖此处产出的
+排序模型与元学习器；**不拉在线行情**，仅读本地 SQLite ``stock_daily_kline``。
+
+触发入口
+--------
+1. **Web 控制台**（``app.py`` → 系统控制台 Tab → 任务 B）
+   - 点击「开始模型训练」后，父进程执行::
+
+         python train_model.py --fast-train --no-catboost [--train-end-date YYYY-MM-DD]
+
+   - ``--fast-train`` / ``--no-catboost`` 为界面固定参数，缩短训练耗时。
+   - 若环境变量 ``QUANT_TRAIN_END_DATE`` 已设置，会追加 ``--train-end-date``。
+   - 子进程 stdout/stderr 经 ``run_command_interactive`` 实时回显；成功则覆盖
+     ``models/`` 下权重并写入 ``model_versions`` 表。
+
+2. **命令行 / 定时流水线**（``scripts/auto_pipeline.bat`` 步骤 3）
+   - 默认全量训练：``python train_model.py``（含 CatBoost，迭代上限更高）。
+   - 调参：``--tune --tune-trials N`` → Optuna 搜索 → ``models/best_params.json``。
+
+整体流水线（``main()``）
+-----------------------
+::
+
+  本地 K 线 → 逐股因子/标签面板 → 截面特征管道 → Purged 时序划分
+       → [可选 Optuna] → LGBM LambdaRank + XGB Ranker + [可选 CatBoost]
+       → 验证指标 / PSI / 置换重要性 → Ridge 元模型（OOF Stacking）
+       → 落盘 pkl/cbm + register_model_version(set_active=True)
+
+阶段 1：构建训练面板（``_load_local_kline_panel``）
+--------------------------------------------------
+- 从 ``stock_daily_kline`` 读取 OHLCV 及 industry / market_cap / turnover_rate / pe_ttm。
+- ``--train-end-date``：只保留该日及之前的行；筛空则回退为库内全部日期。
+- ``--max-stocks`` / ``--sh-main-board`` / ``--train-stock-prefixes``：限制参与训练的股票池。
+- 单股最少 K 线根数：``max(MIN_HISTORY_BARS + LABEL_HORIZON_DAYS, 65)``（见 ``src.config``）。
+- 对每只有足够历史的股票依次：
+  1. ``panel_enrichment.enrich_ohlcv_history`` — 合并基本面/资金流等辅助列；
+  2. ``factor_calculator.compute_factors_for_history`` — 技术因子（与预测侧 ``FEATURE_COLUMNS`` 一致）；
+  3. ``factor_calculator.compute_morphology_metrics_for_history`` — 形态类因子；
+  4. ``factor_calculator.label_forward_return`` — **监督标签** ``label_ret``：
+     T 日收盘后信号 → T+1 可成交买入价 → 约 ``LABEL_HORIZON_DAYS``（默认 5）日后可成交卖出价，
+     收益率；一字涨跌停顺延，避免不可成交的虚假标签。
+- 丢弃 ``FEATURE_COLUMNS + label_ret`` 含 NaN/Inf 的行，合并为全市场面板 DataFrame。
+
+阶段 2：截面特征管道（与任务 C 预测对齐）
+-----------------------------------------
+- ``factor_calculator.prepare_ranking_cross_section_pipeline(panel)``
+  做北向交互、增量库合并、截面去极值/标准化等；**必须与 ``run_daily.py`` 使用同一管道**，
+  否则训练特征分布与推理不一致。
+- 再次 dropna 后得到可用于排序学习的干净面板。
+
+阶段 3：Purged 时序划分（``model_trainer.split_panel_train_val_purged``）
+-------------------------------------------------------------------------
+- 按交易日排序；**验证集** = 最后 60 个交易日；**训练集** = 验证起点前再往前
+  ``purge_days``（默认 = ``LABEL_HORIZON_DAYS``）个交易日之前的全部样本。
+- Purging Gap 防止 forward return 标签跨越切分点造成**时序泄露**。
+- 全市场交易日 < 90 天则拒绝训练，避免 train≈val 过拟合。
+
+阶段 4：超参数（可选 ``--tune``）
+---------------------------------
+- ``--tune``：``model_trainer.optuna_tune_lgbm_ranker`` 在验证集上最大化 **平均 Rank IC**
+  （逐日截面 Spearman(预测分, label_ret) 的均值），结果写入 ``models/best_params.json``。
+- 未调参时：若存在 ``best_params.json`` 则加载，否则用 ``LGB_RANKER_DEFAULT_PARAMS``。
+
+阶段 5：三级排序基学习器
+------------------------
+均以**同一训练/验证划分**、**按 date 分组的 query**（每个交易日一组）训练：
+
+1. **LightGBM LambdaRank**（``train_lgbm_ranker``）
+   - ``objective=lambdarank``；``label_ret`` 在组内线性映射为 0..30 的整型 relevance。
+   - 样本权重：对大幅亏损尾部加权（``ranking_sample_weights_extreme_loss``），强化「避雷」。
+   - 早停：验证集 NDCG；输出 ``mean_rank_ic_val`` 等指标。
+
+2. **XGBoost XGBRanker**（``train_xgb_ranker``）
+   - ``rank:pairwise``，相同分组与 relevance 定义，与 LGBM 形成多样性。
+
+3. **CatBoost YetiRank**（``train_catboost_ranker_optional``，界面任务 B 默认跳过）
+   - 落盘 ``models/cat_ranker.cbm``；``--no-catboost`` 时删除陈旧 cbm，避免预测侧误加载。
+
+``--fast-train`` 降低三者的 ``n_estimators`` 与早停轮数（见 ``main()`` 内 ``n_lgb/n_xgb/n_cat``）。
+
+阶段 6：训练后诊断
+------------------
+- **PSI**（``population_stability_index``）：训练集 vs 验证集 LGBM 预测分分布漂移；
+  超 ``config.json → quant.psi.alert_threshold`` 写入 ``psi_alert``。
+- **置换重要性**（``utils.permutation_importance_rank_ic_delta``）：验证集上逐特征打乱对 Rank IC 的影响。
+
+阶段 7：Ridge 元学习器（Stacking）
+----------------------------------
+- ``fit_meta_stacker_ridge_oof``：在训练集上做 Walk-forward OOF，得到无泄露的一级模型 OOF 分；
+  以 OOF 分为特征、``label_ret`` 为标签拟合 ``Ridge(alpha=10)``。
+- 验证集用**已训好的全量** LGBM/XGB/[Cat] 打分评估 ``meta_mean_rank_ic_val``。
+- ``QUANT_META_OOF_FOLDS=0`` 或 ``ranking.meta_oof_folds<=1`` 时退化为简单 hold-out Stacking。
+- 落盘 ``models/meta_rank_stacker.pkl``（含 ``n_base``：2 或 3）。
+
+阶段 8：落盘与版本登记
+----------------------
+- ``models/lgb_model.pkl``、``models/xgb_model.pkl``、``models/meta_rank_stacker.pkl``、
+  [可选] ``models/cat_ranker.cbm``。
+- ``database.register_model_version``：写入 ``model_versions``（features、metrics JSON），
+  并将新版本 ``is_active=1``（旧版本置 0）。任务 C ``run_daily.py`` 加载的即为 active 版本。
+
+与任务 A / C 的关系
+-------------------
+- **任务 A**（行情同步）→ 填充 ``stock_daily_kline``；无数据时本脚本 ``SystemExit`` 提示先同步。
+- **任务 B**（本脚本）→ 产出 ``models/*`` + ``model_versions``。
+- **任务 C**（``run_daily.py``）→ 用同一 ``FEATURE_COLUMNS`` 与 ``prepare_ranking_cross_section_pipeline``
+  对最新交易日打分，LGBM+XGB+Cat 一级分经 Ridge 融合后排序，再经经验风控取 TopN 写入 ``daily_selections``。
+
+线程与环境
+----------
+- 启动时设置 ``KMP_DUPLICATE_LIB_OK``、``OMP_NUM_THREADS``、``MKL_NUM_THREADS``（默认 4），
+  减轻 Windows 上 LightGBM/XGB/CatBoost 嵌套 OpenMP 导致的假死。
+- 未设置 ``CATBOOST_NUM_THREADS`` 时与 ``OMP_NUM_THREADS`` 对齐。
+
+命令行用法（项目根目录）
+------------------------
+::
+
   python train_model.py
   python train_model.py --train-end-date 2024-12-31
-  # 仅沪市主板约 600/601/603/605，不含创业板 300、科创板 688；再加快可叠加 --fast-train --no-catboost
   python train_model.py --sh-main-board --fast-train
-  python train_model.py --tune                    # Optuna 调参并写入 models/best_params.json
   python train_model.py --tune --tune-trials 30
-未设置 ``CATBOOST_NUM_THREADS`` 时，脚本会按 ``OMP_NUM_THREADS``（默认 4）限制 CatBoost 线程，减轻 Windows 上多库超订导致的极慢或假死。
+
+主要实现文件
+------------
+- 本文件 ``train_model.py`` — 入口、面板构建、流程编排
+- ``src/model_trainer.py`` — 划分、Ranker 训练、OOF Meta、指标
+- ``src/factor_calculator.py`` — 因子与 ``label_forward_return``
+- ``src/panel_enrichment.py`` — OHLCV  enrichment
+- ``src/config.py`` — ``FEATURE_COLUMNS``、路径、``LABEL_HORIZON_DAYS``
 """
 from __future__ import annotations
 

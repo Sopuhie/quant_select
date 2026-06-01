@@ -497,6 +497,7 @@ SCRIPT_TRAIN_MODEL = PROJECT_ROOT / "train_model.py"
 SCRIPT_RUN_DAILY = PROJECT_ROOT / "run_daily.py"
 SCRIPT_BACKTEST = PROJECT_ROOT / "scripts" / "backtest.py"
 SCRIPT_WALKFORWARD_BACKTEST = PROJECT_ROOT / "scripts" / "walkforward_backtest.py"
+SCRIPT_SHORT_TERM_BACKTEST = PROJECT_ROOT / "scripts" / "short_term_backtest.py"
 SCRIPT_UPDATE_RETURNS = PROJECT_ROOT / "update_returns.py"
 SCRIPT_SYNC_AUXILIARY = PROJECT_ROOT / "scripts" / "sync_auxiliary_features.py"
 

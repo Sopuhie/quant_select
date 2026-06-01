@@ -471,6 +471,16 @@ def load_short_selections_df(
                t1_open AS T1开盘价, t1_close AS T1收盘价,
                t2_open AS T2开盘价, t2_close AS T2收盘价,
                CASE
+                 WHEN t1_close IS NOT NULL AND close_price IS NOT NULL AND close_price > 0
+                 THEN (t1_close - close_price) / close_price
+                 ELSE NULL
+               END AS T1日涨幅,
+               CASE
+                 WHEN t2_close IS NOT NULL AND t1_close IS NOT NULL AND t1_close > 0
+                 THEN (t2_close - t1_close) / t1_close
+                 ELSE NULL
+               END AS T2日涨幅,
+               CASE
                  WHEN t2_close IS NOT NULL
                   AND COALESCE(t1_open, t1_close) IS NOT NULL
                   AND COALESCE(t1_open, t1_close) > 0

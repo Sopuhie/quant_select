@@ -196,6 +196,19 @@ CREATE TABLE IF NOT EXISTS stock_concept_boards (
 );
 CREATE INDEX IF NOT EXISTS idx_scb_board ON stock_concept_boards(board_name);
 CREATE INDEX IF NOT EXISTS idx_scb_date ON stock_concept_boards(updated_date);
+
+CREATE TABLE IF NOT EXISTS index_daily (
+    index_code TEXT NOT NULL,
+    date TEXT NOT NULL,
+    close REAL NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    volume REAL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (index_code, date)
+);
+CREATE INDEX IF NOT EXISTS idx_index_daily_code_date ON index_daily(index_code, date);
 """
 
 
@@ -267,6 +280,28 @@ def _ensure_stock_daily_kline_turnover_pe(conn: sqlite3.Connection) -> None:
         _retry_sqlite_locked(_add_pe, attempts=8)
 
 
+def _ensure_index_daily(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='index_daily'")
+    if cur.fetchone() is not None:
+        return
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS index_daily (
+            index_code TEXT NOT NULL,
+            date TEXT NOT NULL,
+            close REAL NOT NULL,
+            open REAL,
+            high REAL,
+            low REAL,
+            volume REAL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (index_code, date)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_index_daily_code_date ON index_daily(index_code, date)"
+    )
+
+
 def _ensure_market_hsgt_flow_daily(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_hsgt_flow_daily'")
     if cur.fetchone() is None:
@@ -291,6 +326,7 @@ def _ensure_performance_indexes(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_kline_date ON stock_daily_kline(date)",
         "CREATE INDEX IF NOT EXISTS idx_mf_code_date ON stock_money_flow_daily(stock_code, trade_date)",
         "CREATE INDEX IF NOT EXISTS idx_nh_code_date ON stock_north_hold_daily(stock_code, trade_date)",
+        "CREATE INDEX IF NOT EXISTS idx_index_daily_code_date ON index_daily(index_code, date)",
     ):
         try:
             conn.execute(ddl)
@@ -333,6 +369,7 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_daily_selections_selection_reason(conn)
         _ensure_daily_selections_hold_returns(conn)
         _ensure_stock_concept_boards(conn)
+        _ensure_index_daily(conn)
         _ensure_market_hsgt_flow_daily(conn)
         _ensure_performance_indexes(conn)
         _ensure_short_term_tables(conn)
@@ -449,6 +486,93 @@ def upsert_stock_daily_klines(
     finally:
         if own:
             conn.close()
+
+
+def fetch_index_daily_max_date(
+    index_code: str,
+    db_path: Path | None = None,
+) -> str | None:
+    """返回 ``index_daily`` 中该指数已有数据的最近交易日，无记录时返回 None。"""
+    code = str(index_code).strip().zfill(6)
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT MAX(date) FROM index_daily WHERE index_code = ?",
+            (code,),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0]).strip()[:10]
+
+
+def upsert_index_daily_rows(
+    rows: Iterable[dict[str, Any]],
+    db_path: Path | None = None,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> int:
+    """写入指数日线（``index_code`` + ``date`` 主键）；返回写入行数。"""
+    sql = """
+    INSERT INTO index_daily (index_code, date, close, open, high, low, volume)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(index_code, date) DO UPDATE SET
+        close = excluded.close,
+        open = COALESCE(excluded.open, index_daily.open),
+        high = COALESCE(excluded.high, index_daily.high),
+        low = COALESCE(excluded.low, index_daily.low),
+        volume = COALESCE(excluded.volume, index_daily.volume),
+        updated_at = CURRENT_TIMESTAMP
+    """
+
+    def _opt_float(raw: object) -> float | None:
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            return None
+        try:
+            v = float(raw)
+            return v if math.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
+
+    batch: list[tuple[Any, ...]] = []
+    for r in rows:
+        close_v = _opt_float(r.get("close"))
+        if close_v is None:
+            continue
+        batch.append(
+            (
+                str(r["index_code"]).strip().zfill(6),
+                str(r["date"]).strip()[:10],
+                close_v,
+                _opt_float(r.get("open")),
+                _opt_float(r.get("high")),
+                _opt_float(r.get("low")),
+                _opt_float(r.get("volume")),
+            )
+        )
+    if not batch:
+        return 0
+
+    own = connection is None
+    if own:
+        init_db(db_path)
+    conn = (
+        connection
+        if connection is not None
+        else sqlite3.connect(str(db_path or DB_PATH), timeout=_SQLITE_CONNECT_TIMEOUT)
+    )
+    if own:
+        _apply_sqlite_pragmas(conn)
+    try:
+        def _write() -> None:
+            conn.executemany(sql, batch)
+
+        _retry_sqlite_locked(_write, attempts=5)
+        if own:
+            conn.commit()
+    finally:
+        if own:
+            conn.close()
+    return len(batch)
 
 
 def insert_daily_selections(

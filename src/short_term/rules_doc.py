@@ -164,7 +164,9 @@ def short_term_rules_sections() -> list[dict[str, str]]:
             "规则": (
                 "trade_date、stock_code、close_price、final_score、"
                 "pct_change、volume_ratio_5d、macd_bar_improve、j_slope、"
-                "is_executed；T1买T2卖涨跌幅=(T2收盘−T+1开盘或收盘)/买入价；"
+                "is_executed；T1日涨幅=(T+1收盘−信号日收盘)/信号日收盘；"
+                "T2日涨幅=(T+2收盘−T+1收盘)/T+1收盘；"
+                "T1买T2卖涨跌幅=(T2收盘−T+1开盘或收盘)/买入价；"
                 "detail_json 含各校验项 checks"
             ),
         },

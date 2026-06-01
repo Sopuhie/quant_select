@@ -19,6 +19,8 @@
   - K 线写入后默认调用 ``sync_stock_industries``，生成 ``{stock_code: 行业名}`` 并批量 UPDATE。
   - 数据源（``QUANT_INDUSTRY_SOURCE``）：``auto`` 时先东方财富行业板块，失败则 **Baostock** 全市场行业表。
   - 市值（``QUANT_MCAP_SOURCE``）：``auto`` 时先东财 push2，失败则用东财 datacenter ``stock_value_em``。
+  - 沪深300 指数（``index_daily``）：默认在 K 线同步后增量写入，供 ``run_daily`` 大盘环境分/熔断使用；
+    仅同步指数：``python scripts/update_local_data.py --only-index-sync``。
 """
 from __future__ import annotations
 
@@ -54,6 +56,7 @@ from src.data_fetcher import (
     list_a_stock_codes,
     resolve_incremental_daily_fetch_window,
 )
+from src.index_daily_sync import sync_index_daily
 from src.utils import get_kline_incremental_end_trade_date
 
 DEFAULT_WORKERS = max(1, int(os.environ.get("QUANT_UPDATE_WORKERS", "4")))
@@ -740,6 +743,16 @@ def main() -> int:
         help="仅执行基本面财报同步（不拉取 K 线）",
     )
     parser.add_argument(
+        "--only-index-sync",
+        action="store_true",
+        help="仅同步沪深300等指数至 index_daily（不拉取个股 K 线）",
+    )
+    parser.add_argument(
+        "--skip-index-sync",
+        action="store_true",
+        help="跳过 index_daily 指数同步（run_daily 大盘熔断依赖该表）",
+    )
+    parser.add_argument(
         "--industry-board-limit",
         type=int,
         default=0,
@@ -761,6 +774,11 @@ def main() -> int:
         sync_fundamental_data(DB_PATH)
         return 0
 
+    if args.only_index_sync:
+        init_db()
+        sync_index_daily(DB_PATH, verbose=True)
+        return 0
+
     eff_max = 0 if args.all_stocks else args.max_stocks
 
     update_database_kline(
@@ -771,6 +789,11 @@ def main() -> int:
         industry_board_limit=args.industry_board_limit,
         run_market_cap_sync=not args.skip_market_cap_sync,
     )
+    if not args.skip_index_sync:
+        try:
+            sync_index_daily(DB_PATH, verbose=True)
+        except Exception as exc:
+            print(f"警告: 指数 index_daily 同步失败（个股 K 线已写入）: {exc}", flush=True)
     if not args.skip_fundamental_sync:
         try:
             sync_fundamental_data(DB_PATH)

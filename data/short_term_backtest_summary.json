@@ -1,0 +1,29 @@
+{
+  "start_date": "2025-05-09",
+  "end_date": "2026-05-29",
+  "scan_end_date": "2026-05-28",
+  "top_n": 5,
+  "sell_offset": 1,
+  "stop_loss_ratio": 0.03,
+  "min_market_score": 50,
+  "include_300": false,
+  "include_688": false,
+  "max_scan_stocks": null,
+  "calendar_days_scanned": 256,
+  "signal_days": 163,
+  "fused_days": 72,
+  "empty_days": 21,
+  "total_trades": 815,
+  "closed_trades": 815,
+  "holding_trades": 0,
+  "win_rate": 0.3901840490797546,
+  "avg_pnl_pct": -0.25022713348800973,
+  "median_pnl_pct": -0.8010680907877236,
+  "cum_return_pct": -34.89677123843797,
+  "max_drawdown_pct": -42.411351604773095,
+  "exit_reason_counts": {
+    "t1_close_exit": 573,
+    "t1_intraday_stop_loss": 215,
+    "t1_open_below_stop_limit": 27
+  }
+}

@@ -102,14 +102,15 @@ def get_hs300_market_environment_score(
                     f"[大盘环境] {td} 本地沪深300指数不足 20 根，"
                     f"环境分={score_out}（QUANT_MARKET_REGIME_MISSING_SCORE，"
                     f"默认低于熔断线 {MARKET_REGIME_MIN_SCORE}）。"
-                    "请同步 index_daily。",
+                    "请运行 scripts/update_local_data.py（或 --only-index-sync）同步 index_daily。",
                     flush=True,
                 )
     except Exception:
         if td not in _MISSING_INDEX_WARNED:
             _MISSING_INDEX_WARNED.add(td)
             print(
-                f"[大盘环境] {td} 读取 index_daily 失败，环境分={score_out}（保守熔断）。",
+                f"[大盘环境] {td} 读取 index_daily 失败，环境分={score_out}（保守熔断）。"
+                "请运行 scripts/update_local_data.py（或 --only-index-sync）。",
                 flush=True,
             )
     _SCORE_CACHE[td] = score_out
