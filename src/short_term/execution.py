@@ -3,7 +3,7 @@
 纯日线短线交易执行引擎。
 
 - 信号：T 日收盘确认
-- 买入：T+1 开盘价（需在信号收盘价 ± 追高/缺口容忍区间内）
+- 买入：T+1 非对称入场（微高开按开盘价，亢奋高开按 (open+low)/2 模拟低吸）
 - T+1 冲高动态止盈 / 收盘止损 / 平庸提早平仓 / 强势 T+2 趋势骑乘
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ import numpy as np
 
 from .config import (
     SHORT_CLOSE_STOP_RATIO,
+    SHORT_ENTRY_DIP_OPEN_THRESHOLD,
     SHORT_ENTRY_MAX_CHASE,
     SHORT_ENTRY_MAX_CHASE_HARD_CAP,
     SHORT_ENTRY_MIN_GAP,
@@ -39,7 +40,11 @@ def resolve_t1_entry_price(
     min_gap: float | None = None,
 ) -> tuple[float | None, str | None]:
     """
-    T+1 开盘限价入场：在 [signal_close×(1+min_gap), signal_close×(1+max_chase)] 内成交。
+    T+1 非对称入场：允许高开至 5.5% 的人气股，并模拟分时低吸修正成本。
+
+    - ``open <= signal×(1+1.5%)``：按开盘价成交
+    - ``open > signal×(1+1.5%)``：按 ``(open + T+1 low) / 2`` 模拟下探低吸
+    - ``open > signal×(1+5.5%)``：拒绝追高
 
     Returns:
         (买入价, None) 或 (None, skip_reason)。
@@ -48,6 +53,7 @@ def resolve_t1_entry_price(
         float(SHORT_ENTRY_MAX_CHASE if max_chase is None else max_chase),
         float(SHORT_ENTRY_MAX_CHASE_HARD_CAP),
     )
+    dip_thr = float(SHORT_ENTRY_DIP_OPEN_THRESHOLD)
     gap = float(SHORT_ENTRY_MIN_GAP if min_gap is None else min_gap)
     sig = float(signal_close)
     if sig <= 0:
@@ -58,17 +64,25 @@ def resolve_t1_entry_price(
         return None, "await_t1_open"
 
     open_px = float(t1_open)
-    lo = sig * (1.0 + gap)
-    hi = sig * (1.0 + chase)
-    if open_px > hi:
+    lo_bound = sig * (1.0 + gap)
+    hi_bound = sig * (1.0 + chase)
+    if open_px > hi_bound:
         return None, "t1_open_chase_rejected"
-    if open_px < lo:
+    if open_px < lo_bound:
         return None, "t1_open_gap_down_rejected"
+
+    if open_px <= sig * (1.0 + dip_thr):
+        return open_px, None
+
+    t1_low = t1_bar.get("low")
+    if t1_low is not None and np.isfinite(float(t1_low)):
+        buy_px = (open_px + float(t1_low)) / 2.0
+        return buy_px, None
     return open_px, None
 
 
 def stop_loss_trigger_price(buy_price: float) -> float:
-    """T+1 收盘破位止损线（买入价 × (1 - 收盘止损比例)）。"""
+    """T+1 收盘破位止损线（买入价 × 0.94，即 -6% 容忍）。"""
     return float(buy_price) * (1.0 - float(SHORT_CLOSE_STOP_RATIO))
 
 
@@ -170,7 +184,7 @@ def evaluate_daily_exit(
 
     评估顺序（T+1 日）：
     1. 盘中冲高动态止盈（``high`` 涨幅 ≥ 6%，按 (高+收)/2 保守撮合）。
-    2. 收盘价破位止损（``SHORT_CLOSE_STOP_RATIO``）。
+    2. 收盘价破位止损（``SHORT_CLOSE_STOP_RATIO``，默认 -6%）。
     3. ``offset==1``：T+1 收盘平仓。
     4. ``offset==2``：T+1 收盘 < 4% → 平庸 T+1 离场；≥ 4% → T+2 趋势骑乘。
     """
