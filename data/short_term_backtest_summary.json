@@ -17,16 +17,16 @@
   "fused_days": 73,
   "empty_days": 32,
   "total_trades": 785,
-  "closed_trades": 607,
+  "closed_trades": 609,
   "holding_trades": 0,
-  "skipped_trades": 178,
-  "win_rate": 0.4415156507413509,
-  "avg_pnl_pct": 0.0755194456775013,
-  "median_pnl_pct": -0.3382187147688767,
-  "cum_return_pct": 4.430894702123411,
-  "max_drawdown_pct": -20.337744006265453,
+  "skipped_trades": 176,
+  "win_rate": 0.45648604269293924,
+  "avg_pnl_pct": 0.19613834866767185,
+  "median_pnl_pct": -0.23968042609853793,
+  "cum_return_pct": 35.94429221638076,
+  "max_drawdown_pct": -11.051815681096395,
   "exit_reason_counts": {
-    "t2_close_exit": 600,
-    "t1_close_below_stop_limit": 7
+    "t2_close_exit": 601,
+    "t1_close_below_stop_limit": 8
   }
 }
