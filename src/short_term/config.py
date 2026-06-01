@@ -30,22 +30,32 @@ SHORT_SELL_OFFSET = _env_int_bounded("QUANT_SHORT_SELL_OFFSET", 2, 1, 2)
 # 遗留字段：旧版盘中止损比例（现仅用于文档/兼容引用）
 SHORT_STOP_LOSS_RATIO = _env_float("QUANT_SHORT_STOP_LOSS", 0.03)
 # T+1 收盘价破位止损：收盘价 < 买入价 × (1 - 该比例) 时在 T+1 收盘离场
-SHORT_CLOSE_STOP_RATIO = _env_float("QUANT_SHORT_CLOSE_STOP", 0.05)
-# T+1 开盘入场：相对信号日收盘价，高开超过该比例则放弃（防追高）
-SHORT_ENTRY_MAX_CHASE = _env_float("QUANT_SHORT_ENTRY_MAX_CHASE", 0.01)
+SHORT_CLOSE_STOP_RATIO = _env_float("QUANT_SHORT_CLOSE_STOP", 0.06)
+# T+1 开盘入场：相对信号日收盘价，高开超过该比例则放弃（牛股放行通道上限 5.5%）
+SHORT_ENTRY_MAX_CHASE = _env_float("QUANT_SHORT_ENTRY_MAX_CHASE", 0.055)
+SHORT_ENTRY_MAX_CHASE_HARD_CAP = 0.055
+# 微幅高开（≤该比例）按开盘价成交；更高开则按 (open+low)/2 模拟分时低吸
+SHORT_ENTRY_DIP_OPEN_THRESHOLD = _env_float("QUANT_SHORT_ENTRY_DIP_OPEN", 0.015)
 # T+1 开盘入场：低开超过该比例则放弃（弱势缺口）
 SHORT_ENTRY_MIN_GAP = _env_float("QUANT_SHORT_ENTRY_MIN_GAP", -0.02)
 
-# T+1 盘中冲高动态止盈：最高价涨幅 >= 该比例时，按 (高+收)/2 保守平仓
-SHORT_T1_TAKE_PROFIT_PCT = _env_float("QUANT_SHORT_T1_TP", 0.06)
+# T+1 双阶梯动态止盈
+SHORT_T1_TAKE_PROFIT_TIER1_PCT = _env_float("QUANT_SHORT_T1_TP_T1", 0.06)
+SHORT_T1_TAKE_PROFIT_TIER2_PCT = _env_float("QUANT_SHORT_T1_TP_T2", 0.05)
+SHORT_T1_TAKE_PROFIT_TIER2_LOCK = _env_float("QUANT_SHORT_T1_TP_T2_LOCK", 0.03)
+SHORT_T1_TAKE_PROFIT_PCT = SHORT_T1_TAKE_PROFIT_TIER1_PCT
+# 平庸股（盘中未达第二阶梯）非对称收盘止损
+SHORT_MEDIOCRE_STOP_RATIO = _env_float("QUANT_SHORT_MEDIOCRE_STOP", 0.04)
 # T+1 收盘强势阈值：>= 该比例则延续至 T+2 趋势骑乘；否则 T+1 收盘即平
 SHORT_T1_STRONG_CLOSE_PCT = _env_float("QUANT_SHORT_T1_STRONG", 0.04)
 
 SHORT_HOLD_PLAN = (
-    f"T 日收盘确认信号 → T+1 开盘在 "
+    f"T 日收盘确认信号 → T+1 非对称入场 "
     f"[{(1 + SHORT_ENTRY_MIN_GAP) * 100:.0f}%, {(1 + SHORT_ENTRY_MAX_CHASE) * 100:.0f}%] "
-    f"区间限价买入 → T+1 冲高≥{SHORT_T1_TAKE_PROFIT_PCT * 100:.0f}% 动态止盈 → "
-    f"收盘破 -{SHORT_CLOSE_STOP_RATIO * 100:.0f}% 止损 → "
+    f"→ T+1 双阶梯止盈（{SHORT_T1_TAKE_PROFIT_TIER2_PCT * 100:.0f}%/"
+    f"{SHORT_T1_TAKE_PROFIT_TIER1_PCT * 100:.0f}%）→ "
+    f"平庸股 -{SHORT_MEDIOCRE_STOP_RATIO * 100:.0f}% / 强势股 -"
+    f"{SHORT_CLOSE_STOP_RATIO * 100:.0f}% 止损 → "
     f"收盘<{SHORT_T1_STRONG_CLOSE_PCT * 100:.0f}% 则 T+1 离场，否则 T+2 趋势骑乘"
 )
 SHORT_TOP_N = _env_int_bounded("QUANT_SHORT_TOP_N", 5, 1, 20)
@@ -85,6 +95,9 @@ SHORT_KDJ_J_SLOPE_MIN = _env_float("QUANT_SHORT_KDJ_J_SLOPE", 1.5)
 # 信号日流动性：成交额(元)与换手率(%) 满足其一即可
 SHORT_MIN_AMOUNT = _env_float("QUANT_SHORT_MIN_AMOUNT", 50_000_000.0)
 SHORT_MIN_TURNOVER = _env_float("QUANT_SHORT_MIN_TURNOVER", 2.0)
+# 换手率黄金区间（%，剔除僵尸股与死亡换手力竭股）
+SHORT_TURNOVER_GOLDEN_MIN = _env_float("QUANT_SHORT_TURNOVER_MIN", 3.5)
+SHORT_TURNOVER_GOLDEN_MAX = _env_float("QUANT_SHORT_TURNOVER_MAX", 24.0)
 
 SHORT_EXCLUDE_ST = os.environ.get("QUANT_SHORT_EXCLUDE_ST", "1") not in (
     "0",

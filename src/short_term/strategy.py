@@ -34,6 +34,8 @@ from .config import (
     SHORT_MIN_HISTORY_BARS,
     SHORT_MIN_MARKET_SCORE,
     SHORT_MIN_TURNOVER,
+    SHORT_TURNOVER_GOLDEN_MAX,
+    SHORT_TURNOVER_GOLDEN_MIN,
     SHORT_MARKET_INDEX_CODE,
     SHORT_MARKET_MOMENTUM_DAYS,
     SHORT_MARKET_MOMENTUM_MIN,
@@ -66,6 +68,10 @@ _RESONANCE_MIN_PASS = 3
 # J 超买惩罚阈值与扣分
 _J_OVERBOUGHT_THRESHOLD = 88.0
 _J_OVERBOUGHT_PENALTY = 30.0
+_VOLUME_PRICE_DIVERGENCE_CHG = 0.03
+_VOLUME_PRICE_DIVERGENCE_VR1 = 1.0
+_CANDLE_BODY_SUPER_RATIO = 0.98
+_CANDLE_BODY_SUPER_BONUS = 25.0
 
 
 def _is_st_name(name: str) -> bool:
@@ -166,6 +172,13 @@ def score_pct_nonlinear(chg_decimal: float) -> float:
     return max(0.0, pct * 15.0)
 
 
+def _candle_body_bonus(candle_body_ratio: float) -> float:
+    ratio = float(candle_body_ratio)
+    if ratio >= _CANDLE_BODY_SUPER_RATIO:
+        return _CANDLE_BODY_SUPER_BONUS
+    return min(15.0, max(0.0, ratio * 15.0))
+
+
 def compute_rule_score(
     chg_decimal: float,
     vr5: float,
@@ -179,7 +192,7 @@ def compute_rule_score(
     综合规则得分（加权后可为负，最终截断为 >= 0）。
 
     权重：当日涨幅 20%、5 日量比 30%、MACD 柱改善 20%、J 斜率 15%。
-    光头阳线动能溢价：``candle_body_ratio × 15``（上限 15 分）。
+    光头强阳（实体占比≥98%）动能溢价 25 分，其余最高 15 分。
     J >= 88 时额外扣 30 分（超买惩罚，降低 Top 排名）。
     """
     pct_score = score_pct_nonlinear(chg_decimal)
@@ -187,7 +200,7 @@ def compute_rule_score(
     bar_diff = macd_bar - macd_bar_prev
     macd_score = max(0.0, min(100.0, 50.0 + bar_diff * 200.0))
     j_score = min(100.0, max(0.0, 50.0 + j_slope * 5.0))
-    body_bonus = min(15.0, max(0.0, float(candle_body_ratio) * 15.0))
+    body_bonus = _candle_body_bonus(candle_body_ratio)
 
     total = (
         pct_score * 0.20
@@ -262,6 +275,7 @@ class ShortTermRuleStrategy:
 
         cur_cols_query = cur.execute("PRAGMA table_info(stock_daily_kline)").fetchall()
         cur_cols = {str(row[1]) for row in cur_cols_query}
+        has_turnover_col = "turnover_rate" in cur_cols
         amount_col = "volume * close" if "amount" not in cur_cols else "amount"
         turnover_col = "turnover_rate" if "turnover_rate" in cur_cols else "NULL"
 
@@ -330,6 +344,11 @@ class ShortTermRuleStrategy:
             amt = float(meta["amount"])
             tr = float(meta["turnover"]) if meta["turnover"] is not None else 0.0
             if amt < float(SHORT_MIN_AMOUNT) and tr < float(SHORT_MIN_TURNOVER):
+                continue
+            if has_turnover_col and (
+                tr < float(SHORT_TURNOVER_GOLDEN_MIN)
+                or tr > float(SHORT_TURNOVER_GOLDEN_MAX)
+            ):
                 continue
 
             if len(sub_df) < min_bars:
@@ -405,6 +424,9 @@ class ShortTermRuleStrategy:
 
             vr5 = float(vol_ratio_5d.iloc[-1])
             vr1 = float(vol_ratio_1d.iloc[-1])
+            if chg > _VOLUME_PRICE_DIVERGENCE_CHG and vr1 < _VOLUME_PRICE_DIVERGENCE_VR1:
+                continue
+
             j_now = float(j.iloc[-1])
             j_prev = float(j.iloc[-2])
             k_now, d_now = float(k.iloc[-1]), float(d.iloc[-1])
@@ -440,6 +462,17 @@ class ShortTermRuleStrategy:
                     SHORT_EXCLUDE_NEAR_LIMIT and chg >= near_limit_thr
                 ),
                 "resonance_pass": resonance_n >= _RESONANCE_MIN_PASS,
+                "turnover_golden_ok": (
+                    float(SHORT_TURNOVER_GOLDEN_MIN)
+                    <= tr
+                    <= float(SHORT_TURNOVER_GOLDEN_MAX)
+                    if has_turnover_col
+                    else True
+                ),
+                "volume_price_ok": not (
+                    chg > _VOLUME_PRICE_DIVERGENCE_CHG
+                    and vr1 < _VOLUME_PRICE_DIVERGENCE_VR1
+                ),
                 **resonance_flags,
             }
             detail = {
@@ -450,6 +483,7 @@ class ShortTermRuleStrategy:
                 "return_5d": ret5,
                 "vol_ratio_5d": vr5,
                 "vol_ratio_1d": vr1,
+                "turnover_pct": tr,
                 "kdj_j": j_now,
                 "macd_bar": cbar,
                 "macd_bar_improve": cbar - pbar,
@@ -458,9 +492,7 @@ class ShortTermRuleStrategy:
                 "score_breakdown": {
                     "pct_score": score_pct_nonlinear(chg),
                     "vr5_score": min(100.0, (vr5 / SHORT_VOL_RATIO_5D_MIN) * 60.0),
-                    "candle_body_bonus": min(
-                        15.0, max(0.0, float(candle_body_ratio) * 15.0)
-                    ),
+                    "candle_body_bonus": _candle_body_bonus(candle_body_ratio),
                     "j_overbought_penalty": (
                         _J_OVERBOUGHT_PENALTY if j_now >= _J_OVERBOUGHT_THRESHOLD else 0.0
                     ),

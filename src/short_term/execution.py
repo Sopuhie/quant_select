@@ -3,7 +3,7 @@
 纯日线短线交易执行引擎。
 
 - 信号：T 日收盘确认
-- 买入：T+1 开盘价（需在信号收盘价 ± 追高/缺口容忍区间内）
+- 买入：T+1 非对称入场（微高开按开盘价，亢奋高开按 (open+low)/2 模拟低吸）
 - T+1 冲高动态止盈 / 收盘止损 / 平庸提早平仓 / 强势 T+2 趋势骑乘
 """
 from __future__ import annotations
@@ -15,13 +15,18 @@ import numpy as np
 
 from .config import (
     SHORT_CLOSE_STOP_RATIO,
+    SHORT_ENTRY_DIP_OPEN_THRESHOLD,
     SHORT_ENTRY_MAX_CHASE,
+    SHORT_ENTRY_MAX_CHASE_HARD_CAP,
     SHORT_ENTRY_MIN_GAP,
     SHORT_HOLD_PLAN,
+    SHORT_MEDIOCRE_STOP_RATIO,
     SHORT_SELL_OFFSET,
     SHORT_STOP_LOSS_RATIO,
     SHORT_T1_STRONG_CLOSE_PCT,
-    SHORT_T1_TAKE_PROFIT_PCT,
+    SHORT_T1_TAKE_PROFIT_TIER1_PCT,
+    SHORT_T1_TAKE_PROFIT_TIER2_LOCK,
+    SHORT_T1_TAKE_PROFIT_TIER2_PCT,
 )
 from .review_prices import resolve_t1_t2_dates
 
@@ -38,12 +43,20 @@ def resolve_t1_entry_price(
     min_gap: float | None = None,
 ) -> tuple[float | None, str | None]:
     """
-    T+1 开盘限价入场：在 [signal_close×(1+min_gap), signal_close×(1+max_chase)] 内成交。
+    T+1 非对称入场：允许高开至 5.5% 的人气股，并模拟分时低吸修正成本。
+
+    - ``open <= signal×(1+1.5%)``：按开盘价成交
+    - ``open > signal×(1+1.5%)``：按 ``(open + T+1 low) / 2`` 模拟下探低吸
+    - ``open > signal×(1+5.5%)``：拒绝追高
 
     Returns:
         (买入价, None) 或 (None, skip_reason)。
     """
-    chase = float(SHORT_ENTRY_MAX_CHASE if max_chase is None else max_chase)
+    chase = min(
+        float(SHORT_ENTRY_MAX_CHASE if max_chase is None else max_chase),
+        float(SHORT_ENTRY_MAX_CHASE_HARD_CAP),
+    )
+    dip_thr = float(SHORT_ENTRY_DIP_OPEN_THRESHOLD)
     gap = float(SHORT_ENTRY_MIN_GAP if min_gap is None else min_gap)
     sig = float(signal_close)
     if sig <= 0:
@@ -54,18 +67,31 @@ def resolve_t1_entry_price(
         return None, "await_t1_open"
 
     open_px = float(t1_open)
-    lo = sig * (1.0 + gap)
-    hi = sig * (1.0 + chase)
-    if open_px > hi:
+    lo_bound = sig * (1.0 + gap)
+    hi_bound = sig * (1.0 + chase)
+    if open_px > hi_bound:
         return None, "t1_open_chase_rejected"
-    if open_px < lo:
+    if open_px < lo_bound:
         return None, "t1_open_gap_down_rejected"
+
+    if open_px <= sig * (1.0 + dip_thr):
+        return open_px, None
+
+    t1_low = t1_bar.get("low")
+    if t1_low is not None and np.isfinite(float(t1_low)):
+        buy_px = (open_px + float(t1_low)) / 2.0
+        return buy_px, None
     return open_px, None
 
 
 def stop_loss_trigger_price(buy_price: float) -> float:
-    """T+1 收盘破位止损线（买入价 × (1 - 收盘止损比例)）。"""
+    """强势股 T+1 收盘破位止损线（默认 -6%）。"""
     return float(buy_price) * (1.0 - float(SHORT_CLOSE_STOP_RATIO))
+
+
+def mediocre_stop_trigger_price(buy_price: float) -> float:
+    """平庸股非对称收盘止损线（默认 -4%）。"""
+    return float(buy_price) * (1.0 - float(SHORT_MEDIOCRE_STOP_RATIO))
 
 
 def legacy_intraday_stop_price(buy_price: float) -> float:
@@ -165,15 +191,16 @@ def evaluate_daily_exit(
     纯日线模拟平仓结果。
 
     评估顺序（T+1 日）：
-    1. 盘中冲高动态止盈（``high`` 涨幅 ≥ 6%，按 (高+收)/2 保守撮合）。
-    2. 收盘价破位止损。
+    1. 双阶梯动态止盈（≥6% 按 (高+收)/2；≥5% 锁定 3% 利润）。
+    2. 非对称收盘止损（盘中未达 5% 用 -4%；否则 -6%）。
     3. ``offset==1``：T+1 收盘平仓。
-    4. ``offset==2``：收盘 < 4% → T+1 平庸离场；≥ 4% → T+2 趋势骑乘。
+    4. ``offset==2``：T+1 收盘 < 4% → 平庸 T+1 离场；≥ 4% → T+2 趋势骑乘。
     """
     offset = int(sell_offset if sell_offset is not None else SHORT_SELL_OFFSET)
     offset = max(1, min(2, offset))
     buy_price = float(buy_price)
-    stop_px = stop_loss_trigger_price(buy_price)
+    strong_stop_px = stop_loss_trigger_price(buy_price)
+    mediocre_stop_px = mediocre_stop_trigger_price(buy_price)
 
     t1_low = t1_bar.get("low")
     t1_high = t1_bar.get("high")
@@ -188,7 +215,7 @@ def evaluate_daily_exit(
             "hold_days": 0,
             "pnl_ratio": None,
             "stop_loss_triggered": 0,
-            "stop_loss_price": stop_px,
+            "stop_loss_price": strong_stop_px,
             "exit_reason": "await_t1_kline",
         }
 
@@ -197,38 +224,64 @@ def evaluate_daily_exit(
     if t1_low is not None and np.isfinite(float(t1_low)):
         t1_low_f = float(t1_low)
 
-    # T+1 盘中冲高动态止盈（优先于收盘止损）
-    if t1_date and t1_high is not None and np.isfinite(float(t1_high)):
+    tier1_pct = float(SHORT_T1_TAKE_PROFIT_TIER1_PCT)
+    tier2_pct = float(SHORT_T1_TAKE_PROFIT_TIER2_PCT)
+    tier2_lock = float(SHORT_T1_TAKE_PROFIT_TIER2_LOCK)
+
+    t1_high_pct = 0.0
+    t1_high_f: float | None = None
+    if t1_high is not None and np.isfinite(float(t1_high)):
         t1_high_f = float(t1_high)
-        t1_high_pct = (t1_high_f - buy_price) / buy_price if buy_price > 0 else 0.0
-        if t1_high_pct >= float(SHORT_T1_TAKE_PROFIT_PCT):
+        t1_high_pct = (
+            (t1_high_f - buy_price) / buy_price if buy_price > 0 else 0.0
+        )
+
+    if t1_date and t1_high_f is not None:
+        if t1_high_pct >= tier1_pct:
             sell_px = (t1_high_f + t1_close_f) / 2.0
             return _closed_exit(
                 buy_price=buy_price,
                 sell_px=sell_px,
                 sell_date=t1_date,
                 hold_days=1,
-                stop_px=stop_px,
-                exit_reason="t1_intraday_take_profit",
+                stop_px=strong_stop_px,
+                exit_reason="t1_intraday_take_profit_tier1",
+                t1_low_f=t1_low_f,
+            )
+        if t1_high_pct >= tier2_pct:
+            sell_px = buy_price * (1.0 + tier2_lock)
+            return _closed_exit(
+                buy_price=buy_price,
+                sell_px=sell_px,
+                sell_date=t1_date,
+                hold_days=1,
+                stop_px=strong_stop_px,
+                exit_reason="t1_intraday_take_profit_tier2",
                 t1_low_f=t1_low_f,
             )
 
-    # T+1 收盘价破位止损
-    if t1_close_f < stop_px and t1_date:
+    effective_stop_px = (
+        mediocre_stop_px if t1_high_pct < tier2_pct else strong_stop_px
+    )
+    if t1_close_f < effective_stop_px and t1_date:
+        exit_reason = (
+            "t1_asymmetric_stop_exit"
+            if t1_high_pct < tier2_pct
+            else "t1_close_below_stop_limit"
+        )
         return _closed_exit(
             buy_price=buy_price,
             sell_px=t1_close_f,
             sell_date=t1_date,
             hold_days=1,
-            stop_px=stop_px,
-            exit_reason="t1_close_below_stop_limit",
+            stop_px=effective_stop_px,
+            exit_reason=exit_reason,
             stop_loss_triggered=1,
             t1_low_f=t1_low_f,
         )
 
     t1_close_pct = (t1_close_f - buy_price) / buy_price if buy_price > 0 else 0.0
 
-    # offset==1：T+1 收盘平仓
     if offset == 1:
         if not t1_date:
             return {
@@ -238,7 +291,7 @@ def evaluate_daily_exit(
                 "hold_days": 0,
                 "pnl_ratio": None,
                 "stop_loss_triggered": 0,
-                "stop_loss_price": stop_px,
+                "stop_loss_price": strong_stop_px,
                 "exit_reason": "await_t1_close",
             }
         return _closed_exit(
@@ -246,12 +299,11 @@ def evaluate_daily_exit(
             sell_px=t1_close_f,
             sell_date=t1_date,
             hold_days=1,
-            stop_px=stop_px,
+            stop_px=strong_stop_px,
             exit_reason="t1_close_exit",
             t1_low_f=t1_low_f,
         )
 
-    # offset==2：非对称持仓——平庸 T+1 离场，强势 T+2 趋势骑乘
     strong_thr = float(SHORT_T1_STRONG_CLOSE_PCT)
     if t1_close_pct < strong_thr:
         if not t1_date:
@@ -262,7 +314,7 @@ def evaluate_daily_exit(
                 "hold_days": 0,
                 "pnl_ratio": None,
                 "stop_loss_triggered": 0,
-                "stop_loss_price": stop_px,
+                "stop_loss_price": strong_stop_px,
                 "exit_reason": "await_t1_close",
             }
         return _closed_exit(
@@ -270,7 +322,7 @@ def evaluate_daily_exit(
             sell_px=t1_close_f,
             sell_date=t1_date,
             hold_days=1,
-            stop_px=stop_px,
+            stop_px=strong_stop_px,
             exit_reason="t1_mediocre_close_exit",
             t1_low_f=t1_low_f,
         )
@@ -283,7 +335,7 @@ def evaluate_daily_exit(
             "hold_days": 1,
             "pnl_ratio": None,
             "stop_loss_triggered": 0,
-            "stop_loss_price": stop_px,
+            "stop_loss_price": strong_stop_px,
             "exit_reason": "await_t2_close",
             "t1_low": t1_low_f,
         }
@@ -299,7 +351,7 @@ def evaluate_daily_exit(
         sell_px=t2_close_f,
         sell_date=t2_date,
         hold_days=2,
-        stop_px=stop_px,
+        stop_px=strong_stop_px,
         exit_reason=exit_reason,
         t1_low_f=t1_low_f,
     )
