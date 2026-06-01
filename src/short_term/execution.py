@@ -166,9 +166,9 @@ def evaluate_daily_exit(
 
     评估顺序（T+1 日）：
     1. 盘中冲高动态止盈（``high`` 涨幅 ≥ 6%，按 (高+收)/2 保守撮合）。
-    2. 收盘价破位止损。
+    2. 收盘价破位止损（``SHORT_CLOSE_STOP_RATIO``）。
     3. ``offset==1``：T+1 收盘平仓。
-    4. ``offset==2``：收盘 < 4% → T+1 平庸离场；≥ 4% → T+2 趋势骑乘。
+    4. ``offset==2``：T+1 收盘 < 4% → 平庸 T+1 离场；≥ 4% → T+2 趋势骑乘。
     """
     offset = int(sell_offset if sell_offset is not None else SHORT_SELL_OFFSET)
     offset = max(1, min(2, offset))
@@ -289,18 +289,13 @@ def evaluate_daily_exit(
         }
 
     t2_close_f = float(t2_close)
-    exit_reason = (
-        "t2_trend_ride_exit"
-        if t2_close_f > t1_close_f
-        else "t2_close_exit"
-    )
     return _closed_exit(
         buy_price=buy_price,
         sell_px=t2_close_f,
         sell_date=t2_date,
         hold_days=2,
         stop_px=stop_px,
-        exit_reason=exit_reason,
+        exit_reason="t2_trend_ride_exit",
         t1_low_f=t1_low_f,
     )
 
