@@ -6,75 +6,91 @@ import sqlite3
 from src.short_term.execution import (
     ORDER_STATUS_CLOSED,
     ORDER_STATUS_HOLDING,
+    ORDER_STATUS_SKIPPED,
     evaluate_daily_exit,
+    evaluate_short_trade,
+    resolve_t1_entry_price,
     stop_loss_trigger_price,
     sync_short_orders_for_signal_day,
 )
 
 
-def test_stop_loss_triggered_on_t1_low():
+def test_stop_loss_triggered_on_t1_close():
     buy = 10.0
     stop_px = stop_loss_trigger_price(buy)
-    assert abs(stop_px - 9.7) < 1e-6
+    assert abs(stop_px - 9.5) < 1e-6
     out = evaluate_daily_exit(
         buy,
-        t1_bar={"open": 10.0, "low": 9.5, "close": 9.6},
+        t1_bar={"open": 10.0, "low": 9.5, "close": 9.49},
         t2_bar={"open": 9.6, "low": 9.4, "close": 9.8},
         t1_date="2026-05-16",
         t2_date="2026-05-19",
-        sell_offset=1,
+        sell_offset=2,
     )
     assert out["status"] == ORDER_STATUS_CLOSED
     assert out["stop_loss_triggered"] == 1
-    assert abs(out["sell_price"] - stop_px) < 1e-6
-    assert out["exit_reason"] == "t1_intraday_stop_loss"
+    assert abs(out["sell_price"] - 9.49) < 1e-6
+    assert out["exit_reason"] == "t1_close_below_stop_limit"
 
 
-def test_gap_down_falls_back_to_open_when_t1_close_missing():
-    """开盘≤止损且 T+1 收盘缺失时，平仓价降级为开盘价。"""
+def test_intraday_wash_not_stopped_when_close_above_limit():
+    """盘中跌破但收盘收回：不触发止损，持有至 T+2。"""
     buy = 10.0
     out = evaluate_daily_exit(
         buy,
-        t1_bar={"open": 9.5, "low": 9.5, "close": None},
-        t2_bar={},
+        t1_bar={"open": 10.0, "low": 9.5, "close": 9.8},
+        t2_bar={"open": 9.9, "low": 9.7, "close": 10.2},
         t1_date="2026-05-16",
-        t2_date=None,
-        sell_offset=1,
+        t2_date="2026-05-19",
+        sell_offset=2,
     )
-    assert out["exit_reason"] == "t1_open_below_stop_limit"
-    assert out["sell_price"] == 9.5
+    assert out["status"] == ORDER_STATUS_CLOSED
+    assert out["stop_loss_triggered"] == 0
+    assert out["sell_price"] == 10.2
+    assert out["exit_reason"] == "t2_close_exit"
 
 
-def test_limit_down_sealed_bar_uses_close():
-    """一字跌停：open==low==close，开盘即封死，按收盘价计提。"""
+def test_close_stop_at_exact_threshold_not_triggered():
+    """收盘价恰等于 -5% 线时不触发止损。"""
     buy = 10.0
     out = evaluate_daily_exit(
         buy,
-        t1_bar={"open": 9.0, "low": 9.0, "close": 9.0},
-        t2_bar={},
+        t1_bar={"open": 9.7, "low": 9.5, "close": 9.5},
+        t2_bar={"open": 9.7, "low": 9.6, "close": 9.9},
         t1_date="2026-05-16",
-        t2_date=None,
-        sell_offset=1,
+        t2_date="2026-05-19",
+        sell_offset=2,
     )
-    assert out["exit_reason"] == "t1_open_below_stop_limit"
-    assert out["sell_price"] == 9.0
-    assert out["pnl_ratio"] == -0.1
+    assert out["stop_loss_triggered"] == 0
+    assert out["exit_reason"] == "t2_close_exit"
 
 
-def test_stop_loss_gap_down_uses_t1_close_not_stop_px():
-    """T+1 开盘已在止损线下方：不能按 -3% 价成交，按收盘价计提。"""
-    buy = 10.0
-    out = evaluate_daily_exit(
-        buy,
-        t1_bar={"open": 9.5, "low": 9.5, "close": 9.2},
-        t2_bar={},
-        t1_date="2026-05-16",
-        t2_date=None,
-        sell_offset=1,
+def test_t1_open_entry_within_band():
+    px, reason = resolve_t1_entry_price(
+        10.0, {"open": 10.05, "low": 10.0, "close": 10.1}
     )
-    assert out["exit_reason"] == "t1_open_below_stop_limit"
-    assert out["sell_price"] == 9.2
-    assert out["stop_loss_triggered"] == 1
+    assert reason is None
+    assert px == 10.05
+
+
+def test_t1_open_chase_rejected():
+    px, reason = resolve_t1_entry_price(
+        10.0, {"open": 10.2, "low": 10.1, "close": 10.15}
+    )
+    assert px is None
+    assert reason == "t1_open_chase_rejected"
+
+
+def test_evaluate_short_trade_skipped_on_chase():
+    out = evaluate_short_trade(
+        10.0,
+        t1_bar={"open": 10.2, "low": 10.0, "close": 10.1},
+        t2_bar={"open": 10.0, "low": 9.9, "close": 10.0},
+        t1_date="2026-05-16",
+        t2_date="2026-05-19",
+    )
+    assert out["status"] == ORDER_STATUS_SKIPPED
+    assert out["exit_reason"] == "t1_open_chase_rejected"
 
 
 def test_t1_close_exit_when_no_stop():
@@ -129,7 +145,7 @@ def test_sync_orders_writes_tracker():
         );
         INSERT INTO stock_daily_kline VALUES
         ('2026-05-15', '000001', 9.8, 9.7, 10.0, 1000),
-        ('2026-05-16', '000001', 10.0, 9.5, 9.6, 1000);
+        ('2026-05-16', '000001', 10.0, 9.3, 9.4, 1000);
         """
     )
     from unittest.mock import patch
@@ -155,4 +171,4 @@ def test_sync_orders_writes_tracker():
         ).fetchone()
         assert row[0] == ORDER_STATUS_CLOSED
         assert row[1] == 1
-        assert abs(row[2] - 9.7) < 1e-6
+        assert abs(row[2] - 9.4) < 1e-6

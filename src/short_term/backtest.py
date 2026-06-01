@@ -7,7 +7,7 @@
 对每个信号日 T（在 ``[start_date, scan_end_date]`` 内）：
 
 1. ``ShortTermRuleStrategy.scan(T)`` — 与实盘扫描相同，无未来数据；
-2. 对 Top N 入选逐笔模拟：T 收盘价买入 → T+1 止损 / T+N 收盘卖出；
+2. 对 Top N 入选逐笔模拟：T+1 开盘限价买入 → T+1 止损 / T+N 收盘卖出；
 3. 信号日等权汇总当日收益，再复利拼接净值曲线。
 
 说明
@@ -30,6 +30,9 @@ import pandas as pd
 from src.config import DATA_DIR
 
 from .config import (
+    SHORT_CLOSE_STOP_RATIO,
+    SHORT_ENTRY_MAX_CHASE,
+    SHORT_ENTRY_MIN_GAP,
     SHORT_MIN_MARKET_SCORE,
     SHORT_SELL_OFFSET,
     SHORT_STOP_LOSS_RATIO,
@@ -38,7 +41,8 @@ from .config import (
 from .execution import (
     ORDER_STATUS_CLOSED,
     ORDER_STATUS_HOLDING,
-    evaluate_daily_exit,
+    ORDER_STATUS_SKIPPED,
+    evaluate_short_trade,
     fetch_post_signal_ohlc,
 )
 from .review_prices import resolve_t1_t2_dates
@@ -98,11 +102,11 @@ def simulate_short_trade(
     """单笔短线模拟（不写订单表）。"""
     td = str(signal_date).strip()[:10]
     code = str(row.get("stock_code", "")).strip().zfill(6)
-    buy_price = float(row.get("close_price") or 0.0)
+    signal_close = float(row.get("close_price") or 0.0)
     t1_date, t2_date = resolve_t1_t2_dates(td, conn)
     bars = fetch_post_signal_ohlc(conn, code, td)
-    exit_info = evaluate_daily_exit(
-        buy_price,
+    exit_info = evaluate_short_trade(
+        signal_close,
         t1_bar=bars["t1"],
         t2_bar=bars["t2"],
         t1_date=t1_date,
@@ -115,7 +119,8 @@ def simulate_short_trade(
         "stock_name": row.get("stock_name"),
         "rank": row.get("rank"),
         "rule_score": row.get("rule_score"),
-        "buy_price": buy_price,
+        "signal_close": signal_close,
+        "buy_price": exit_info.get("buy_price"),
         "sell_date": exit_info.get("sell_date"),
         "sell_price": exit_info.get("sell_price"),
         "hold_days": exit_info.get("hold_days"),
@@ -182,6 +187,11 @@ def summarize_backtest(
         "closed_trades": int(len(closed)),
         "holding_trades": int(
             (trades_df["status"].astype(str).str.upper() == ORDER_STATUS_HOLDING).sum()
+        )
+        if not trades_df.empty
+        else 0,
+        "skipped_trades": int(
+            (trades_df["status"].astype(str).str.upper() == ORDER_STATUS_SKIPPED).sum()
         )
         if not trades_df.empty
         else 0,
@@ -318,12 +328,16 @@ def run_short_term_rolling_backtest(
 
         day_pnls: list[float] = []
         closed_n = 0
+        skipped_n = 0
         for row in picks:
             row = dict(row)
             row["market_score"] = mkt_score
             tr = simulate_short_trade(conn, td, row, sell_offset=offset)
             tr["market_score"] = mkt_score
             trade_rows.append(tr)
+            if tr.get("status") == ORDER_STATUS_SKIPPED:
+                skipped_n += 1
+                continue
             if tr.get("status") == ORDER_STATUS_CLOSED and tr.get("pnl_ratio") is not None:
                 day_pnls.append(float(tr["pnl_ratio"]))
                 closed_n += 1
@@ -335,9 +349,10 @@ def run_short_term_rolling_backtest(
                 "market_score": mkt_score,
                 "pick_count": len(picks),
                 "closed_count": closed_n,
+                "skipped_count": skipped_n,
                 "day_return": day_ret,
                 "cum_nav": None,
-                "day_type": "signal",
+                "day_type": "signal" if closed_n > 0 else "empty",
             }
         )
 
@@ -362,6 +377,9 @@ def run_short_term_rolling_backtest(
         "top_n": top_n,
         "sell_offset": offset,
         "stop_loss_ratio": SHORT_STOP_LOSS_RATIO,
+        "close_stop_ratio": SHORT_CLOSE_STOP_RATIO,
+        "entry_max_chase": SHORT_ENTRY_MAX_CHASE,
+        "entry_min_gap": SHORT_ENTRY_MIN_GAP,
         "min_market_score": SHORT_MIN_MARKET_SCORE,
         "include_300": include_300,
         "include_688": include_688,

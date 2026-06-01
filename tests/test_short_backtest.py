@@ -30,7 +30,7 @@ def test_summarize_backtest_metrics():
     trades = pd.DataFrame(
         [
             {"status": ORDER_STATUS_CLOSED, "pnl_ratio": 0.05, "exit_reason": "t1_close_exit"},
-            {"status": ORDER_STATUS_CLOSED, "pnl_ratio": -0.03, "exit_reason": "t1_intraday_stop_loss"},
+            {"status": ORDER_STATUS_CLOSED, "pnl_ratio": -0.03, "exit_reason": "t1_close_below_stop_limit"},
         ]
     )
     daily = pd.DataFrame(
@@ -83,7 +83,7 @@ def test_run_short_term_rolling_backtest_with_mock_scan():
         );
         INSERT INTO stock_daily_kline VALUES
         ('2026-05-14', '000001', 9.8, 9.7, 10.0, 1000),
-        ('2026-05-15', '000001', 10.0, 9.5, 9.6, 1000),
+        ('2026-05-15', '000001', 10.0, 9.5, 9.4, 1000),
         ('2026-05-16', '000001', 9.6, 9.4, 9.8, 1000);
         """
     )

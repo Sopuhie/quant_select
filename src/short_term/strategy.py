@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from src.factor_calculator import is_bar_limit_up, is_bar_suspended
-from src.market_regime import market_environment_allows_trading
+from src.market_regime import short_term_market_allows_trading
 
 from .board_filter import board_allowed
 from .config import (
@@ -34,6 +34,11 @@ from .config import (
     SHORT_MIN_HISTORY_BARS,
     SHORT_MIN_MARKET_SCORE,
     SHORT_MIN_TURNOVER,
+    SHORT_MARKET_INDEX_CODE,
+    SHORT_MARKET_MOMENTUM_DAYS,
+    SHORT_MARKET_MOMENTUM_MIN,
+    SHORT_ENTITY_RATIO_MIN,
+    SHORT_PCT_SCORE_MAX,
     SHORT_TOP_N,
     SHORT_VOL_RATIO_1D_MIN,
     SHORT_VOL_RATIO_5D_MIN,
@@ -148,15 +153,16 @@ def score_pct_nonlinear(chg_decimal: float) -> float:
     当日涨幅非线性区间得分（0~100）。
 
     ``chg_decimal`` 为小数涨幅（0.03 = 3%）。
-    - [2.5%, 5.5%]：满分 100
-    - > 5.5%：每多 1 个百分点扣 15 分（防高位接盘）
-    - < 2.5%：按 pct×15 线性缩水
+    - [2.0%, SHORT_PCT_SCORE_MAX]：满分 100（温和启动右侧）
+    - > SHORT_PCT_SCORE_MAX：每多 1 个百分点扣 25 分（防高位接盘）
+    - < 2.0%：按 pct×15 线性缩水
     """
     pct = float(chg_decimal) * 100.0
-    if 2.5 <= pct <= 5.5:
+    hi = float(SHORT_PCT_SCORE_MAX)
+    if 2.0 <= pct <= hi:
         return 100.0
-    if pct > 5.5:
-        return max(0.0, 100.0 - (pct - 5.5) * 15.0)
+    if pct > hi:
+        return max(0.0, 100.0 - (pct - hi) * 25.0)
     return max(0.0, pct * 15.0)
 
 
@@ -214,7 +220,7 @@ class ShortTermRuleStrategy:
             return "⚠️ J 偏高：仅适合极小仓博弈，严格执行 T+2 开盘离场"
         if chg >= 0.06:
             return "⚠️ 当日涨幅偏大：次日高开若不及预期应果断止损"
-        return "✅ 短线共振成立：T 日收盘买入，T+1 用日线最低价评估 -3% 止损"
+        return "✅ 短线共振成立：T+1 开盘限价买入，T+1 收盘 -5% 破位止损，否则 T+2 收盘离场"
 
     def scan(
         self,
@@ -237,8 +243,12 @@ class ShortTermRuleStrategy:
         else:
             target_date = str(target_date).strip()[:10]
 
-        allows, mkt_score = market_environment_allows_trading(
-            target_date, min_score=SHORT_MIN_MARKET_SCORE
+        allows, mkt_score, _mom = short_term_market_allows_trading(
+            target_date,
+            min_score=SHORT_MIN_MARKET_SCORE,
+            index_code=SHORT_MARKET_INDEX_CODE,
+            momentum_days=SHORT_MARKET_MOMENTUM_DAYS,
+            momentum_min=SHORT_MARKET_MOMENTUM_MIN,
         )
         if not allows:
             return (pd.DataFrame(columns=RESULT_COLUMNS), target_date, mkt_score)
@@ -378,6 +388,12 @@ class ShortTermRuleStrategy:
 
             trend_ok, bullish_ok = hard_trend_pass(c_close, c_open, c_ma_f, c_ma_s)
             if not trend_ok or not bullish_ok:
+                continue
+
+            c_low = float(low_arr.iloc[-1])
+            c_high = float(high_arr.iloc[-1])
+            entity_ratio = (c_close - c_low) / (c_high - c_low + 1e-6)
+            if entity_ratio < SHORT_ENTITY_RATIO_MIN:
                 continue
 
             vr5 = float(vol_ratio_5d.iloc[-1])

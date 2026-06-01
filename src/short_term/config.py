@@ -25,14 +25,21 @@ def _env_float(name: str, default: float) -> float:
 # 逻辑持有交易日数（文案/钉钉）；实际平仓日见 SHORT_SELL_OFFSET
 SHORT_HOLDING_DAYS = 1
 
-# 纯日线执行：T 日收盘价买入；未触发止损时的平仓日偏移（1=T+1 收盘，2=T+2 收盘）
-SHORT_SELL_OFFSET = _env_int_bounded("QUANT_SHORT_SELL_OFFSET", 1, 1, 2)
-# 盘中 -3% 硬止损（用 T+1 最低价模拟）：卖出价 = 买入价 × (1 - 该比例)
+# 纯日线执行：T 日收盘确认信号，T+1 开盘限价买入；未触发止损时的平仓日偏移
+SHORT_SELL_OFFSET = _env_int_bounded("QUANT_SHORT_SELL_OFFSET", 2, 1, 2)
+# 遗留字段：旧版盘中止损比例（现仅用于文档/兼容引用）
 SHORT_STOP_LOSS_RATIO = _env_float("QUANT_SHORT_STOP_LOSS", 0.03)
+# T+1 收盘价破位止损：收盘价 < 买入价 × (1 - 该比例) 时在 T+1 收盘离场
+SHORT_CLOSE_STOP_RATIO = _env_float("QUANT_SHORT_CLOSE_STOP", 0.05)
+# T+1 开盘入场：相对信号日收盘价，高开超过该比例则放弃（防追高）
+SHORT_ENTRY_MAX_CHASE = _env_float("QUANT_SHORT_ENTRY_MAX_CHASE", 0.01)
+# T+1 开盘入场：低开超过该比例则放弃（弱势缺口）
+SHORT_ENTRY_MIN_GAP = _env_float("QUANT_SHORT_ENTRY_MIN_GAP", -0.02)
 
 SHORT_HOLD_PLAN = (
-    f"T 日收盘确认信号并以收盘价买入 → "
-    f"T+1 用最低价模拟 -{SHORT_STOP_LOSS_RATIO * 100:.0f}% 硬止损 → "
+    f"T 日收盘确认信号 → T+1 开盘在 "
+    f"[{(1 + SHORT_ENTRY_MIN_GAP) * 100:.0f}%, {(1 + SHORT_ENTRY_MAX_CHASE) * 100:.0f}%] "
+    f"区间限价买入 → T+1 收盘跌破 -{SHORT_CLOSE_STOP_RATIO * 100:.0f}% 止损 → "
     f"未触发则 T+{SHORT_SELL_OFFSET} 收盘平仓"
 )
 SHORT_TOP_N = _env_int_bounded("QUANT_SHORT_TOP_N", 5, 1, 20)
@@ -40,7 +47,19 @@ SHORT_TOP_N = _env_int_bounded("QUANT_SHORT_TOP_N", 5, 1, 20)
 SHORT_MIN_HISTORY_BARS = int(os.environ.get("QUANT_SHORT_MIN_BARS", "35"))
 SHORT_HIST_LIMIT = int(os.environ.get("QUANT_SHORT_HIST_LIMIT", "120"))
 
-SHORT_MIN_MARKET_SCORE = int(os.environ.get("QUANT_SHORT_MIN_MARKET_SCORE", "50"))
+SHORT_MIN_MARKET_SCORE = int(os.environ.get("QUANT_SHORT_MIN_MARKET_SCORE", "60"))
+# 短线大盘环境分锚定指数（默认中证1000，更贴近小盘/题材非线性环境）
+SHORT_MARKET_INDEX_CODE = str(
+    os.environ.get("QUANT_SHORT_MARKET_INDEX", "000852")
+).strip().zfill(6)
+# 指数 N 日动量 > 该阈值才允许扫描（与 MA20 环境分叠加，过滤贴线放行）
+SHORT_MARKET_MOMENTUM_DAYS = int(os.environ.get("QUANT_SHORT_MKT_MOM_DAYS", "5"))
+SHORT_MARKET_MOMENTUM_MIN = _env_float("QUANT_SHORT_MKT_MOM_MIN", 0.0)
+
+# 信号日 K 线实体比例下限（防长上影线/炸板）
+SHORT_ENTITY_RATIO_MIN = _env_float("QUANT_SHORT_ENTITY_RATIO", 0.7)
+# 涨幅非线性打分：满分区间上沿（%），满分区间为 [2%, SHORT_PCT_SCORE_MAX]
+SHORT_PCT_SCORE_MAX = _env_float("QUANT_SHORT_PCT_SCORE_MAX", 3.5)
 
 SHORT_MA_FAST = 5
 SHORT_MA_SLOW = 10

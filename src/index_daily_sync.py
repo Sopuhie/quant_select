@@ -24,6 +24,11 @@ _INDEX_SOURCES: dict[str, dict[str, str]] = {
         "em_name": "沪深300",
         "sina_symbol": "sh000300",
     },
+    "000852": {
+        "ak_hist_symbol": "000852",
+        "em_name": "中证1000",
+        "sina_symbol": "sh000852",
+    },
 }
 
 
@@ -164,7 +169,7 @@ def sync_index_daily(
     """
     path = db_path or DB_PATH
     init_db(path)
-    codes = index_codes or [HS300_INDEX_CODE]
+    codes = index_codes or [HS300_INDEX_CODE, "000852"]
     end_date = get_kline_incremental_end_trade_date()
     stats: dict[str, Any] = {
         "end_date": end_date,
