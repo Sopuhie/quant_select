@@ -66,6 +66,8 @@ _RESONANCE_MIN_PASS = 3
 # J 超买惩罚阈值与扣分
 _J_OVERBOUGHT_THRESHOLD = 88.0
 _J_OVERBOUGHT_PENALTY = 30.0
+# 缩量大涨（量价背离）扣分
+_VOLUME_PRICE_DIVERGENCE_PENALTY = 20.0
 
 
 def _is_st_name(name: str) -> bool:
@@ -100,14 +102,19 @@ def hard_trend_pass(
     open_price: float,
     ma_fast: float,
     ma_slow: float,
+    ma_20: float,
 ) -> tuple[bool, bool]:
     """
     不可违背的趋势硬性门槛。
 
     Returns:
-        (均线趋势成立, 当日收阳): 收盘>MA5 且 MA5>=MA10；收盘>开盘为收阳。
+        (均线趋势成立, 当日收阳): 收盘>MA5/MA10/MA20 且 MA5>=MA10；收盘>开盘为收阳。
     """
-    trend_ma = close > ma_fast and ma_fast >= ma_slow
+    trend_ma = (
+        close > ma_fast
+        and ma_fast >= ma_slow
+        and close > ma_20
+    )
     bullish_candle = close > open_price
     return trend_ma, bullish_candle
 
@@ -169,15 +176,19 @@ def score_pct_nonlinear(chg_decimal: float) -> float:
 def compute_rule_score(
     chg_decimal: float,
     vr5: float,
+    vr1: float,
     macd_bar: float,
     macd_bar_prev: float,
     j_slope: float,
     j_now: float,
+    candle_body_ratio: float = 0.0,
 ) -> float:
     """
     综合规则得分（加权后可为负，最终截断为 >= 0）。
 
-    权重：当日涨幅 20%、5 日量比 25%、MACD 柱改善 25%、J 斜率 15%。
+    权重：当日涨幅 20%、5 日量比 30%、MACD 柱改善 20%、J 斜率 15%。
+    光头阳线动能溢价：``candle_body_ratio × 15``（上限 15 分）。
+    涨幅 > 3% 且 1 日量比 < 1.0（缩量大涨/量价背离）扣 20 分。
     J >= 88 时额外扣 30 分（超买惩罚，降低 Top 排名）。
     """
     pct_score = score_pct_nonlinear(chg_decimal)
@@ -185,13 +196,17 @@ def compute_rule_score(
     bar_diff = macd_bar - macd_bar_prev
     macd_score = max(0.0, min(100.0, 50.0 + bar_diff * 200.0))
     j_score = min(100.0, max(0.0, 50.0 + j_slope * 5.0))
+    body_bonus = min(15.0, max(0.0, float(candle_body_ratio) * 15.0))
 
     total = (
         pct_score * 0.20
-        + vr5_score * 0.25
-        + macd_score * 0.25
+        + vr5_score * 0.30
+        + macd_score * 0.20
         + j_score * 0.15
+        + body_bonus
     )
+    if float(chg_decimal) > 0.03 and float(vr1) < 1.0:
+        total -= _VOLUME_PRICE_DIVERGENCE_PENALTY
     if j_now >= _J_OVERBOUGHT_THRESHOLD:
         total -= _J_OVERBOUGHT_PENALTY
     return max(0.0, float(total))
@@ -206,13 +221,17 @@ class ShortTermRuleStrategy:
     def _rule_score(
         chg: float,
         vr5: float,
+        vr1: float,
         bar_now: float,
         bar_prev: float,
         j_slope: float,
         j_now: float,
+        candle_body_ratio: float = 0.0,
     ) -> float:
         """兼容旧调用入口，内部转调 ``compute_rule_score``。"""
-        return compute_rule_score(chg, vr5, bar_now, bar_prev, j_slope, j_now)
+        return compute_rule_score(
+            chg, vr5, vr1, bar_now, bar_prev, j_slope, j_now, candle_body_ratio
+        )
 
     @staticmethod
     def advice_text(j_now: float, chg: float) -> str:
@@ -220,7 +239,7 @@ class ShortTermRuleStrategy:
             return "⚠️ J 偏高：仅适合极小仓博弈，严格执行 T+2 开盘离场"
         if chg >= 0.06:
             return "⚠️ 当日涨幅偏大：次日高开若不及预期应果断止损"
-        return "✅ 短线共振成立：T+1 开盘限价买入，T+1 收盘 -5% 破位止损，否则 T+2 收盘离场"
+        return "✅ 短线共振成立：T+1 开盘买入，冲高 6% 动态止盈，平庸 T+1 离场，强势 T+2 骑乘"
 
     def scan(
         self,
@@ -342,6 +361,7 @@ class ShortTermRuleStrategy:
 
             ma_f = close_arr.rolling(SHORT_MA_FAST).mean()
             ma_s = close_arr.rolling(SHORT_MA_SLOW).mean()
+            ma_20 = close_arr.rolling(20).mean()
 
             ema12 = close_arr.ewm(span=12, adjust=False).mean()
             ema26 = close_arr.ewm(span=26, adjust=False).mean()
@@ -382,11 +402,14 @@ class ShortTermRuleStrategy:
 
             c_ma_f = float(ma_f.iloc[-1])
             c_ma_s = float(ma_s.iloc[-1])
+            c_ma_20 = float(ma_20.iloc[-1])
             ret5 = float(return_5d.iloc[-1])
             if ret5 > SHORT_MAX_5D_RETURN:
                 continue
 
-            trend_ok, bullish_ok = hard_trend_pass(c_close, c_open, c_ma_f, c_ma_s)
+            trend_ok, bullish_ok = hard_trend_pass(
+                c_close, c_open, c_ma_f, c_ma_s, c_ma_20
+            )
             if not trend_ok or not bullish_ok:
                 continue
 
@@ -420,7 +443,10 @@ class ShortTermRuleStrategy:
                 continue
 
             j_slope = j_now - j_prev
-            score = compute_rule_score(chg, vr5, cbar, pbar, j_slope, j_now)
+            candle_body_ratio = (c_close - c_open) / (c_high - c_low + 1e-6)
+            score = compute_rule_score(
+                chg, vr5, vr1, cbar, pbar, j_slope, j_now, candle_body_ratio
+            )
 
             checks: dict[str, bool] = {
                 "trend_ma": trend_ok,
@@ -448,6 +474,14 @@ class ShortTermRuleStrategy:
                 "score_breakdown": {
                     "pct_score": score_pct_nonlinear(chg),
                     "vr5_score": min(100.0, (vr5 / SHORT_VOL_RATIO_5D_MIN) * 60.0),
+                    "candle_body_bonus": min(
+                        15.0, max(0.0, float(candle_body_ratio) * 15.0)
+                    ),
+                    "volume_price_divergence_penalty": (
+                        _VOLUME_PRICE_DIVERGENCE_PENALTY
+                        if chg > 0.03 and vr1 < 1.0
+                        else 0.0
+                    ),
                     "j_overbought_penalty": (
                         _J_OVERBOUGHT_PENALTY if j_now >= _J_OVERBOUGHT_THRESHOLD else 0.0
                     ),

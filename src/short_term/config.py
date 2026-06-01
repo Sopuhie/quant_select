@@ -36,11 +36,17 @@ SHORT_ENTRY_MAX_CHASE = _env_float("QUANT_SHORT_ENTRY_MAX_CHASE", 0.01)
 # T+1 开盘入场：低开超过该比例则放弃（弱势缺口）
 SHORT_ENTRY_MIN_GAP = _env_float("QUANT_SHORT_ENTRY_MIN_GAP", -0.02)
 
+# T+1 盘中冲高动态止盈：最高价涨幅 >= 该比例时，按 (高+收)/2 保守平仓
+SHORT_T1_TAKE_PROFIT_PCT = _env_float("QUANT_SHORT_T1_TP", 0.06)
+# T+1 收盘强势阈值：>= 该比例则延续至 T+2 趋势骑乘；否则 T+1 收盘即平
+SHORT_T1_STRONG_CLOSE_PCT = _env_float("QUANT_SHORT_T1_STRONG", 0.04)
+
 SHORT_HOLD_PLAN = (
     f"T 日收盘确认信号 → T+1 开盘在 "
     f"[{(1 + SHORT_ENTRY_MIN_GAP) * 100:.0f}%, {(1 + SHORT_ENTRY_MAX_CHASE) * 100:.0f}%] "
-    f"区间限价买入 → T+1 收盘跌破 -{SHORT_CLOSE_STOP_RATIO * 100:.0f}% 止损 → "
-    f"未触发则 T+{SHORT_SELL_OFFSET} 收盘平仓"
+    f"区间限价买入 → T+1 冲高≥{SHORT_T1_TAKE_PROFIT_PCT * 100:.0f}% 动态止盈 → "
+    f"收盘破 -{SHORT_CLOSE_STOP_RATIO * 100:.0f}% 止损 → "
+    f"收盘<{SHORT_T1_STRONG_CLOSE_PCT * 100:.0f}% 则 T+1 离场，否则 T+2 趋势骑乘"
 )
 SHORT_TOP_N = _env_int_bounded("QUANT_SHORT_TOP_N", 5, 1, 20)
 

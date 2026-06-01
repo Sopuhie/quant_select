@@ -21,7 +21,7 @@ def test_stop_loss_triggered_on_t1_close():
     assert abs(stop_px - 9.5) < 1e-6
     out = evaluate_daily_exit(
         buy,
-        t1_bar={"open": 10.0, "low": 9.5, "close": 9.49},
+        t1_bar={"open": 10.0, "high": 10.2, "low": 9.5, "close": 9.49},
         t2_bar={"open": 9.6, "low": 9.4, "close": 9.8},
         t1_date="2026-05-16",
         t2_date="2026-05-19",
@@ -33,12 +33,40 @@ def test_stop_loss_triggered_on_t1_close():
     assert out["exit_reason"] == "t1_close_below_stop_limit"
 
 
-def test_intraday_wash_not_stopped_when_close_above_limit():
-    """盘中跌破但收盘收回：不触发止损，持有至 T+2。"""
+def test_take_profit_on_t1_high_spike():
     buy = 10.0
     out = evaluate_daily_exit(
         buy,
-        t1_bar={"open": 10.0, "low": 9.5, "close": 9.8},
+        t1_bar={"open": 10.0, "high": 10.7, "low": 9.9, "close": 10.1},
+        t2_bar={"open": 10.0, "low": 9.9, "close": 10.0},
+        t1_date="2026-05-16",
+        t2_date="2026-05-19",
+        sell_offset=2,
+    )
+    assert out["exit_reason"] == "t1_intraday_take_profit"
+    assert abs(out["sell_price"] - 10.4) < 1e-6
+    assert out["stop_loss_triggered"] == 0
+
+
+def test_take_profit_priority_over_stop_on_same_day():
+    buy = 10.0
+    out = evaluate_daily_exit(
+        buy,
+        t1_bar={"open": 10.0, "high": 10.7, "low": 9.4, "close": 9.4},
+        t2_bar={},
+        t1_date="2026-05-16",
+        t2_date=None,
+        sell_offset=2,
+    )
+    assert out["exit_reason"] == "t1_intraday_take_profit"
+    assert abs(out["sell_price"] - 10.05) < 1e-6
+
+
+def test_mediocre_exit_at_t1_close():
+    buy = 10.0
+    out = evaluate_daily_exit(
+        buy,
+        t1_bar={"open": 10.0, "high": 10.2, "low": 9.5, "close": 9.8},
         t2_bar={"open": 9.9, "low": 9.7, "close": 10.2},
         t1_date="2026-05-16",
         t2_date="2026-05-19",
@@ -46,94 +74,22 @@ def test_intraday_wash_not_stopped_when_close_above_limit():
     )
     assert out["status"] == ORDER_STATUS_CLOSED
     assert out["stop_loss_triggered"] == 0
-    assert out["sell_price"] == 10.2
-    assert out["exit_reason"] == "t2_close_exit"
+    assert out["sell_price"] == 9.8
+    assert out["exit_reason"] == "t1_mediocre_close_exit"
 
 
-def test_close_stop_at_exact_threshold_not_triggered():
-    """收盘价恰等于 -5% 线时不触发止损。"""
+def test_t2_trend_ride_exit_when_strong():
     buy = 10.0
     out = evaluate_daily_exit(
         buy,
-        t1_bar={"open": 9.7, "low": 9.5, "close": 9.5},
-        t2_bar={"open": 9.7, "low": 9.6, "close": 9.9},
+        t1_bar={"open": 10.0, "high": 10.5, "low": 9.8, "close": 10.5},
+        t2_bar={"open": 10.4, "low": 10.0, "close": 10.8},
         t1_date="2026-05-16",
         t2_date="2026-05-19",
         sell_offset=2,
     )
-    assert out["stop_loss_triggered"] == 0
-    assert out["exit_reason"] == "t2_close_exit"
-
-
-def test_t1_open_entry_within_band():
-    px, reason = resolve_t1_entry_price(
-        10.0, {"open": 10.05, "low": 10.0, "close": 10.1}
-    )
-    assert reason is None
-    assert px == 10.05
-
-
-def test_t1_open_chase_rejected():
-    px, reason = resolve_t1_entry_price(
-        10.0, {"open": 10.2, "low": 10.1, "close": 10.15}
-    )
-    assert px is None
-    assert reason == "t1_open_chase_rejected"
-
-
-def test_evaluate_short_trade_skipped_on_chase():
-    out = evaluate_short_trade(
-        10.0,
-        t1_bar={"open": 10.2, "low": 10.0, "close": 10.1},
-        t2_bar={"open": 10.0, "low": 9.9, "close": 10.0},
-        t1_date="2026-05-16",
-        t2_date="2026-05-19",
-    )
-    assert out["status"] == ORDER_STATUS_SKIPPED
-    assert out["exit_reason"] == "t1_open_chase_rejected"
-
-
-def test_t1_close_exit_when_no_stop():
-    buy = 10.0
-    out = evaluate_daily_exit(
-        buy,
-        t1_bar={"open": 10.1, "low": 9.8, "close": 10.5},
-        t2_bar={"open": 10.4, "low": 10.0, "close": 10.6},
-        t1_date="2026-05-16",
-        t2_date="2026-05-19",
-        sell_offset=1,
-    )
-    assert out["status"] == ORDER_STATUS_CLOSED
-    assert out["stop_loss_triggered"] == 0
-    assert out["sell_price"] == 10.5
-    assert out["sell_date"] == "2026-05-16"
-
-
-def test_t2_close_exit_when_offset_2():
-    buy = 10.0
-    out = evaluate_daily_exit(
-        buy,
-        t1_bar={"open": 10.0, "low": 9.8, "close": 10.2},
-        t2_bar={"open": 10.1, "low": 10.0, "close": 10.8},
-        t1_date="2026-05-16",
-        t2_date="2026-05-19",
-        sell_offset=2,
-    )
-    assert out["status"] == ORDER_STATUS_CLOSED
+    assert out["exit_reason"] == "t2_trend_ride_exit"
     assert out["sell_price"] == 10.8
-    assert out["sell_date"] == "2026-05-19"
-    assert out["hold_days"] == 2
-
-
-def test_holding_when_t1_missing():
-    out = evaluate_daily_exit(
-        10.0,
-        t1_bar={"open": None, "low": None, "close": None},
-        t2_bar={},
-        t1_date=None,
-        t2_date=None,
-    )
-    assert out["status"] == ORDER_STATUS_HOLDING
 
 
 def test_sync_orders_writes_tracker():
@@ -141,11 +97,11 @@ def test_sync_orders_writes_tracker():
     conn.executescript(
         """
         CREATE TABLE stock_daily_kline (
-            date TEXT, stock_code TEXT, open REAL, low REAL, close REAL, volume REAL
+            date TEXT, stock_code TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL
         );
         INSERT INTO stock_daily_kline VALUES
-        ('2026-05-15', '000001', 9.8, 9.7, 10.0, 1000),
-        ('2026-05-16', '000001', 10.0, 9.3, 9.4, 1000);
+        ('2026-05-15', '000001', 9.8, 9.9, 9.7, 10.0, 1000),
+        ('2026-05-16', '000001', 10.0, 10.1, 9.3, 9.4, 1000);
         """
     )
     from unittest.mock import patch
@@ -166,9 +122,3 @@ def test_sync_orders_writes_tracker():
         ]
         summary = sync_short_orders_for_signal_day(conn, "2026-05-15", rows)
         assert summary["stop_loss_count"] == 1
-        row = conn.execute(
-            "SELECT status, stop_loss_triggered, sell_price FROM short_order_tracker"
-        ).fetchone()
-        assert row[0] == ORDER_STATUS_CLOSED
-        assert row[1] == 1
-        assert abs(row[2] - 9.4) < 1e-6

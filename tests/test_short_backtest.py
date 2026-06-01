@@ -52,11 +52,11 @@ def test_simulate_short_trade_t1_exit():
     conn.executescript(
         """
         CREATE TABLE stock_daily_kline (
-            date TEXT, stock_code TEXT, open REAL, low REAL, close REAL, volume REAL
+            date TEXT, stock_code TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL
         );
         INSERT INTO stock_daily_kline VALUES
-        ('2026-05-15', '000001', 9.8, 9.7, 10.0, 1000),
-        ('2026-05-16', '000001', 10.1, 9.8, 10.5, 1000);
+        ('2026-05-15', '000001', 9.8, 10.0, 9.7, 10.0, 1000),
+        ('2026-05-16', '000001', 10.1, 10.6, 9.8, 10.5, 1000);
         """
     )
     with patch(
@@ -79,12 +79,12 @@ def test_run_short_term_rolling_backtest_with_mock_scan():
     conn.executescript(
         """
         CREATE TABLE stock_daily_kline (
-            date TEXT, stock_code TEXT, open REAL, low REAL, close REAL, volume REAL
+            date TEXT, stock_code TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL
         );
         INSERT INTO stock_daily_kline VALUES
-        ('2026-05-14', '000001', 9.8, 9.7, 10.0, 1000),
-        ('2026-05-15', '000001', 10.0, 9.5, 9.4, 1000),
-        ('2026-05-16', '000001', 9.6, 9.4, 9.8, 1000);
+        ('2026-05-14', '000001', 9.8, 10.0, 9.7, 10.0, 1000),
+        ('2026-05-15', '000001', 10.0, 10.1, 9.5, 9.4, 1000),
+        ('2026-05-16', '000001', 9.6, 9.8, 9.4, 9.8, 1000);
         """
     )
 

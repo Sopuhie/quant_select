@@ -4,8 +4,7 @@
 
 - 信号：T 日收盘确认
 - 买入：T+1 开盘价（需在信号收盘价 ± 追高/缺口容忍区间内）
-- 止损：T+1 收盘价 < 买入价×(1-收盘止损比例) → 以 T+1 收盘价离场
-- 未止损：在 T+SHORT_SELL_OFFSET 以当日 close 平仓（默认 T+2）
+- T+1 冲高动态止盈 / 收盘止损 / 平庸提早平仓 / 强势 T+2 趋势骑乘
 """
 from __future__ import annotations
 
@@ -21,6 +20,8 @@ from .config import (
     SHORT_HOLD_PLAN,
     SHORT_SELL_OFFSET,
     SHORT_STOP_LOSS_RATIO,
+    SHORT_T1_STRONG_CLOSE_PCT,
+    SHORT_T1_TAKE_PROFIT_PCT,
 )
 from .review_prices import resolve_t1_t2_dates
 
@@ -81,13 +82,13 @@ def fetch_post_signal_ohlc(
     读取信号日之后的 T+1 / T+2 日线 OHLC。
 
     Returns:
-        ``{"t1": {"open","low","close"}, "t2": {...}}``，无 K 线则对应键为空 dict。
+        ``{"t1": {"open","high","low","close"}, "t2": {...}}``，无 K 线则对应键为空 dict。
     """
     code = str(stock_code).strip().zfill(6)
     t1, t2 = resolve_t1_t2_dates(signal_trade_date, conn)
     out: dict[str, dict[str, float | None]] = {
-        "t1": {"open": None, "low": None, "close": None},
-        "t2": {"open": None, "low": None, "close": None},
+        "t1": {"open": None, "high": None, "low": None, "close": None},
+        "t2": {"open": None, "high": None, "low": None, "close": None},
     }
     if not t1:
         return out
@@ -98,7 +99,7 @@ def fetch_post_signal_ohlc(
     placeholders = ",".join("?" * len(dates))
     cur = conn.execute(
         f"""
-        SELECT date, open, low, close
+        SELECT date, open, high, low, close
         FROM stock_daily_kline
         WHERE stock_code = ? AND date IN ({placeholders})
         """,
@@ -109,17 +110,45 @@ def fetch_post_signal_ohlc(
         d = str(row[0]).strip()[:10]
         try:
             o = float(row[1])
-            lo = float(row[2])
-            c = float(row[3])
+            hi = float(row[2])
+            lo = float(row[3])
+            c = float(row[4])
         except (TypeError, ValueError):
             continue
-        if all(np.isfinite(x) for x in (o, lo, c)):
-            by_date[d] = {"open": o, "low": lo, "close": c}
+        if all(np.isfinite(x) for x in (o, hi, lo, c)):
+            by_date[d] = {"open": o, "high": hi, "low": lo, "close": c}
 
     if t1 in by_date:
         out["t1"] = dict(by_date[t1])
     if t2 and t2 in by_date:
         out["t2"] = dict(by_date[t2])
+    return out
+
+
+def _closed_exit(
+    *,
+    buy_price: float,
+    sell_px: float,
+    sell_date: str,
+    hold_days: int,
+    stop_px: float,
+    exit_reason: str,
+    stop_loss_triggered: int = 0,
+    t1_low_f: float | None = None,
+) -> dict[str, Any]:
+    pnl = (sell_px - buy_price) / buy_price if buy_price > 0 else None
+    out: dict[str, Any] = {
+        "status": ORDER_STATUS_CLOSED,
+        "sell_date": sell_date,
+        "sell_price": sell_px,
+        "hold_days": hold_days,
+        "pnl_ratio": pnl,
+        "stop_loss_triggered": stop_loss_triggered,
+        "stop_loss_price": stop_px,
+        "exit_reason": exit_reason,
+    }
+    if t1_low_f is not None:
+        out["t1_low"] = t1_low_f
     return out
 
 
@@ -135,12 +164,11 @@ def evaluate_daily_exit(
     """
     纯日线模拟平仓结果。
 
-    止损评估（仅依赖日线 OHLC）：
-    1. T+1 **收盘价** 跌破 ``buy_price × (1 - SHORT_CLOSE_STOP_RATIO)``：
-       以 T+1 收盘价离场，``exit_reason=t1_close_below_stop_limit``。
-    2. 未触发止损：按 ``SHORT_SELL_OFFSET`` 在 T+1 或 T+2 以 ``close`` 平仓。
-
-    T+1 收盘价尚未入库时返回 HOLDING。
+    评估顺序（T+1 日）：
+    1. 盘中冲高动态止盈（``high`` 涨幅 ≥ 6%，按 (高+收)/2 保守撮合）。
+    2. 收盘价破位止损。
+    3. ``offset==1``：T+1 收盘平仓。
+    4. ``offset==2``：收盘 < 4% → T+1 平庸离场；≥ 4% → T+2 趋势骑乘。
     """
     offset = int(sell_offset if sell_offset is not None else SHORT_SELL_OFFSET)
     offset = max(1, min(2, offset))
@@ -148,6 +176,7 @@ def evaluate_daily_exit(
     stop_px = stop_loss_trigger_price(buy_price)
 
     t1_low = t1_bar.get("low")
+    t1_high = t1_bar.get("high")
     t1_close = t1_bar.get("close")
     t2_close = t2_bar.get("close")
 
@@ -168,25 +197,38 @@ def evaluate_daily_exit(
     if t1_low is not None and np.isfinite(float(t1_low)):
         t1_low_f = float(t1_low)
 
-    # T+1 收盘价破位止损（抗洗盘，忽略盘中最低价）
-    if t1_close_f < stop_px and t1_date:
-        sell_px = t1_close_f
-        pnl = (sell_px - buy_price) / buy_price if buy_price > 0 else None
-        out: dict[str, Any] = {
-            "status": ORDER_STATUS_CLOSED,
-            "sell_date": t1_date,
-            "sell_price": sell_px,
-            "hold_days": 1,
-            "pnl_ratio": pnl,
-            "stop_loss_triggered": 1,
-            "stop_loss_price": stop_px,
-            "exit_reason": "t1_close_below_stop_limit",
-        }
-        if t1_low_f is not None:
-            out["t1_low"] = t1_low_f
-        return out
+    # T+1 盘中冲高动态止盈（优先于收盘止损）
+    if t1_date and t1_high is not None and np.isfinite(float(t1_high)):
+        t1_high_f = float(t1_high)
+        t1_high_pct = (t1_high_f - buy_price) / buy_price if buy_price > 0 else 0.0
+        if t1_high_pct >= float(SHORT_T1_TAKE_PROFIT_PCT):
+            sell_px = (t1_high_f + t1_close_f) / 2.0
+            return _closed_exit(
+                buy_price=buy_price,
+                sell_px=sell_px,
+                sell_date=t1_date,
+                hold_days=1,
+                stop_px=stop_px,
+                exit_reason="t1_intraday_take_profit",
+                t1_low_f=t1_low_f,
+            )
 
-    # 未触发止损：T+1 收盘平仓
+    # T+1 收盘价破位止损
+    if t1_close_f < stop_px and t1_date:
+        return _closed_exit(
+            buy_price=buy_price,
+            sell_px=t1_close_f,
+            sell_date=t1_date,
+            hold_days=1,
+            stop_px=stop_px,
+            exit_reason="t1_close_below_stop_limit",
+            stop_loss_triggered=1,
+            t1_low_f=t1_low_f,
+        )
+
+    t1_close_pct = (t1_close_f - buy_price) / buy_price if buy_price > 0 else 0.0
+
+    # offset==1：T+1 收盘平仓
     if offset == 1:
         if not t1_date:
             return {
@@ -199,25 +241,42 @@ def evaluate_daily_exit(
                 "stop_loss_price": stop_px,
                 "exit_reason": "await_t1_close",
             }
-        sell_px = t1_close_f
-        pnl = (sell_px - buy_price) / buy_price if buy_price > 0 else None
-        out = {
-            "status": ORDER_STATUS_CLOSED,
-            "sell_date": t1_date,
-            "sell_price": sell_px,
-            "hold_days": 1,
-            "pnl_ratio": pnl,
-            "stop_loss_triggered": 0,
-            "stop_loss_price": stop_px,
-            "exit_reason": "t1_close_exit",
-        }
-        if t1_low_f is not None:
-            out["t1_low"] = t1_low_f
-        return out
+        return _closed_exit(
+            buy_price=buy_price,
+            sell_px=t1_close_f,
+            sell_date=t1_date,
+            hold_days=1,
+            stop_px=stop_px,
+            exit_reason="t1_close_exit",
+            t1_low_f=t1_low_f,
+        )
 
-    # offset == 2：持有至 T+2 收盘（T+1 已确认未触发止损）
+    # offset==2：非对称持仓——平庸 T+1 离场，强势 T+2 趋势骑乘
+    strong_thr = float(SHORT_T1_STRONG_CLOSE_PCT)
+    if t1_close_pct < strong_thr:
+        if not t1_date:
+            return {
+                "status": ORDER_STATUS_HOLDING,
+                "sell_date": None,
+                "sell_price": None,
+                "hold_days": 0,
+                "pnl_ratio": None,
+                "stop_loss_triggered": 0,
+                "stop_loss_price": stop_px,
+                "exit_reason": "await_t1_close",
+            }
+        return _closed_exit(
+            buy_price=buy_price,
+            sell_px=t1_close_f,
+            sell_date=t1_date,
+            hold_days=1,
+            stop_px=stop_px,
+            exit_reason="t1_mediocre_close_exit",
+            t1_low_f=t1_low_f,
+        )
+
     if t2_close is None or not np.isfinite(float(t2_close)) or not t2_date:
-        out = {
+        return {
             "status": ORDER_STATUS_HOLDING,
             "sell_date": None,
             "sell_price": None,
@@ -226,25 +285,24 @@ def evaluate_daily_exit(
             "stop_loss_triggered": 0,
             "stop_loss_price": stop_px,
             "exit_reason": "await_t2_close",
+            "t1_low": t1_low_f,
         }
-        if t1_low_f is not None:
-            out["t1_low"] = t1_low_f
-        return out
-    sell_px = float(t2_close)
-    pnl = (sell_px - buy_price) / buy_price if buy_price > 0 else None
-    out = {
-        "status": ORDER_STATUS_CLOSED,
-        "sell_date": t2_date,
-        "sell_price": sell_px,
-        "hold_days": 2,
-        "pnl_ratio": pnl,
-        "stop_loss_triggered": 0,
-        "stop_loss_price": stop_px,
-        "exit_reason": "t2_close_exit",
-    }
-    if t1_low_f is not None:
-        out["t1_low"] = t1_low_f
-    return out
+
+    t2_close_f = float(t2_close)
+    exit_reason = (
+        "t2_trend_ride_exit"
+        if t2_close_f > t1_close_f
+        else "t2_close_exit"
+    )
+    return _closed_exit(
+        buy_price=buy_price,
+        sell_px=t2_close_f,
+        sell_date=t2_date,
+        hold_days=2,
+        stop_px=stop_px,
+        exit_reason=exit_reason,
+        t1_low_f=t1_low_f,
+    )
 
 
 def evaluate_short_trade(
@@ -399,7 +457,7 @@ def refresh_holding_short_orders(
     commit: bool = True,
 ) -> int:
     """K 线增量后，重新评估仍为 HOLDING 的订单（可指定信号日或全表）。"""
-    from .db import ensure_short_term_tables, upsert_short_order
+    from .db import ensure_short_term_tables
 
     ensure_short_term_tables(conn)
     td = str(buy_date).strip()[:10] if buy_date else None
