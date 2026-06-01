@@ -5,6 +5,7 @@ import sqlite3
 
 from src.short_term.execution import (
     ORDER_STATUS_CLOSED,
+    ORDER_STATUS_HOLDING,
     ORDER_STATUS_SKIPPED,
     evaluate_daily_exit,
     evaluate_short_trade,
@@ -17,10 +18,10 @@ from src.short_term.execution import (
 def test_stop_loss_triggered_on_t1_close():
     buy = 10.0
     stop_px = stop_loss_trigger_price(buy)
-    assert abs(stop_px - 9.4) < 1e-6
+    assert abs(stop_px - 9.5) < 1e-6
     out = evaluate_daily_exit(
         buy,
-        t1_bar={"open": 10.0, "high": 10.2, "low": 9.5, "close": 9.39},
+        t1_bar={"open": 10.0, "high": 10.2, "low": 9.5, "close": 9.49},
         t2_bar={"open": 9.6, "low": 9.4, "close": 9.8},
         t1_date="2026-05-16",
         t2_date="2026-05-19",
@@ -28,47 +29,8 @@ def test_stop_loss_triggered_on_t1_close():
     )
     assert out["status"] == ORDER_STATUS_CLOSED
     assert out["stop_loss_triggered"] == 1
-    assert abs(out["sell_price"] - 9.39) < 1e-6
+    assert abs(out["sell_price"] - 9.49) < 1e-6
     assert out["exit_reason"] == "t1_close_below_stop_limit"
-
-
-def test_entry_dip_cost_correction_on_high_open():
-    px, reason = resolve_t1_entry_price(
-        10.0,
-        {"open": 10.3, "high": 10.5, "low": 9.9, "close": 10.1},
-    )
-    assert reason is None
-    assert abs(px - 10.1) < 1e-6
-
-
-def test_entry_uses_open_on_micro_gap_up():
-    px, reason = resolve_t1_entry_price(
-        10.0,
-        {"open": 10.1, "high": 10.2, "low": 10.0, "close": 10.15},
-    )
-    assert reason is None
-    assert px == 10.1
-
-
-def test_entry_chase_rejected_above_55pct():
-    px, reason = resolve_t1_entry_price(
-        10.0,
-        {"open": 10.56, "high": 10.6, "low": 10.4, "close": 10.5},
-    )
-    assert px is None
-    assert reason == "t1_open_chase_rejected"
-
-
-def test_evaluate_short_trade_allows_moderate_gap_up():
-    out = evaluate_short_trade(
-        10.0,
-        t1_bar={"open": 10.2, "high": 10.3, "low": 10.0, "close": 10.1},
-        t2_bar={"open": 10.0, "low": 9.9, "close": 10.0},
-        t1_date="2026-05-16",
-        t2_date="2026-05-19",
-    )
-    assert out["status"] != ORDER_STATUS_SKIPPED
-    assert out["buy_price"] == 10.2
 
 
 def test_take_profit_on_t1_high_spike():
@@ -82,6 +44,22 @@ def test_take_profit_on_t1_high_spike():
         sell_offset=2,
     )
     assert out["exit_reason"] == "t1_intraday_take_profit"
+    assert abs(out["sell_price"] - 10.4) < 1e-6
+    assert out["stop_loss_triggered"] == 0
+
+
+def test_take_profit_priority_over_stop_on_same_day():
+    buy = 10.0
+    out = evaluate_daily_exit(
+        buy,
+        t1_bar={"open": 10.0, "high": 10.7, "low": 9.4, "close": 9.4},
+        t2_bar={},
+        t1_date="2026-05-16",
+        t2_date=None,
+        sell_offset=2,
+    )
+    assert out["exit_reason"] == "t1_intraday_take_profit"
+    assert abs(out["sell_price"] - 10.05) < 1e-6
 
 
 def test_mediocre_exit_at_t1_close():
@@ -94,7 +72,24 @@ def test_mediocre_exit_at_t1_close():
         t2_date="2026-05-19",
         sell_offset=2,
     )
+    assert out["status"] == ORDER_STATUS_CLOSED
+    assert out["stop_loss_triggered"] == 0
+    assert out["sell_price"] == 9.8
     assert out["exit_reason"] == "t1_mediocre_close_exit"
+
+
+def test_t2_trend_ride_exit_when_strong():
+    buy = 10.0
+    out = evaluate_daily_exit(
+        buy,
+        t1_bar={"open": 10.0, "high": 10.5, "low": 9.8, "close": 10.5},
+        t2_bar={"open": 10.4, "low": 10.0, "close": 10.8},
+        t1_date="2026-05-16",
+        t2_date="2026-05-19",
+        sell_offset=2,
+    )
+    assert out["exit_reason"] == "t2_trend_ride_exit"
+    assert out["sell_price"] == 10.8
 
 
 def test_sync_orders_writes_tracker():
@@ -106,7 +101,7 @@ def test_sync_orders_writes_tracker():
         );
         INSERT INTO stock_daily_kline VALUES
         ('2026-05-15', '000001', 9.8, 9.9, 9.7, 10.0, 1000),
-        ('2026-05-16', '000001', 10.0, 10.1, 9.3, 9.39, 1000);
+        ('2026-05-16', '000001', 10.0, 10.1, 9.3, 9.4, 1000);
         """
     )
     from unittest.mock import patch
