@@ -250,7 +250,7 @@ class ShortTermRuleStrategy:
         include_300: bool = False,
         include_688: bool = False,
     ) -> tuple[pd.DataFrame, str, int]:
-        top_n = int(top_n if top_n is not None else SHORT_TOP_N)
+        top_n_config = int(top_n if top_n is not None else SHORT_TOP_N)
         cur = self.conn.cursor()
         if target_date is None:
             res_date = cur.execute(
@@ -271,6 +271,14 @@ class ShortTermRuleStrategy:
         )
         if not allows:
             return (pd.DataFrame(columns=RESULT_COLUMNS), target_date, mkt_score)
+
+        # 动态 Top N：强市（≥80）满配，震荡市（60~79）最多 3 只精选
+        if mkt_score >= 80:
+            top_n = top_n_config
+        elif mkt_score >= 60:
+            top_n = min(3, top_n_config)
+        else:
+            top_n = top_n_config
 
         cur_cols_query = cur.execute("PRAGMA table_info(stock_daily_kline)").fetchall()
         cur_cols = {str(row[1]) for row in cur_cols_query}

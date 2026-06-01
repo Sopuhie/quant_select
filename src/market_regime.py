@@ -175,6 +175,38 @@ def get_index_momentum_return(
     return (last_close / base_close) - 1.0
 
 
+def get_short_term_market_score(
+    target_date: str,
+    *,
+    index_code: str = "000852",
+    momentum_days: int = 5,
+    db_path=None,
+) -> int:
+    """
+    短线动态环境分（0~100）：MA20 基础上叠加指数 N 日动量，供 Top N 非线性降档。
+    """
+    base = get_market_environment_score(
+        target_date, index_code=index_code, db_path=db_path
+    )
+    if base < 60:
+        return int(base)
+    mom = get_index_momentum_return(
+        target_date,
+        index_code=index_code,
+        lookback_days=momentum_days,
+        db_path=db_path,
+    )
+    if mom is None or mom <= 0:
+        return int(base)
+    if mom >= 0.05:
+        return 95
+    if mom >= 0.03:
+        return 85
+    if mom >= 0.015:
+        return 75
+    return 65
+
+
 def short_term_market_allows_trading(
     target_date: str,
     *,
@@ -184,8 +216,8 @@ def short_term_market_allows_trading(
     momentum_min: float = 0.0,
     db_path=None,
 ) -> tuple[bool, int, float | None]:
-    """短线专用：MA20 环境分 + 指数 N 日动量双过滤。Returns (允许, 环境分, 动量)。"""
-    score = get_market_environment_score(
+    """短线专用：MA20 环境分 + 指数 N 日动量双过滤。Returns (允许, 动态环境分, 动量)。"""
+    base = get_market_environment_score(
         target_date, index_code=index_code, db_path=db_path
     )
     mom = get_index_momentum_return(
@@ -194,7 +226,13 @@ def short_term_market_allows_trading(
         lookback_days=momentum_days,
         db_path=db_path,
     )
-    allows = score >= int(min_score) and mom is not None and mom > float(momentum_min)
+    score = get_short_term_market_score(
+        target_date,
+        index_code=index_code,
+        momentum_days=momentum_days,
+        db_path=db_path,
+    )
+    allows = base >= int(min_score) and mom is not None and mom > float(momentum_min)
     return allows, score, mom
 
 

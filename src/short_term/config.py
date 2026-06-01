@@ -31,8 +31,9 @@ SHORT_SELL_OFFSET = _env_int_bounded("QUANT_SHORT_SELL_OFFSET", 2, 1, 2)
 SHORT_STOP_LOSS_RATIO = _env_float("QUANT_SHORT_STOP_LOSS", 0.03)
 # T+1 收盘价破位止损：收盘价 < 买入价 × (1 - 该比例) 时在 T+1 收盘离场
 SHORT_CLOSE_STOP_RATIO = _env_float("QUANT_SHORT_CLOSE_STOP", 0.05)
-# T+1 开盘入场：相对信号日收盘价，高开超过该比例则放弃（防追高）
-SHORT_ENTRY_MAX_CHASE = _env_float("QUANT_SHORT_ENTRY_MAX_CHASE", 0.01)
+# T+1 开盘入场：相对信号日收盘价，高开超过该比例则放弃（防追高，硬上限 2%）
+SHORT_ENTRY_MAX_CHASE = _env_float("QUANT_SHORT_ENTRY_MAX_CHASE", 0.02)
+SHORT_ENTRY_MAX_CHASE_HARD_CAP = 0.02
 # T+1 开盘入场：低开超过该比例则放弃（弱势缺口）
 SHORT_ENTRY_MIN_GAP = _env_float("QUANT_SHORT_ENTRY_MIN_GAP", -0.02)
 

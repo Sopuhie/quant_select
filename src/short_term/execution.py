@@ -16,6 +16,7 @@ import numpy as np
 from .config import (
     SHORT_CLOSE_STOP_RATIO,
     SHORT_ENTRY_MAX_CHASE,
+    SHORT_ENTRY_MAX_CHASE_HARD_CAP,
     SHORT_ENTRY_MIN_GAP,
     SHORT_HOLD_PLAN,
     SHORT_SELL_OFFSET,
@@ -43,7 +44,10 @@ def resolve_t1_entry_price(
     Returns:
         (买入价, None) 或 (None, skip_reason)。
     """
-    chase = float(SHORT_ENTRY_MAX_CHASE if max_chase is None else max_chase)
+    chase = min(
+        float(SHORT_ENTRY_MAX_CHASE if max_chase is None else max_chase),
+        float(SHORT_ENTRY_MAX_CHASE_HARD_CAP),
+    )
     gap = float(SHORT_ENTRY_MIN_GAP if min_gap is None else min_gap)
     sig = float(signal_close)
     if sig <= 0:
