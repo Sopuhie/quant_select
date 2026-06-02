@@ -7,7 +7,7 @@
 对每个信号日 T（在 ``[start_date, scan_end_date]`` 内）：
 
 1. ``ShortTermRuleStrategy.scan(T)`` — 与实盘扫描相同，无未来数据；
-2. 对 Top N 入选逐笔模拟：T+1 开盘限价买入 → T+1 止损 / T+N 收盘卖出；
+2. 对 Top N 入选逐笔模拟：T+1 开盘限价买入 → 最早 T+2 止盈/止损/收盘卖出；
 3. 信号日等权汇总当日收益，再复利拼接净值曲线。
 
 说明
@@ -83,13 +83,12 @@ def resolve_scan_end_date(
     """
     最后一个可完整平仓的信号日。
 
-    信号日 T 需存在 T+``sell_offset`` 的 K 线（见 ``SHORT_SELL_OFFSET``）。
+    A 股 T+1 交割：T+1 买入，最早 T+2 卖出，故信号日 T 至少需有 T+2 的 K 线。
     """
-    offset = int(sell_offset if sell_offset is not None else SHORT_SELL_OFFSET)
-    offset = max(1, min(2, offset))
-    if len(trade_dates) <= offset:
+    min_lag = 2
+    if len(trade_dates) <= min_lag:
         return None
-    return trade_dates[-(offset + 1)]
+    return trade_dates[-(min_lag + 1)]
 
 
 def simulate_short_trade(

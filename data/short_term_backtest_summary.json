@@ -20,17 +20,15 @@
   "closed_trades": 697,
   "holding_trades": 0,
   "skipped_trades": 88,
-  "win_rate": 0.460545193687231,
-  "avg_pnl_pct": 0.33020350910796575,
-  "median_pnl_pct": -0.12568077084205106,
-  "cum_return_pct": 79.73806754348468,
-  "max_drawdown_pct": -12.862659488597894,
+  "win_rate": 0.48493543758967,
+  "avg_pnl_pct": 0.6083506173519373,
+  "median_pnl_pct": 0.0,
+  "cum_return_pct": 159.5097290186557,
+  "max_drawdown_pct": -11.154238123530847,
   "exit_reason_counts": {
-    "t1_mediocre_close_exit": 614,
-    "t1_intraday_take_profit_tier1": 50,
-    "t1_intraday_take_profit_tier2": 18,
-    "t1_asymmetric_stop_exit": 12,
-    "t2_close_exit": 2,
-    "t2_trend_ride_exit": 1
+    "t2_close_exit": 537,
+    "t2_intraday_take_profit_tier1": 86,
+    "t2_asymmetric_stop_exit": 45,
+    "t2_intraday_take_profit_tier2": 29
   }
 }

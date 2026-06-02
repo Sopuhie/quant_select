@@ -78,31 +78,31 @@ def short_term_rules_sections() -> list[dict[str, str]]:
             "规则": SHORT_HOLD_PLAN,
         },
         {
-            "类别": "T+1 双阶梯止盈",
+            "类别": "T+2 双阶梯止盈",
             "规则": (
-                f"盘中最高涨幅 ≥{_pct(SHORT_T1_TAKE_PROFIT_TIER1_PCT)}："
-                f"平仓价=(high+close)/2，exit=t1_intraday_take_profit_tier1；"
+                f"A 股 T+1 交割：T+1 只买不卖，最早 T+2 评估。"
+                f"T+2 盘中最高涨幅 ≥{_pct(SHORT_T1_TAKE_PROFIT_TIER1_PCT)}："
+                f"平仓价=(high+close)/2，exit=t2_intraday_take_profit_tier1；"
                 f"≥{_pct(SHORT_T1_TAKE_PROFIT_TIER2_PCT)} 且未达第一阶梯："
                 f"锁定 +{_pct(SHORT_T1_TAKE_PROFIT_TIER2_LOCK)}，"
-                f"exit=t1_intraday_take_profit_tier2"
+                f"exit=t2_intraday_take_profit_tier2"
             ),
         },
         {
-            "类别": "T+1 非对称收盘止损",
+            "类别": "T+2 非对称收盘止损",
             "规则": (
-                f"盘中最高涨幅 <{_pct(SHORT_T1_TAKE_PROFIT_TIER2_PCT)}（平庸股）："
-                f"收盘 < 买入价×(1-{_pct(SHORT_MEDIOCRE_STOP_RATIO)}) → t1_asymmetric_stop_exit；"
+                f"T+2 盘中最高涨幅 <{_pct(SHORT_T1_TAKE_PROFIT_TIER2_PCT)}（平庸股）："
+                f"收盘 < 买入价×(1-{_pct(SHORT_MEDIOCRE_STOP_RATIO)}) → t2_asymmetric_stop_exit；"
                 f"盘中曾达 ≥{_pct(SHORT_T1_TAKE_PROFIT_TIER2_PCT)}："
-                f"收盘 < 买入价×(1-{_pct(SHORT_CLOSE_STOP_RATIO)}) → t1_close_below_stop_limit"
+                f"收盘 < 买入价×(1-{_pct(SHORT_CLOSE_STOP_RATIO)}) → t2_close_below_stop_limit"
             ),
         },
         {
-            "类别": "T+1/T+2 持仓分支",
+            "类别": "T+2 持仓分支",
             "规则": (
                 f"QUANT_SHORT_SELL_OFFSET={SHORT_SELL_OFFSET}（默认 2）。"
-                f"T+1 收盘涨幅 <{_pct(SHORT_T1_STRONG_CLOSE_PCT)} → 当日收盘平"
-                f"（t1_mediocre_close_exit）；"
-                f"≥{_pct(SHORT_T1_STRONG_CLOSE_PCT)} → 延续 T+2："
+                f"T+1 与 T+2 均走同一止盈/止损链（仅禁止 T+1 卖出）；"
+                f"T+1 收盘涨幅 ≥{_pct(SHORT_T1_STRONG_CLOSE_PCT)} 且 offset≥2："
                 f"T+2 收盘 > T+1 收盘则 t2_trend_ride_exit，否则 t2_close_exit"
             ),
         },
@@ -216,7 +216,7 @@ def short_term_rules_sections() -> list[dict[str, str]]:
             "规则": (
                 "J≥88：极小仓博弈，严格执行 T+2 离场；"
                 "当日涨幅≥6%：警惕次日高开不及预期；"
-                "否则：T+1 开盘买入，双阶梯动态止盈，平庸 T+1 离场，强势 T+2 骑乘"
+                "否则：T+1 开盘买入，T+2 双阶梯止盈/止损，强势 T+2 收盘骑乘"
             ),
         },
         {
@@ -257,32 +257,31 @@ def format_short_term_rules_markdown() -> str:
             f"| 高开 >{_pct(SHORT_ENTRY_MAX_CHASE)} 或低开 <{_pct(SHORT_ENTRY_MIN_GAP)} | "
             "**SKIPPED**（不成交） |",
             "",
-            "### 三、T+1 平仓评估顺序（纯日线模拟）",
-            "评估在 T+1 日按以下**优先级**依次触发（先触发先平）：",
+            "### 三、T+2 平仓评估顺序（A 股 T+1 交割，纯日线模拟）",
+            "T+1 仅完成买入；**最早 T+2** 按以下**优先级**依次触发（先触发先平）：",
             "",
-            "#### 3.1 双阶梯动态止盈",
+            "#### 3.1 双阶梯动态止盈（T+2 日）",
             "| 条件 | 平仓价 | exit_reason |",
             "|------|--------|-------------|",
             f"| 盘中最高涨幅 ≥ **{_pct(SHORT_T1_TAKE_PROFIT_TIER1_PCT)}** | (high + close) / 2 | "
-            "`t1_intraday_take_profit_tier1` |",
+            "`t2_intraday_take_profit_tier1` |",
             f"| 盘中最高涨幅 ≥ **{_pct(SHORT_T1_TAKE_PROFIT_TIER2_PCT)}** 且未达第一阶梯 | "
             f"买入价 × (1 + {_pct(SHORT_T1_TAKE_PROFIT_TIER2_LOCK)}) | "
-            "`t1_intraday_take_profit_tier2` |",
+            "`t2_intraday_take_profit_tier2` |",
             "",
-            "#### 3.2 非对称收盘止损",
+            "#### 3.2 非对称收盘止损（T+2 日）",
             "| 盘中表现 | 止损线 | exit_reason |",
             "|----------|--------|-------------|",
             f"| 最高涨幅 **<{_pct(SHORT_T1_TAKE_PROFIT_TIER2_PCT)}**（平庸股） | "
-            f"收盘破 **-{_pct(SHORT_MEDIOCRE_STOP_RATIO)}** | `t1_asymmetric_stop_exit` |",
+            f"收盘破 **-{_pct(SHORT_MEDIOCRE_STOP_RATIO)}** | `t2_asymmetric_stop_exit` |",
             f"| 最高涨幅 **≥{_pct(SHORT_T1_TAKE_PROFIT_TIER2_PCT)}**（曾显强势） | "
-            f"收盘破 **-{_pct(SHORT_CLOSE_STOP_RATIO)}** | `t1_close_below_stop_limit` |",
+            f"收盘破 **-{_pct(SHORT_CLOSE_STOP_RATIO)}** | `t2_close_below_stop_limit` |",
             "",
-            "#### 3.3 持仓延续（`QUANT_SHORT_SELL_OFFSET`，默认 2）",
-            f"- T+1 收盘涨幅 **<{_pct(SHORT_T1_STRONG_CLOSE_PCT)}** → **T+1 收盘**平仓 "
-            "（`t1_mediocre_close_exit`）",
-            f"- T+1 收盘涨幅 **≥{_pct(SHORT_T1_STRONG_CLOSE_PCT)}** → 延续至 **T+2 收盘**：",
+            "#### 3.3 默认收盘（T+2 日）",
+            f"- offset=2 且 T+1 收盘涨幅 **≥{_pct(SHORT_T1_STRONG_CLOSE_PCT)}**：",
             "  - T+2 收盘 > T+1 收盘 → `t2_trend_ride_exit`",
             "  - 否则 → `t2_close_exit`",
+            "- offset=1：未触发止盈/止损时 → `t2_close_exit`",
             "",
             f"- 完整文案：`{SHORT_HOLD_PLAN}`",
             "",
@@ -342,11 +341,11 @@ def format_short_term_rules_markdown() -> str:
             "|------|------|",
             "| `t1_open_chase_rejected` | T+1 高开超限，放弃买入 |",
             "| `t1_open_gap_down_rejected` | T+1 低开超限，放弃买入 |",
-            "| `t1_intraday_take_profit_tier1` | T+1 冲高 ≥6% 动态止盈 |",
-            "| `t1_intraday_take_profit_tier2` | T+1 冲高 ≥5% 锁定 +3% |",
-            "| `t1_asymmetric_stop_exit` | 平庸股 T+1 收盘 -4% 止损 |",
-            "| `t1_close_below_stop_limit` | 强势股 T+1 收盘 -6% 止损 |",
-            "| `t1_mediocre_close_exit` | T+1 收盘弱势提前离场 |",
+            "| `await_t2_kline` | T+1 已买，等待 T+2 K 线 |",
+            "| `t2_intraday_take_profit_tier1` | T+2 冲高 ≥6% 动态止盈 |",
+            "| `t2_intraday_take_profit_tier2` | T+2 冲高 ≥5% 锁定 +3% |",
+            "| `t2_asymmetric_stop_exit` | 平庸股 T+2 收盘 -4% 止损 |",
+            "| `t2_close_below_stop_limit` | 强势股 T+2 收盘 -6% 止损 |",
             "| `t2_trend_ride_exit` / `t2_close_exit` | T+2 趋势骑乘 / 普通平仓 |",
             "",
             "### 十、复盘对照说明",
@@ -354,8 +353,9 @@ def format_short_term_rules_markdown() -> str:
             "- **入选明细**：`detail_json.checks` 对应趋势、共振、换手、量价等子项。",
             "- **订单表** `short_order_tracker`：`HOLDING` / `CLOSED` / 跳过不入库；"
             "`stop_loss_triggered`、`pnl_ratio`、`exit_reason` 用于复盘统计。",
-            f"- 文案口径持有 **{SHORT_HOLDING_DAYS}** 日；实际平仓日以 "
-            f"`SHORT_SELL_OFFSET={SHORT_SELL_OFFSET}`（{sell_day} 收盘）为准。",
+            f"- 文案口径持有 **{SHORT_HOLDING_DAYS}** 日（T+1 买 → 最早 T+2 卖）；"
+            f"`QUANT_SHORT_SELL_OFFSET={SHORT_SELL_OFFSET}` 控制 T+1 强势时是否启用"
+            f" T+2 趋势骑乘分支（{sell_day} 收盘评估）。",
             "",
             "### 十一、主要环境变量",
             "| 变量 | 含义 | 默认 |",
@@ -363,7 +363,7 @@ def format_short_term_rules_markdown() -> str:
             f"| `QUANT_SHORT_TOP_N` | 每日输出条数 | {SHORT_TOP_N} |",
             f"| `QUANT_SHORT_MIN_MARKET_SCORE` | 大盘环境分下限 | {SHORT_MIN_MARKET_SCORE} |",
             f"| `QUANT_SHORT_MARKET_INDEX` | 锚定指数代码 | {SHORT_MARKET_INDEX_CODE} |",
-            f"| `QUANT_SHORT_SELL_OFFSET` | 1=T+1 平，2=T+2 骑乘 | {SHORT_SELL_OFFSET} |",
+            f"| `QUANT_SHORT_SELL_OFFSET` | 2=强势骑乘分支，1=全走 T+2 收盘 | {SHORT_SELL_OFFSET} |",
             f"| `QUANT_SHORT_CLOSE_STOP` | 强势股收盘止损比例 | {SHORT_CLOSE_STOP_RATIO} |",
             f"| `QUANT_SHORT_MEDIOCRE_STOP` | 平庸股收盘止损比例 | {SHORT_MEDIOCRE_STOP_RATIO} |",
             f"| `QUANT_SHORT_ENTRY_MAX_CHASE` | T+1 最高追高比例 | {SHORT_ENTRY_MAX_CHASE} |",

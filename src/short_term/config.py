@@ -22,8 +22,8 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# 逻辑持有交易日数（文案/钉钉）；实际平仓日见 SHORT_SELL_OFFSET
-SHORT_HOLDING_DAYS = 1
+# 逻辑持有交易日数（文案）；A 股最早 T+2 卖出，实际至少跨 1 个交割夜
+SHORT_HOLDING_DAYS = 2
 
 # 纯日线执行：T 日收盘确认信号，T+1 开盘限价买入；未触发止损时的平仓日偏移
 SHORT_SELL_OFFSET = _env_int_bounded("QUANT_SHORT_SELL_OFFSET", 2, 1, 2)
@@ -46,17 +46,15 @@ SHORT_T1_TAKE_PROFIT_TIER2_LOCK = _env_float("QUANT_SHORT_T1_TP_T2_LOCK", 0.03)
 SHORT_T1_TAKE_PROFIT_PCT = SHORT_T1_TAKE_PROFIT_TIER1_PCT
 # 平庸股（盘中未达第二阶梯）非对称收盘止损
 SHORT_MEDIOCRE_STOP_RATIO = _env_float("QUANT_SHORT_MEDIOCRE_STOP", 0.04)
-# T+1 收盘强势阈值：>= 该比例则延续至 T+2 趋势骑乘；否则 T+1 收盘即平
+# T+1 收盘强势阈值：>= 该比例则 T+2 趋势骑乘（收盘 > T+1 收盘）
 SHORT_T1_STRONG_CLOSE_PCT = _env_float("QUANT_SHORT_T1_STRONG", 0.04)
 
 SHORT_HOLD_PLAN = (
-    f"T 日收盘确认信号 → T+1 非对称入场 "
+    f"T 日收盘确认信号 → T+1 非对称买入 "
     f"[{(1 + SHORT_ENTRY_MIN_GAP) * 100:.0f}%, {(1 + SHORT_ENTRY_MAX_CHASE) * 100:.0f}%] "
-    f"→ T+1 双阶梯止盈（{SHORT_T1_TAKE_PROFIT_TIER2_PCT * 100:.0f}%/"
-    f"{SHORT_T1_TAKE_PROFIT_TIER1_PCT * 100:.0f}%）→ "
-    f"平庸股 -{SHORT_MEDIOCRE_STOP_RATIO * 100:.0f}% / 强势股 -"
-    f"{SHORT_CLOSE_STOP_RATIO * 100:.0f}% 止损 → "
-    f"收盘<{SHORT_T1_STRONG_CLOSE_PCT * 100:.0f}% 则 T+1 离场，否则 T+2 趋势骑乘"
+    f"→ T+2 最早卖出（A股T+1交割）："
+    f"T+2 双阶梯止盈/非对称止损；"
+    f"T+1 收≥{SHORT_T1_STRONG_CLOSE_PCT * 100:.0f}% 且 T+2 续强则收盘骑乘"
 )
 SHORT_TOP_N = _env_int_bounded("QUANT_SHORT_TOP_N", 5, 1, 20)
 

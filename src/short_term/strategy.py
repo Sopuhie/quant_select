@@ -240,7 +240,7 @@ class ShortTermRuleStrategy:
             return "⚠️ J 偏高：仅适合极小仓博弈，严格执行 T+2 开盘离场"
         if chg >= 0.06:
             return "⚠️ 当日涨幅偏大：次日高开若不及预期应果断止损"
-        return "✅ 短线共振成立：T+1 开盘买入，冲高 6% 动态止盈，平庸 T+1 离场，强势 T+2 骑乘"
+        return "✅ 短线共振成立：T+1 开盘买入，T+2 双阶梯止盈/止损，强势 T+2 收盘骑乘"
 
     def scan(
         self,

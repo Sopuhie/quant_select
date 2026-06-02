@@ -16,21 +16,17 @@ from src.short_term.backtest import (
 from src.short_term.execution import ORDER_STATUS_CLOSED
 
 
-def test_resolve_scan_end_date_offset_1():
+def test_resolve_scan_end_date_requires_t2_kline():
     dates = ["2026-05-12", "2026-05-13", "2026-05-14", "2026-05-15"]
-    assert resolve_scan_end_date(dates, sell_offset=1) == "2026-05-14"
-
-
-def test_resolve_scan_end_date_offset_2():
-    dates = ["2026-05-12", "2026-05-13", "2026-05-14", "2026-05-15"]
+    assert resolve_scan_end_date(dates, sell_offset=1) == "2026-05-13"
     assert resolve_scan_end_date(dates, sell_offset=2) == "2026-05-13"
 
 
 def test_summarize_backtest_metrics():
     trades = pd.DataFrame(
         [
-            {"status": ORDER_STATUS_CLOSED, "pnl_ratio": 0.05, "exit_reason": "t1_close_exit"},
-            {"status": ORDER_STATUS_CLOSED, "pnl_ratio": -0.03, "exit_reason": "t1_close_below_stop_limit"},
+            {"status": ORDER_STATUS_CLOSED, "pnl_ratio": 0.05, "exit_reason": "t2_close_exit"},
+            {"status": ORDER_STATUS_CLOSED, "pnl_ratio": -0.03, "exit_reason": "t2_asymmetric_stop_exit"},
         ]
     )
     daily = pd.DataFrame(
@@ -47,7 +43,7 @@ def test_summarize_backtest_metrics():
     assert summary["cum_return_pct"] == pytest.approx(1.0)
 
 
-def test_simulate_short_trade_t1_exit():
+def test_simulate_short_trade_t2_exit():
     conn = sqlite3.connect(":memory:")
     conn.executescript(
         """
@@ -56,7 +52,8 @@ def test_simulate_short_trade_t1_exit():
         );
         INSERT INTO stock_daily_kline VALUES
         ('2026-05-15', '000001', 9.8, 10.0, 9.7, 10.0, 1000),
-        ('2026-05-16', '000001', 10.1, 10.6, 9.8, 10.5, 1000);
+        ('2026-05-16', '000001', 10.1, 10.6, 9.8, 10.5, 1000),
+        ('2026-05-19', '000001', 10.4, 10.54, 10.0, 10.605, 1000);
         """
     )
     with patch(
@@ -70,8 +67,8 @@ def test_simulate_short_trade_t1_exit():
             sell_offset=1,
         )
     assert tr["status"] == ORDER_STATUS_CLOSED
-    assert tr["pnl_ratio"] == 0.05
-    assert tr["exit_reason"] == "t1_close_exit"
+    assert tr["pnl_ratio"] == pytest.approx(0.05, rel=1e-3)
+    assert tr["exit_reason"] == "t2_close_exit"
 
 
 def test_run_short_term_rolling_backtest_with_mock_scan():
@@ -83,8 +80,9 @@ def test_run_short_term_rolling_backtest_with_mock_scan():
         );
         INSERT INTO stock_daily_kline VALUES
         ('2026-05-14', '000001', 9.8, 10.0, 9.7, 10.0, 1000),
-        ('2026-05-15', '000001', 10.0, 10.1, 9.5, 9.4, 1000),
-        ('2026-05-16', '000001', 9.6, 9.8, 9.4, 9.8, 1000);
+        ('2026-05-15', '000001', 10.0, 10.5, 9.8, 10.5, 1000),
+        ('2026-05-16', '000001', 10.4, 10.45, 9.2, 9.35, 1000),
+        ('2026-05-17', '000001', 9.3, 9.4, 9.2, 9.3, 1000);
         """
     )
 
@@ -113,7 +111,7 @@ def test_run_short_term_rolling_backtest_with_mock_scan():
         out = run_short_term_rolling_backtest(
             conn,
             "2026-05-14",
-            "2026-05-15",
+            "2026-05-16",
             top_n=1,
             verbose=False,
         )
