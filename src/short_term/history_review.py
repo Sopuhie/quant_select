@@ -15,6 +15,7 @@ from .db import (
 )
 from .review_prices import calc_t1_buy_t2_sell_return
 from .rules_doc import CHECK_LABELS
+from .trade_guide import build_trade_action_guide
 
 
 def list_short_selection_trade_dates(conn: sqlite3.Connection) -> list[str]:
@@ -159,11 +160,102 @@ def load_short_execution_recap_df(
     return pd.DataFrame(out)
 
 
+def load_short_action_guide_df(
+    conn: sqlite3.Connection,
+    trade_date: str,
+) -> pd.DataFrame:
+    """入选票 T+1 买入 / T+2 卖出·持有操作价位（可直接对照挂单）。"""
+    ensure_short_term_tables(conn)
+    td = str(trade_date).strip()[:10]
+    rows = conn.execute(
+        """
+        SELECT stock_code, stock_name, rank, close_price, detail_json
+        FROM short_daily_selections
+        WHERE trade_date = ?
+        ORDER BY rank
+        """,
+        (td,),
+    ).fetchall()
+
+    out: list[dict[str, Any]] = []
+    for code, name, rank, close_px, dj in rows:
+        guide: dict[str, Any] | None = None
+        if dj:
+            try:
+                payload = json.loads(dj)
+                guide = payload.get("trade_guide")
+            except json.JSONDecodeError:
+                guide = None
+        if not guide and close_px is not None:
+            try:
+                guide = build_trade_action_guide(float(close_px))
+            except (TypeError, ValueError):
+                guide = None
+        disp = (guide or {}).get("display") or {}
+        out.append(
+            {
+                "排名": rank,
+                "代码": str(code).zfill(6),
+                "名称": name,
+                "信号收盘": close_px,
+                "T+1开盘区间": disp.get("T+1开盘区间", "—"),
+                "T+1放弃": disp.get("T+1放弃条件", "—"),
+                "T+2止盈": disp.get("T+2止盈触发", "—"),
+                "T+2止损": disp.get("T+2止损线", "—"),
+                "T+2持有": disp.get("T+2持有条件", "—"),
+                "操作要点": disp.get("操作要点", "—"),
+                "详细说明": (guide or {}).get("summary_text", "—"),
+            }
+        )
+    df = pd.DataFrame(out)
+    if not df.empty and "信号收盘" in df.columns:
+        df["信号收盘"] = pd.to_numeric(df["信号收盘"], errors="coerce").round(2)
+    return df
+
+
+def enrich_selections_with_action_guide(df: pd.DataFrame) -> pd.DataFrame:
+    """为选股表追加操作价位列（无 detail 时按收盘价重算）。"""
+    if df.empty:
+        return df
+    out = df.copy()
+    guide_cols = [
+        "T+1开盘区间",
+        "T+2止盈触发",
+        "T+2止损线",
+        "T+2持有条件",
+        "操作要点",
+    ]
+    for col in guide_cols:
+        if col not in out.columns:
+            out[col] = "—"
+
+    close_col = None
+    for c in ("信号日收盘价", "close_price", "收盘价"):
+        if c in out.columns:
+            close_col = c
+            break
+    if close_col is None:
+        return out
+
+    for idx, row in out.iterrows():
+        if all(str(row.get(c, "—")) not in ("—", "", "nan") for c in guide_cols[:4]):
+            continue
+        try:
+            px = float(row[close_col])
+        except (TypeError, ValueError):
+            continue
+        disp = build_trade_action_guide(px).get("display") or {}
+        for col in guide_cols:
+            if str(out.at[idx, col]) in ("—", "", "nan"):
+                out.at[idx, col] = disp.get(col, "—")
+    return out
+
+
 def format_selections_display_df(df: pd.DataFrame) -> pd.DataFrame:
     """界面展示用格式化（百分比、小数位）。"""
     if df.empty:
         return df
-    out = df.copy()
+    out = enrich_selections_with_action_guide(df.copy())
     if "日涨幅" in out.columns:
         out["日涨幅"] = out["日涨幅"].apply(
             lambda x: f"{float(x) * 100:.2f}%"
@@ -199,6 +291,11 @@ def format_selections_display_df(df: pd.DataFrame) -> pd.DataFrame:
         "J斜率",
         "KDJ_J",
         "MACD柱",
+        "T+1开盘区间",
+        "T+2止盈触发",
+        "T+2止损线",
+        "T+2持有条件",
+        "操作要点",
         "已执行",
         "信号日收盘价",
         "T1开盘价",
@@ -232,6 +329,7 @@ def load_short_review_bundle(
         "trade_date": td,
         "selections": sel,
         "selections_display": format_selections_display_df(sel),
+        "action_guide": load_short_action_guide_df(conn, td),
         "count": len(sel),
         "t1_t2_fill": fill_stats,
     }

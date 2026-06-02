@@ -2259,8 +2259,7 @@ with tab_settings:
 with tab_short:
     st.markdown("### ⚡ 短线规则选股（持有 1 个交易日）")
     st.caption(
-        "T 日收盘确认信号并以收盘价买入（纯日线模拟）；"
-        "T+1 用最低价评估 -3% 硬止损，未触发则按配置在 T+1/T+2 收盘平仓。"
+        "T 日收盘确认信号；T+1 非对称限价买入；A 股 T+1 交割最早 T+2 止盈/止损/收盘卖。"
         "落库 ``short_daily_selections`` + ``short_order_tracker`` + ``short_today.json``。"
         "命令行：``python scripts/run_short_daily.py``；回填复盘：``python scripts/update_short_review.py``。"
     )
@@ -2583,6 +2582,40 @@ with tab_short:
         if _sel_df.empty:
             st.warning(f"{_review_date} 当日无入选记录（可能大盘熔断或规则未命中）。")
         else:
+            st.markdown("#### 📌 T+1 买入 / T+2 卖出·持有（可直接对照）")
+            _action_df = _bundle.get("action_guide")
+            if _action_df is not None and not _action_df.empty:
+                st.dataframe(
+                    _action_df[
+                        [
+                            c
+                            for c in (
+                                "排名",
+                                "代码",
+                                "名称",
+                                "信号收盘",
+                                "T+1开盘区间",
+                                "T+1放弃",
+                                "T+2止盈",
+                                "T+2止损",
+                                "T+2持有",
+                                "操作要点",
+                            )
+                            if c in _action_df.columns
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                with st.expander("展开各票完整操作说明", expanded=False):
+                    for _, _ar in _action_df.iterrows():
+                        st.markdown(
+                            f"**{_ar.get('排名')}. {_ar.get('代码')} {_ar.get('名称')}** "
+                            f"（信号收 {_ar.get('信号收盘')} 元）"
+                        )
+                        st.text(str(_ar.get("详细说明") or "—"))
+                        st.divider()
+            st.markdown("#### 选股明细")
             st.dataframe(_sel_df, use_container_width=True, hide_index=True)
 
 # ----------------- TAB: 🔥 热门题材高爆选股（置于末尾，避免网络同步阻塞其它 Tab）-----------------

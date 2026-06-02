@@ -13,6 +13,7 @@ from src.utils import display_trading_date_for_push
 
 from .config import SHORT_HOLD_PLAN, SHORT_TOP_N
 from .db import ensure_short_term_tables
+from .trade_guide import build_trade_action_guide
 
 
 def _short_push_notification_enabled() -> bool:
@@ -125,15 +126,29 @@ def build_short_selection_markdown(
         meta = " · ".join(parts) if parts else "—"
         advice = str(s.get("advice_text") or "").strip()
         advice_esc = html.escape(advice) if advice else "—"
+        close_px = s.get("close_price")
+        guide_text = ""
+        if close_px is not None:
+            try:
+                guide = build_trade_action_guide(float(close_px))
+                guide_text = html.escape(str(guide.get("summary_text") or ""))
+            except (TypeError, ValueError):
+                guide_text = ""
         lines.append(f"**{rank}. {code} {name}**  ")
         lines.append(f"{meta}  ")
         lines.append(f"> {advice_esc}  ")
+        if guide_text:
+            lines.append("")
+            lines.append("**操作价位**  ")
+            for ln in guide_text.split("\n"):
+                if ln.strip():
+                    lines.append(f"> {ln}  ")
         lines.append("")
 
     footer = (
         "🤖 短线规则模块自动生成  \n"
         f"⏰ 推送时间：{now_s}  \n"
-        "⚠️ 超短线波动大，严格执行 T+2 开盘离场；仅供参考，不构成投资建议"
+        "⚠️ 超短线波动大，T+1 仅买 T+2 卖；按推送价位严格执行止盈/止损；仅供参考，不构成投资建议"
     )
     lines.extend(["---", "", footer])
     return title, "\n".join(lines)

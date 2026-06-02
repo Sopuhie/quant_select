@@ -18,6 +18,7 @@ from src.factor_calculator import is_bar_limit_up, is_bar_suspended
 from src.market_regime import short_term_market_allows_trading
 
 from .board_filter import board_allowed
+from .trade_guide import build_trade_action_guide
 from .config import (
     SHORT_HOLD_PLAN,
     SHORT_EXCLUDE_BJ,
@@ -57,6 +58,11 @@ RESULT_COLUMNS = [
     "KDJ_J",
     "MACD柱",
     "规则得分",
+    "T+1开盘区间",
+    "T+2止盈触发",
+    "T+2止损线",
+    "T+2持有条件",
+    "操作要点",
     "持仓计划",
     "实盘建议",
 ]
@@ -453,6 +459,8 @@ class ShortTermRuleStrategy:
             score = compute_rule_score(
                 chg, vr5, cbar, pbar, j_slope, j_now, candle_body_ratio
             )
+            trade_guide = build_trade_action_guide(c_close)
+            guide_display = trade_guide.get("display") or {}
 
             checks: dict[str, bool] = {
                 "trend_ma": trend_ok,
@@ -477,6 +485,7 @@ class ShortTermRuleStrategy:
             }
             detail = {
                 "checks": checks,
+                "trade_guide": trade_guide,
                 "resonance_count": resonance_n,
                 "resonance_min": _RESONANCE_MIN_PASS,
                 "change_pct": chg,
@@ -520,6 +529,11 @@ class ShortTermRuleStrategy:
                         "KDJ_J": round(j_now, 2),
                         "MACD柱": round(cbar, 4),
                         "规则得分": round(score, 2),
+                        "T+1开盘区间": guide_display.get("T+1开盘区间", "—"),
+                        "T+2止盈触发": guide_display.get("T+2止盈触发", "—"),
+                        "T+2止损线": guide_display.get("T+2止损线", "—"),
+                        "T+2持有条件": guide_display.get("T+2持有条件", "—"),
+                        "操作要点": guide_display.get("操作要点", "—"),
                         "持仓计划": _HOLD_PLAN,
                         "实盘建议": self.advice_text(j_now, chg),
                     },

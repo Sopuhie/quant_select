@@ -148,3 +148,5 @@ def test_build_short_markdown_contains_codes():
     assert "短线" in title
     assert "000001" in text
     assert "平安银行" in text
+    assert "操作价位" in text
+    assert "9.80" in text
