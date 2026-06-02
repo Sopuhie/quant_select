@@ -1,5 +1,30 @@
 {
-  "trade_date": "2026-06-01",
-  "generated_at": "2026-06-01T23:24:32",
-  "stocks": []
+  "trade_date": "2026-06-02",
+  "generated_at": "2026-06-03T00:05:17",
+  "stocks": [
+    {
+      "rank": 1,
+      "code": "000430",
+      "name": "张家界",
+      "close_price": 8.16,
+      "score": 0.9643,
+      "selection_reason": "1. 今日成交量较5日均量显著放量，增量资金正深度建仓突破；2. 60日均线乖离：短期涨幅过大，股价显著偏离均线，存在高位超买与追高回撤风险，请谨慎关注；3. 10日截面动量效应爆发，多头追涨及资金吸筹意愿高涨。"
+    },
+    {
+      "rank": 2,
+      "code": "000755",
+      "name": "山西高速",
+      "close_price": 5.35,
+      "score": 0.8929,
+      "selection_reason": "1. 5日均量超越20日均量，量能温和交织放大，买盘换手充分；2. 量能表现温和平衡，买卖盘力量处于良性交织状态；3. 核心因子 [factor_turnover_stability] 处于截面优势地位。"
+    },
+    {
+      "rank": 3,
+      "code": "000027",
+      "name": "深圳能源",
+      "close_price": 8.02,
+      "score": 0.8571,
+      "selection_reason": "1. 核心因子 [factor_return_1d] 处于截面优势地位；2. 5日均量超越20日均量，量能温和交织放大，买盘换手充分；3. 核心因子 [factor_turnover_stability] 处于截面优势地位。"
+    }
+  ]
 }
