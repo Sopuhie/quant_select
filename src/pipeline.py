@@ -136,7 +136,7 @@ def run_complete_pipeline(
         },
         {
             "name": "4. 每日智能选股",
-            "args": [python_exe, str(SCRIPT_RUN_DAILY)],
+            "args": [python_exe, str(SCRIPT_RUN_DAILY), "--max-stocks", "0"],
         },
         {
             "name": "5. 历史滚动回测",

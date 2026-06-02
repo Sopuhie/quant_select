@@ -69,7 +69,7 @@ def resolve_run_daily_max_stocks(cli_value: int | None) -> int | None:
     """
     每日选股股票池上限：CLI ``--max-stocks`` 优先；
     否则 ``QUANT_RUN_DAILY_MAX_STOCKS``（``0``/``none``/``all``=不限制）；
-    未设环境变量时与 ``MAX_STOCKS_UNIVERSE`` 对齐，保证与训练/回测可比。
+    未设环境变量时默认全库（不限制）；设正整数可单独限制每日选股规模。
     """
     if cli_value is not None:
         return int(cli_value) if int(cli_value) > 0 else None
@@ -77,12 +77,12 @@ def resolve_run_daily_max_stocks(cli_value: int | None) -> int | None:
     if raw in ("0", "none", "all", "unlimited"):
         return None
     if not raw:
-        return int(MAX_STOCKS_UNIVERSE)
+        return None
     try:
         v = int(raw)
         return v if v > 0 else None
     except ValueError:
-        return int(MAX_STOCKS_UNIVERSE)
+        return None
 
 # AkShare HTTP 超时（秒）；超时或失败则跳过该股票，避免长时间卡死
 AKSHARE_REQUEST_TIMEOUT = float(os.environ.get("QUANT_AK_TIMEOUT", "30"))
