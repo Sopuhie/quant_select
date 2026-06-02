@@ -237,7 +237,7 @@ class ShortTermRuleStrategy:
     @staticmethod
     def advice_text(j_now: float, chg: float) -> str:
         if j_now >= _J_OVERBOUGHT_THRESHOLD:
-            return "⚠️ J 偏高：仅适合极小仓博弈，严格执行 T+2 开盘离场"
+            return "⚠️ J 偏高：仅适合极小仓博弈，严格执行 T+2 双阶梯止盈/止损离场"
         if chg >= 0.06:
             return "⚠️ 当日涨幅偏大：次日高开若不及预期应果断止损"
         return "✅ 短线共振成立：T+1 开盘买入，T+2 双阶梯止盈/止损，强势 T+2 收盘骑乘"
