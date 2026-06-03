@@ -64,8 +64,20 @@ SHORT_HIST_LIMIT = int(os.environ.get("QUANT_SHORT_HIST_LIMIT", "120"))
 SHORT_MIN_MARKET_SCORE = int(os.environ.get("QUANT_SHORT_MIN_MARKET_SCORE", "60"))
 # 短线大盘环境分锚定指数（默认中证1000，更贴近小盘/题材非线性环境）
 SHORT_MARKET_INDEX_CODE = str(
-    os.environ.get("QUANT_SHORT_MARKET_INDEX", "000852")
+    os.environ.get("QUANT_SHORT_MARKET_INDEX", "000300")
 ).strip().zfill(6)
+
+
+def short_market_index_label(index_code: str | None = None) -> str:
+    """短线大盘环境分锚定指数的中文名（界面/推送文案）。"""
+    code = str(index_code or SHORT_MARKET_INDEX_CODE).strip().zfill(6)
+    if code == "000852":
+        return "中证1000"
+    if code == "000300":
+        return "沪深300"
+    return code
+
+
 # 指数 N 日动量 > 该阈值才允许扫描（与 MA20 环境分叠加，过滤贴线放行）
 SHORT_MARKET_MOMENTUM_DAYS = int(os.environ.get("QUANT_SHORT_MKT_MOM_DAYS", "5"))
 SHORT_MARKET_MOMENTUM_MIN = _env_float("QUANT_SHORT_MKT_MOM_MIN", 0.0)

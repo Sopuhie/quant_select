@@ -259,7 +259,7 @@ Streamlit → **短线规则选股** Tab：
 |------|------|------|
 | `QUANT_SHORT_TOP_N` | 短线输出条数 | 5 |
 | `QUANT_SHORT_MIN_MARKET_SCORE` | 大盘环境分下限 | 60 |
-| `QUANT_SHORT_MARKET_INDEX` | 锚定指数 | 000852 |
+| `QUANT_SHORT_MARKET_INDEX` | 锚定指数 | 000300 |
 | `QUANT_SHORT_SELL_OFFSET` | 2=强势骑乘分支，1=全走 T+2 收盘 | 2 |
 | `QUANT_SHORT_CLOSE_STOP` | 强势股收盘止损 | 0.06 |
 | `QUANT_SHORT_MEDIOCRE_STOP` | 平庸股收盘止损 | 0.04 |

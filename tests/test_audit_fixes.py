@@ -25,15 +25,18 @@ def test_prev_gain_suppression_default_on(monkeypatch):
     assert cfg.ENABLE_PREV_GAIN_SUPPRESSION is True
 
 
-def test_resolve_run_daily_max_stocks_defaults_to_universe(monkeypatch):
+def test_resolve_run_daily_max_stocks_defaults_to_full_universe(monkeypatch):
     monkeypatch.delenv("QUANT_RUN_DAILY_MAX_STOCKS", raising=False)
     monkeypatch.setenv("QUANT_MAX_STOCKS", "400")
     import importlib
     import src.config as cfg
 
     importlib.reload(cfg)
-    assert cfg.resolve_run_daily_max_stocks(None) == 400
+    assert cfg.resolve_run_daily_max_stocks(None) is None
     assert cfg.resolve_run_daily_max_stocks(100) == 100
+    monkeypatch.setenv("QUANT_RUN_DAILY_MAX_STOCKS", "500")
+    importlib.reload(cfg)
+    assert cfg.resolve_run_daily_max_stocks(None) == 500
     monkeypatch.setenv("QUANT_RUN_DAILY_MAX_STOCKS", "0")
     importlib.reload(cfg)
     assert cfg.resolve_run_daily_max_stocks(None) is None

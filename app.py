@@ -987,7 +987,7 @@ def _render_system_console_tab() -> None:
                     st.error(f"❌ {err_ef}" if err_ef else "❌ 未启动选股。")
                     st.stop()
 
-                cmd = [sys.executable, str(SCRIPT_RUN_DAILY)]
+                cmd = [sys.executable, str(SCRIPT_RUN_DAILY), "--max-stocks", "0"]
                 if include_300:
                     cmd.append("--include-300")
                 if include_688:
@@ -2263,7 +2263,12 @@ with tab_short:
         "落库 ``short_daily_selections`` + ``short_order_tracker`` + ``short_today.json``。"
         "命令行：``python scripts/run_short_daily.py``；回填复盘：``python scripts/update_short_review.py``。"
     )
-    from src.short_term.config import SHORT_MIN_MARKET_SCORE, SHORT_TOP_N
+    from src.short_term.config import (
+        SHORT_MIN_MARKET_SCORE,
+        SHORT_TOP_N,
+        short_market_index_label,
+    )
+    _short_mkt_index_label = short_market_index_label()
     from src.short_term.db import ensure_short_term_tables
     from src.short_term.history_review import (
         list_short_selection_trade_dates,
@@ -2287,7 +2292,7 @@ with tab_short:
     )
     st.caption(
         f"本地最新 K 线日：{_st_kline_date or '—'} · 库内最近短线记录：{_st_saved_date}"
-        f" · 默认 Top {SHORT_TOP_N} · 大盘环境分下限 {SHORT_MIN_MARKET_SCORE}"
+        f" · 默认 Top {SHORT_TOP_N} · {_short_mkt_index_label} 环境分下限 {SHORT_MIN_MARKET_SCORE}"
     )
 
     from src.short_term.rules_doc import (
@@ -2385,7 +2390,7 @@ with tab_short:
                         st.warning("本地 stock_daily_kline 无可用日期，请先同步行情。")
                     elif mkt < SHORT_MIN_MARKET_SCORE:
                         st.warning(
-                            f"📅 {scanned_date} 沪深300 环境分 {mkt} 低于 "
+                            f"📅 {scanned_date} {_short_mkt_index_label} 环境分 {mkt} 低于 "
                             f"{SHORT_MIN_MARKET_SCORE}，本日不出短线信号（已更新库内记录为空）。"
                         )
                     elif n_written == 0:

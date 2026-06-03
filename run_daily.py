@@ -730,8 +730,8 @@ def main() -> None:
         type=int,
         default=None,
         help=(
-            f"最多参与预测的股票数量；默认与训练/回测一致为 {MAX_STOCKS_UNIVERSE} "
-            "（可用 QUANT_RUN_DAILY_MAX_STOCKS=0 恢复全库）"
+            "最多参与预测的股票数量；默认全库不限制（--max-stocks 0 或 QUANT_RUN_DAILY_MAX_STOCKS=0）；"
+            f"训练/回测默认上限仍为 {MAX_STOCKS_UNIVERSE}（QUANT_MAX_STOCKS）"
         ),
     )
     parser.add_argument("--pool", type=str, default=STOCK_POOL)
@@ -820,8 +820,11 @@ def main() -> None:
         print("QUANT_RUN_DAILY_SKIPPED=non_trading_day", flush=True)
         sys.exit(0)
 
-    if not args.quiet and max_stocks is not None:
-        print(f"本次选股股票池上限: {max_stocks} 只（与 QUANT_MAX_STOCKS 训练/回测默认对齐）", flush=True)
+    if not args.quiet:
+        if max_stocks is None:
+            print("本次选股股票池: 全库（无数量上限）", flush=True)
+        else:
+            print(f"本次选股股票池上限: {max_stocks} 只", flush=True)
 
     predict_daily(
         trade_date=target_date,
