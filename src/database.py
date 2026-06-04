@@ -356,6 +356,13 @@ def _ensure_theme_tables(conn: sqlite3.Connection) -> None:
     _ensure_theme(conn)
 
 
+def _ensure_limit_up_hit_tables(conn: sqlite3.Connection) -> None:
+    """打板选股与模拟订单表（``luh_daily_selections`` / ``luh_order_tracker``）。"""
+    from src.limit_up_hit.db import ensure_luh_tables as _ensure_luh
+
+    _ensure_luh(conn)
+
+
 def init_db(db_path: Path | None = None) -> None:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +381,7 @@ def init_db(db_path: Path | None = None) -> None:
         _ensure_performance_indexes(conn)
         _ensure_short_term_tables(conn)
         _ensure_theme_tables(conn)
+        _ensure_limit_up_hit_tables(conn)
         conn.commit()
     finally:
         conn.close()
