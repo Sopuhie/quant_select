@@ -49,7 +49,6 @@ from src.config import (
     SCHEDULER_RUN_AT,
     SCRIPT_BACKTEST,
     SCRIPT_SHORT_TERM_BACKTEST,
-    SCRIPT_LIMIT_UP_BACKTEST,
     SCRIPT_WALKFORWARD_BACKTEST,
     SCRIPT_RUN_DAILY,
     SCRIPT_TRAIN_MODEL,
@@ -1175,7 +1174,6 @@ def _render_system_console_tab() -> None:
     tab_data,
     tab_theme,
     tab_short,
-    tab_limit_up,
     tab_match,
     tab_hist,
     tab_advisor,
@@ -1189,7 +1187,6 @@ def _render_system_console_tab() -> None:
         "⚙️ 系统控制台",
         "🔥 热门题材高爆选股",
         "⚡ 短线规则（1日）",
-        "📈 打板选股",
         "🎨 视觉图形选股",
         "📜 历史与股票K线查询",
         "🔬 智能诊股",
@@ -2626,239 +2623,46 @@ with tab_short:
             st.markdown("#### 选股明细")
             st.dataframe(_sel_df, use_container_width=True, hide_index=True)
 
-# ----------------- TAB: 📈 打板选股（涨停接力，独立模块）-----------------
-with tab_limit_up:
-    st.markdown("### 📈 打板选股（涨停接力 · 纯日线模拟）")
-    st.caption(
-        "T 日收盘涨停封板确认 → T+1 非一字再次封板以涨停价模拟买入 → 最早 T+2 止盈/止损。"
-        "落库 ``luh_daily_selections`` + ``luh_order_tracker`` + ``limit_up_today.json``。"
-        "命令行：``python scripts/run_limit_up_daily.py``。"
-    )
-    from src.limit_up_hit.config import LUH_MIN_MARKET_SCORE, LUH_TOP_N
-    from src.limit_up_hit.db import (
-        ensure_luh_tables,
-        list_luh_selection_trade_dates,
-        load_luh_orders_for_buy_date,
-        load_luh_selections_for_date,
-    )
-    from src.limit_up_hit.display import format_luh_records
-    from src.limit_up_hit.runner import run_limit_up_daily_pipeline
-    from src.limit_up_hit.rules_doc import (
-        format_limit_up_rules_markdown,
-        limit_up_rules_sections,
-    )
-
-    with get_connection(DB_PATH) as _luh_conn:
-        ensure_luh_tables(_luh_conn)
-        _luh_kline_row = _luh_conn.execute(
-            "SELECT MAX(date) FROM stock_daily_kline"
-        ).fetchone()
-        _luh_saved_row = _luh_conn.execute(
-            "SELECT MAX(trade_date) FROM luh_daily_selections"
-        ).fetchone()
-    _luh_kline_date = (
-        str(_luh_kline_row[0]).strip()[:10] if _luh_kline_row and _luh_kline_row[0] else ""
-    )
-    _luh_saved_date = (
-        str(_luh_saved_row[0]).strip()[:10] if _luh_saved_row and _luh_saved_row[0] else "—"
-    )
-    st.caption(
-        f"本地最新 K 线日：{_luh_kline_date or '—'} · 库内最近打板记录：{_luh_saved_date}"
-        f" · 默认 Top {LUH_TOP_N} · 环境分下限 {LUH_MIN_MARKET_SCORE}"
-    )
-
-    with st.expander("📋 打板规则说明（复盘对照）", expanded=False):
-        st.markdown(format_limit_up_rules_markdown())
-        st.dataframe(
-            pd.DataFrame(limit_up_rules_sections()),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    _luh_cb1, _luh_cb2 = st.columns(2)
-    with _luh_cb1:
-        luh_include_300 = st.checkbox(
-            "🟢 包含创业板 (300 / 301)",
-            value=False,
-            key="luh_include_300",
-        )
-    with _luh_cb2:
-        luh_include_688 = st.checkbox(
-            "🔵 包含科创板 (688)",
-            value=False,
-            key="luh_include_688",
-        )
-
-    _luh_run_col, _luh_force_col = st.columns([2, 1])
-    with _luh_run_col:
-        run_luh_scan = st.button(
-            "🚀 运行打板扫描",
-            type="primary",
-            key="run_limit_up_scan",
-        )
-    with _luh_force_col:
-        luh_force = st.checkbox("覆盖当日记录", value=False, key="luh_force_scan")
-
-    if run_luh_scan:
-        with st.spinner("正在扫描全市场涨停封板标的…"):
-            _luh_summary = run_limit_up_daily_pipeline(
-                None,
-                force=luh_force,
-                include_300=luh_include_300,
-                include_688=luh_include_688,
+            _ret_sum = _bundle.get("returns_summary") or {}
+            _returns_df = _bundle.get("returns_display")
+            st.markdown("#### 📈 T1 / T2 收益率")
+            _rs1, _rs2, _rs3, _rs4 = st.columns(4)
+            _rs1.metric(
+                "T1日平均涨幅",
+                f"{float(_ret_sum['avg_t1_return']) * 100:.2f}%"
+                if _ret_sum.get("avg_t1_return") is not None
+                else "—",
             )
-        if _luh_summary.get("error"):
-            st.error(_luh_summary["error"])
-        elif _luh_summary.get("skipped"):
-            st.info(_luh_summary.get("message", "已跳过"))
-        else:
-            _n = int(_luh_summary.get("count") or 0)
-            _td = _luh_summary.get("trade_date")
-            _ms = _luh_summary.get("market_score")
-            if _n == 0:
-                st.info(f"📅 {_td} 暂无满足打板规则的标的（大盘分 {_ms}）。")
-            else:
-                st.success(f"✅ {_td} 打板扫描完成，写入 {_n} 条（大盘分 {_ms}）。")
-            _sig_df = pd.DataFrame(_luh_summary.get("signals") or [])
-            if not _sig_df.empty:
-                st.dataframe(_sig_df, use_container_width=True, hide_index=True)
-            _ord_df = format_luh_records(_luh_summary.get("orders") or [], table="order")
-            if not _ord_df.empty:
-                st.markdown("#### 模拟订单")
-                st.dataframe(_ord_df, use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("### 📈 策略历史滚动回测")
-    st.caption(
-        "对区间内每个交易日重跑打板扫描，默认 **优化回测**：指数20日涨幅>0、涨停家数>50、"
-        "同概念涨停≥3、T+1收盘涨停+滑点买入、收盘止盈/强板续骑（**不写库**）。"
-        "``--legacy`` 或 ``QUANT_LUH_BT_LEGACY=1`` 恢复旧规则。"
-    )
-    from src.limit_up_hit.backtest import (
-        LUH_BACKTEST_DAILY_CSV,
-        LUH_BACKTEST_SUMMARY_JSON,
-    )
-
-    _luh_bt_lo, _luh_bt_hi = _get_kline_date_bounds()
-    _luh_bt_default_start = _luh_bt_lo or "2025-01-01"
-    _luh_bt_default_end = _luh_bt_hi or date.today().isoformat()
-    _luh_btc1, _luh_btc2, _luh_btc3 = st.columns(3)
-    with _luh_btc1:
-        luh_bt_start = st.text_input(
-            "回测开始日",
-            value=_luh_bt_default_start,
-            key="luh_bt_start",
-        )
-    with _luh_btc2:
-        luh_bt_end = st.text_input(
-            "回测结束日",
-            value=_luh_bt_default_end,
-            key="luh_bt_end",
-        )
-    with _luh_btc3:
-        luh_bt_max_scan = st.number_input(
-            "扫描股票上限（0=不限）",
-            min_value=0,
-            max_value=8000,
-            value=0,
-            step=500,
-            key="luh_bt_max_scan",
-        )
-    luh_bt_btn = st.button(
-        "🚀 启动打板策略滚动回测",
-        key="run_limit_up_backtest",
-        use_container_width=True,
-    )
-    if luh_bt_btn:
-        with st.spinner("打板滚动回测执行中（逐日全市场扫描，请耐心等待）…"):
-            _luh_bt_cmd = [
-                sys.executable,
-                str(SCRIPT_LIMIT_UP_BACKTEST),
-                "--start-date",
-                str(luh_bt_start).strip()[:10],
-                "--end-date",
-                str(luh_bt_end).strip()[:10],
-            ]
-            if luh_include_300:
-                _luh_bt_cmd.append("--include-300")
-            if luh_include_688:
-                _luh_bt_cmd.append("--include-688")
-            if int(luh_bt_max_scan) > 0:
-                _luh_bt_cmd.extend(["--max-scan-stocks", str(int(luh_bt_max_scan))])
-            _luh_bt_ret, _luh_bt_log = run_command_interactive(
-                _luh_bt_cmd,
-                task_name="打板策略滚动回测",
+            _rs2.metric(
+                "T2日平均涨幅",
+                f"{float(_ret_sum['avg_t2_return']) * 100:.2f}%"
+                if _ret_sum.get("avg_t2_return") is not None
+                else "—",
             )
-            if _luh_bt_ret == 0:
-                st.success(
-                    f"✅ 回测完成！明细见 {LUH_BACKTEST_DAILY_CSV.parent}"
-                )
-            else:
-                st.error("❌ 回测异常，请查阅上方调试日志")
-
-    if LUH_BACKTEST_SUMMARY_JSON.exists():
-        try:
-            _luh_sum = json.loads(
-                LUH_BACKTEST_SUMMARY_JSON.read_text(encoding="utf-8")
+            _rs3.metric(
+                "T1买T2卖平均",
+                f"{float(_ret_sum['avg_t1_buy_t2_sell']) * 100:.2f}%"
+                if _ret_sum.get("avg_t1_buy_t2_sell") is not None
+                else "—",
             )
-            _luh_sm1, _luh_sm2, _luh_sm3, _luh_sm4 = st.columns(4)
-            _luh_sm1.metric("复利收益", f"{_luh_sum.get('cum_return_pct', '—')}%")
-            _wr = _luh_sum.get("win_rate")
-            _luh_sm2.metric("胜率", f"{_wr * 100:.1f}%" if _wr is not None else "—")
-            _luh_sm3.metric("平仓笔数", _luh_sum.get("closed_trades", "—"))
-            _luh_sm4.metric("最大回撤", f"{_luh_sum.get('max_drawdown_pct', '—')}%")
+            _rs4.metric(
+                "T1买T2卖胜率",
+                f"{float(_ret_sum['win_rate_t1_buy_t2_sell']) * 100:.1f}%"
+                if _ret_sum.get("win_rate_t1_buy_t2_sell") is not None
+                else "—",
+            )
+            _t1_n = int(_ret_sum.get("t1_filled") or 0)
+            _t2_n = int(_ret_sum.get("t2_filled") or 0)
+            _trade_n = int(_ret_sum.get("trade_filled") or 0)
             st.caption(
-                f"区间 {_luh_sum.get('start_date')} ~ {_luh_sum.get('scan_end_date')} · "
-                f"{_luh_sum.get('entry_rule', '')} · {_luh_sum.get('exit_rule', '')}"
+                f"已补齐 T1 收益 {_t1_n}/{_n_sel} 只 · "
+                f"T2 收益 {_t2_n}/{_n_sel} 只 · "
+                f"完整交易链 {_trade_n}/{_n_sel} 只"
             )
-        except Exception:
-            pass
-
-    st.divider()
-    st.markdown("### 📚 历史打板复盘")
-    with get_connection(DB_PATH) as _luh_hist_conn:
-        ensure_luh_tables(_luh_hist_conn)
-        _luh_dates = list_luh_selection_trade_dates(_luh_hist_conn)
-
-    if not _luh_dates:
-        st.info("暂无历史打板记录。请先运行「打板扫描」。")
-    else:
-        _luh_default = _luh_dates[0]
-        if _luh_saved_date and _luh_saved_date in _luh_dates:
-            _luh_default = _luh_saved_date
-        _luh_review_date = st.selectbox(
-            "选择信号日（复盘）",
-            options=_luh_dates,
-            index=_luh_dates.index(_luh_default),
-            key="luh_history_trade_date",
-        )
-        from src.market_regime import compute_market_regime_score
-
-        _luh_mkt = compute_market_regime_score(_luh_review_date)
-        with get_connection(DB_PATH) as _luh_hist_conn:
-            _luh_sels = load_luh_selections_for_date(_luh_hist_conn, _luh_review_date)
-            _luh_orders = load_luh_orders_for_buy_date(_luh_hist_conn, _luh_review_date)
-
-        _m1, _m2, _m3 = st.columns(3)
-        _m1.metric("信号日", _luh_review_date)
-        _m2.metric("大盘环境分", _luh_mkt)
-        _m3.metric("入选数量", len(_luh_sels))
-
-        if not _luh_sels:
-            st.warning(f"{_luh_review_date} 当日无打板入选记录。")
-        else:
-            st.dataframe(
-                format_luh_records(_luh_sels, table="selection"),
-                use_container_width=True,
-                hide_index=True,
-            )
-        if _luh_orders:
-            st.markdown("#### 模拟订单")
-            st.dataframe(
-                format_luh_records(_luh_orders, table="order"),
-                use_container_width=True,
-                hide_index=True,
-            )
+            if _returns_df is not None and not _returns_df.empty:
+                st.dataframe(_returns_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("T1/T2 K 线尚未到齐，收益率待本地行情补齐后自动计算。")
 
 # ----------------- TAB: 🔥 热门题材高爆选股（置于末尾，避免网络同步阻塞其它 Tab）-----------------
 with tab_theme:

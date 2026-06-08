@@ -7,7 +7,12 @@ import pandas as pd
 import pytest
 
 from src.short_term.dingtalk import build_short_selection_markdown
-from src.short_term.history_review import format_selections_display_df
+from src.short_term.history_review import (
+    build_returns_display_df,
+    format_returns_display_df,
+    format_selections_display_df,
+    summarize_short_returns,
+)
 from src.short_term.review_prices import (
     calc_t1_day_return,
     calc_t2_day_return,
@@ -92,6 +97,47 @@ def test_format_selections_display_includes_t1_t2_pct():
     assert "T1日涨幅" in disp.columns
     assert disp.loc[0, "T1日涨幅"] == "5.00%"
     assert "T2日涨幅" in disp.columns
+
+
+def test_returns_display_and_summary():
+    raw = pd.DataFrame(
+        {
+            "排名": [1, 2],
+            "股票代码": ["000001", "000002"],
+            "股票名称": ["A", "B"],
+            "信号日收盘价": [10.0, 20.0],
+            "T1开盘价": [10.1, 19.5],
+            "T1收盘价": [10.5, 19.0],
+            "T2收盘价": [11.0, 20.0],
+            "T1日涨幅": [0.05, -0.05],
+            "T2日涨幅": [(11.0 - 10.5) / 10.5, (20.0 - 19.0) / 19.0],
+            "T1买T2卖涨跌幅": [0.089, 0.026],
+        }
+    )
+    summary = summarize_short_returns(raw)
+    assert summary["count"] == 2
+    assert summary["t1_filled"] == 2
+    assert summary["win_rate_t1_buy_t2_sell"] == 1.0
+    assert summary["avg_t1_return"] == pytest.approx(0.0)
+
+    disp = format_returns_display_df(raw)
+    assert disp.loc[0, "T1日涨幅"] == "5.00%"
+    assert disp.loc[0, "T1买T2卖涨跌幅"] == "8.90%"
+    assert "代码" in disp.columns
+    assert "信号收盘" in disp.columns
+
+    exec_df = pd.DataFrame(
+        {
+            "代码": ["000001"],
+            "盈亏": ["8.90%"],
+            "订单状态": ["CLOSED"],
+            "退出原因": ["t2_close_exit"],
+        }
+    )
+    merged = build_returns_display_df(raw, exec_df)
+    assert "盈亏" in merged.columns
+    assert merged.loc[0, "盈亏"] == "8.90%"
+    assert merged.loc[1, "盈亏"] == "—"
 
 
 def test_resolve_t1_t2_dates_chain():

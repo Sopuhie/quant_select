@@ -6,7 +6,6 @@
 |------|------|------|
 | **中长线智能选股** | LightGBM / XGB / CatBoost + Meta 融合，输出 TopN 推荐 | `train_model.py` / `run_daily.py` |
 | **短线规则选股** | 纯日线技术共振 + 模拟买卖，默认 Top 5 | `scripts/run_short_daily.py` |
-| **打板选股** | 涨停封板确认 + T+1 打板买入 + T+2 止盈止损模拟 | `scripts/run_limit_up_daily.py` |
 | **Web 控制台** | Streamlit 一键同步、训练、选股、复盘 | `streamlit run app.py` |
 
 > **免责声明**：本项目仅供学习与研究，不涉及实盘下单，不构成任何投资建议。
@@ -34,21 +33,12 @@
 - `final_score` 非线性打分排序，默认输出 **Top 5**
 - 历史信号日下拉复盘，自动补齐 T1/T2 开收盘价与 **T1买→T2卖涨跌幅**
 
-### 打板（涨停接力，纯日线）
-
-- **信号日 T**：收盘涨停且封板质量达标（收盘贴近最高价、实体比过滤）
-- **T+1 打板买入**：非一字且 T+1 再次收盘涨停 → 以理论涨停价模拟成交；一字板跳过
-- **T+2 卖出**：双阶梯止盈（10% / 6%）+ 收盘止损 7%；连板续强可骑乘
-- 连板高度 + 封板强度 + 换手/成交额综合打分，默认 Top 5
-- 独立表 ``luh_daily_selections`` / ``luh_order_tracker``，不影响中长线与短线模块
-
 ### 控制台（Streamlit）
 
 - 任务 A：全量/增量行情同步  
 - 任务 B：模型训练  
 - 任务 C：每日智能选股（可勾选创业板/科创板）  
 - 短线规则 Tab：扫描、历史复盘、规则说明  
-- **打板选股 Tab**：涨停扫描、历史复盘、规则说明  
 - 热门题材规则选股、形态相似度扫描等  
 
 ---
@@ -130,24 +120,6 @@ python scripts/run_short_daily.py --include-300 --include-688
 
 产出：`short_today.json`、`short_daily_selections`、`short_order_tracker`。
 
-### 5b. 打板选股
-
-```bash
-python scripts/run_limit_up_daily.py --force
-python scripts/run_limit_up_daily.py --trade-date 2026-05-21
-python scripts/run_limit_up_daily.py --include-300 --include-688
-```
-
-产出：`limit_up_today.json`、`luh_daily_selections`、`luh_order_tracker`。
-
-打板历史回测（T+1 开盘价买；T+2 起一字续骑，开板日开盘价卖）：
-
-```bash
-python scripts/limit_up_backtest.py --start-date 2025-01-01 --end-date 2025-12-31
-```
-
-产出：`data/limit_up_backtest_trades.csv`、`limit_up_backtest_summary.json`。
-
 ### 6. 打开 Web 复盘
 
 ```bash
@@ -166,7 +138,6 @@ quant_select/
 ├── run_daily.py                # 中长线每日选股
 ├── today.json                  # 最近一次中长线 TopN 摘要
 ├── short_today.json            # 最近一次短线 TopN 摘要
-├── limit_up_today.json         # 最近一次打板 TopN 摘要
 ├── config.json.example         # 钉钉 / 经验风控 / 回测费率模板
 ├── data/
 │   └── stocks.db               # SQLite 主库（自动创建）
@@ -179,7 +150,6 @@ quant_select/
 │   ├── backtest.py             # 历史回测
 │   ├── walkforward_backtest.py # 滚动重训回测
 │   ├── run_short_daily.py      # 短线每日扫描
-│   ├── run_limit_up_daily.py   # 打板每日扫描
 │   ├── update_short_review.py   # 短线 T1/T2 复盘价 + 订单重估
 │   └── repair_short_schema.py  # 旧库短线表结构修复
 └── src/
@@ -196,14 +166,6 @@ quant_select/
         ├── review_prices.py    # T1/T2 复盘价
         ├── history_review.py   # 历史复盘查询
         └── rules_doc.py        # 界面规则说明文案
-    └── limit_up_hit/           # 打板独立模块
-        ├── strategy.py         # 涨停扫描与打分
-        ├── execution.py        # T+1 打板买入 / T+2 卖出
-        ├── runner.py           # 跑批入口
-        ├── db.py               # 打板表与落库
-        ├── backtest.py         # T+1开买/T+2开卖滚动回测
-        ├── display.py          # 表格列名中文化
-        └── rules_doc.py        # 界面规则说明
 ```
 
 ---
@@ -226,13 +188,6 @@ quant_select/
 |------|------|
 | `short_daily_selections` | 信号日选股结果（含 `final_score`、T1/T2 价、T1买T2卖涨跌幅等） |
 | `short_order_tracker` | 模拟订单（买入价、平仓价、止损标记、`exit_reason`） |
-
-### 打板专用
-
-| 表名 | 用途 |
-|------|------|
-| `luh_daily_selections` | 信号日涨停选股（连板数、封板强度、打板得分、T1/T2 价） |
-| `luh_order_tracker` | 打板模拟订单（T+1 涨停价买入、T+2 平仓、`exit_reason`） |
 
 `init_db()` 会自动创建/迁移上述表结构（旧库可通过 `python scripts/repair_short_schema.py` 修复）。
 
@@ -312,19 +267,6 @@ Streamlit → **短线规则选股** Tab：
 | `QUANT_SHORT_VOL_RATIO_CLIP` | 量比上限 | 10 |
 | `QUANT_SHORT_MIN_BARS` | 最少历史 K 线根数 | 35 |
 
-### 打板环境变量（`src/limit_up_hit/config.py`）
-
-| 变量 | 含义 | 默认 |
-|------|------|------|
-| `QUANT_LUH_TOP_N` | 打板输出条数 | 5 |
-| `QUANT_LUH_MIN_MARKET_SCORE` | 大盘环境分下限（已放宽） | **20** |
-| `QUANT_LUH_MARKET_INDEX` | 锚定指数 | 000852 |
-| `QUANT_LUH_BT_SLIPPAGE` | 回测买入滑点 | 0.005 |
-| `QUANT_LUH_BT_MIN_LIMIT_UP` | 全市场涨停家数下限 | 50 |
-| `QUANT_LUH_BT_MIN_CONCEPT_LU` | 同概念涨停数下限 | 3 |
-| `QUANT_LUH_BT_LEGACY` | `1` 恢复旧版回测 | 0 |
-| `QUANT_LUH_T2_STOP` | T+2 收盘止损比例 | 0.07 |
-
 ---
 
 ## 钉钉通知
@@ -372,8 +314,6 @@ python scripts/walkforward_backtest.py --start-date 2025-01-01 --end-date 2025-0
 | `python scripts/update_returns.py` | 回填中长线推荐事后收益 |
 | `python scripts/update_short_review.py` | 回填短线 T1/T2 价并重估 HOLDING 订单 |
 | `python scripts/repair_short_schema.py` | 修复旧库短线表缺少新列 |
-| `python scripts/run_limit_up_daily.py` | 打板涨停扫描与模拟买卖 |
-| `python scripts/limit_up_backtest.py` | 打板滚动回测（T+1开买/一字续骑/开板卖） |
 | `python -m pytest tests/ -q` | 运行单元测试 |
 
 ---

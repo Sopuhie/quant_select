@@ -6,6 +6,7 @@ import json
 import sqlite3
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .db import (
@@ -16,6 +17,136 @@ from .db import (
 from .review_prices import calc_t1_buy_t2_sell_return
 from .rules_doc import CHECK_LABELS
 from .trade_guide import build_trade_action_guide
+
+
+def _fmt_pct(x: Any) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "—"
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    if not np.isfinite(v):
+        return "—"
+    if abs(v) < 2:
+        return f"{v * 100:.2f}%"
+    return f"{v:.2f}%"
+
+
+def summarize_short_returns(df: pd.DataFrame) -> dict[str, Any]:
+    """从 ``load_short_selections_df`` 结果汇总 T1/T2 收益率。"""
+    out: dict[str, Any] = {
+        "count": len(df),
+        "t1_filled": 0,
+        "t2_filled": 0,
+        "trade_filled": 0,
+        "avg_t1_return": None,
+        "avg_t2_return": None,
+        "avg_t1_buy_t2_sell": None,
+        "win_rate_t1_buy_t2_sell": None,
+    }
+    if df.empty:
+        return out
+    for col, key in (
+        ("T1日涨幅", "t1_filled"),
+        ("T2日涨幅", "t2_filled"),
+        ("T1买T2卖涨跌幅", "trade_filled"),
+    ):
+        if col in df.columns:
+            out[key] = int(pd.to_numeric(df[col], errors="coerce").dropna().shape[0])
+    for col, avg_key in (
+        ("T1日涨幅", "avg_t1_return"),
+        ("T2日涨幅", "avg_t2_return"),
+        ("T1买T2卖涨跌幅", "avg_t1_buy_t2_sell"),
+    ):
+        if col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(s):
+                out[avg_key] = float(s.mean())
+    if "T1买T2卖涨跌幅" in df.columns:
+        s = pd.to_numeric(df["T1买T2卖涨跌幅"], errors="coerce").dropna()
+        if len(s):
+            out["win_rate_t1_buy_t2_sell"] = float((s > 0).sum() / len(s))
+    return out
+
+
+def build_returns_display_df(
+    sel: pd.DataFrame,
+    exec_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """入选票 T1/T2 收益率专表（含可选模拟执行盈亏）。"""
+    if sel.empty:
+        return pd.DataFrame()
+    base_cols = [
+        "排名",
+        "股票代码",
+        "股票名称",
+        "信号日收盘价",
+        "T1开盘价",
+        "T1收盘价",
+        "T1日涨幅",
+        "T2开盘价",
+        "T2收盘价",
+        "T2日涨幅",
+        "T1买T2卖涨跌幅",
+    ]
+    out = sel[[c for c in base_cols if c in sel.columns]].copy()
+    if exec_df is not None and not exec_df.empty and "代码" in exec_df.columns:
+        extra = exec_df[
+            [c for c in ("代码", "盈亏", "订单状态", "退出原因") if c in exec_df.columns]
+        ].copy()
+        out["_merge_code"] = out["股票代码"].astype(str).str.zfill(6)
+        extra["代码"] = extra["代码"].astype(str).str.zfill(6)
+        out = out.merge(extra, left_on="_merge_code", right_on="代码", how="left")
+        out = out.drop(columns=["_merge_code", "代码"], errors="ignore")
+    return format_returns_display_df(out)
+
+
+def format_returns_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    """T1/T2 收益率界面展示用格式化。"""
+    if df.empty:
+        return df
+    rename = {
+        "股票代码": "代码",
+        "股票名称": "名称",
+        "信号日收盘价": "信号收盘",
+        "T1开盘价": "T1开盘",
+        "T1收盘价": "T1收盘",
+        "T2开盘价": "T2开盘",
+        "T2收盘价": "T2收盘",
+    }
+    out = df.rename(columns=rename)
+    for pct_col in ("T1日涨幅", "T2日涨幅", "T1买T2卖涨跌幅"):
+        if pct_col in out.columns:
+            out[pct_col] = out[pct_col].apply(_fmt_pct)
+    for col in ("信号收盘", "T1开盘", "T1收盘", "T2开盘", "T2收盘"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+    for col in ("盈亏", "订单状态", "退出原因"):
+        if col in out.columns:
+            out[col] = out[col].apply(
+                lambda x: "—"
+                if x is None or (isinstance(x, float) and pd.isna(x))
+                or str(x).strip() in ("", "nan", "None")
+                else str(x)
+            )
+    order = [
+        "排名",
+        "代码",
+        "名称",
+        "信号收盘",
+        "T1开盘",
+        "T1收盘",
+        "T1日涨幅",
+        "T2开盘",
+        "T2收盘",
+        "T2日涨幅",
+        "T1买T2卖涨跌幅",
+        "盈亏",
+        "订单状态",
+        "退出原因",
+    ]
+    return out[[c for c in order if c in out.columns]]
 
 
 def list_short_selection_trade_dates(conn: sqlite3.Connection) -> list[str]:
@@ -325,10 +456,14 @@ def load_short_review_bundle(
 
         fill_stats = auto_fill_review_prices(conn, td, commit=True)
     sel = load_short_selections_df(conn, td)
+    exec_recap = load_short_execution_recap_df(conn, td)
     return {
         "trade_date": td,
         "selections": sel,
         "selections_display": format_selections_display_df(sel),
+        "returns_display": build_returns_display_df(sel, exec_recap),
+        "returns_summary": summarize_short_returns(sel),
+        "execution_recap": exec_recap,
         "action_guide": load_short_action_guide_df(conn, td),
         "count": len(sel),
         "t1_t2_fill": fill_stats,
