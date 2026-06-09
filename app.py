@@ -54,7 +54,6 @@ from src.config import (
     SCRIPT_TRAIN_MODEL,
     SCRIPT_UPDATE_LOCAL_DATA,
     SCRIPT_UPDATE_RETURNS,
-    TOP_N_SELECTION,
     get_experience_thresholds,
 )
 from src.config_manager import config_manager
@@ -470,26 +469,33 @@ st.markdown(
 )
 
 
-def _latest_top3() -> pd.DataFrame:
+def _latest_short_recommendations() -> pd.DataFrame:
+    """最近信号日短线规则选股（``short_daily_selections``）。"""
     return query_df(
         """
-        SELECT trade_date, rank, stock_code, stock_name, score, close_price,
-               next_day_return, hold_5d_return, selection_reason
-        FROM daily_selections
-        WHERE trade_date = (SELECT MAX(trade_date) FROM daily_selections)
+        SELECT trade_date, rank, stock_code, stock_name,
+               COALESCE(final_score, rule_score) AS score,
+               close_price, advice_text AS selection_reason,
+               hold_plan
+        FROM short_daily_selections
+        WHERE trade_date = (SELECT MAX(trade_date) FROM short_daily_selections)
         ORDER BY rank ASC
         """
     )
 
 
-def _sanitize_latest_selection(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def _sanitize_latest_selection(
+    df: pd.DataFrame,
+    *,
+    max_n: int,
+) -> tuple[pd.DataFrame, list[str]]:
     msgs: list[str] = []
     if df.empty:
         return df, msgs
 
-    out = df[df["rank"].isin(range(1, TOP_N_SELECTION + 1))].copy()
+    out = df[df["rank"].isin(range(1, max_n + 1))].copy()
     if len(out) < len(df):
-        msgs.append("部分记录的 rank 不在 1–3，已从今日推荐展示中排除。")
+        msgs.append(f"部分记录的 rank 不在 1–{max_n}，已从今日推荐展示中排除。")
 
     before = len(out)
     out = out.sort_values("score", ascending=False).drop_duplicates(
@@ -499,11 +505,9 @@ def _sanitize_latest_selection(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str
     if len(out) < before:
         msgs.append("检测到同一 rank 对应多只股票，已保留该 rank 下 score 较高的一条。")
 
-    if len(out) > TOP_N_SELECTION:
-        msgs.append(
-            f"检测到超过 {TOP_N_SELECTION} 条有效记录，仅展示前 {TOP_N_SELECTION} 条。"
-        )
-        out = out.head(TOP_N_SELECTION).reset_index(drop=True)
+    if len(out) > max_n:
+        msgs.append(f"检测到超过 {max_n} 条有效记录，仅展示前 {max_n} 条。")
+        out = out.head(max_n).reset_index(drop=True)
 
     return out, msgs
 
@@ -557,8 +561,8 @@ def render_static_summary_card(row: pd.Series, *, col_index: int = 0) -> None:
   </div>
   <div style="font-family:Georgia,'Noto Serif SC','Times New Roman',serif;font-size:1.85rem;font-weight:800;color:#0f172a;letter-spacing:0.04em;">{code}</div>
   <div style="color:#64748b;font-size:0.88rem;margin:6px 0 14px 0;">{html.escape(name)}</div>
-  <div style="display:flex;justify-content:space-around;border-top:1px solid #f1f5f9;padding-top:12px;font-size:0.82rem;color:#64748b;">
-    <div><div style="color:#94a3b8;margin-bottom:2px;">得分</div><div style="font-family:monospace;font-weight:700;color:#0d9488;font-size:1.05rem;">{sc_s}</div></div>
+    <div style="display:flex;justify-content:space-around;border-top:1px solid #f1f5f9;padding-top:12px;font-size:0.82rem;color:#64748b;">
+    <div><div style="color:#94a3b8;margin-bottom:2px;">规则得分</div><div style="font-family:monospace;font-weight:700;color:#0d9488;font-size:1.05rem;">{sc_s}</div></div>
     <div><div style="color:#94a3b8;margin-bottom:2px;">收盘价</div><div style="font-family:monospace;font-weight:700;color:#0f172a;font-size:1.05rem;">{px_s}</div></div>
   </div>
   {reason_html}
@@ -1205,15 +1209,25 @@ with tab_data:
         st.error("⚙️ 系统控制台加载失败，请将下方错误信息反馈给开发者或重启 Streamlit。")
         st.exception(_tab_data_exc)
 
-# ----------------- TAB 1: 今日推荐 -----------------
+# ----------------- TAB 1: 今日推荐（短线规则选股）-----------------
 with tab_today:
-    t3 = _latest_top3()
-    today_df, selection_warnings = _sanitize_latest_selection(t3)
+    from src.short_term.config import SHORT_TOP_N
+    from src.short_term.db import fetch_short_selections_for_monitor
+
+    t3 = _latest_short_recommendations()
+    today_df, selection_warnings = _sanitize_latest_selection(t3, max_n=SHORT_TOP_N)
     if t3.empty:
-        st.info("暂无选股记录。请先在「系统控制台」中运行数据更新与预测。")
+        st.info(
+            "暂无短线选股记录。请先在「⚡ 短线规则（1日）」Tab 运行扫描，"
+            "或执行 ``python scripts/run_short_daily.py --force``。"
+        )
     else:
         latest_date = t3.iloc[0]["trade_date"]
-        st.subheader(f"📅 最近交易日 · {latest_date}")
+        st.subheader(f"📅 最近信号日 · {latest_date}")
+        st.caption(
+            f"数据来源：短线规则模块 Top {SHORT_TOP_N} · "
+            "T 日收盘确认信号，T+1 买入 / T+2 卖出（详见短线 Tab 操作指引）。"
+        )
 
         for w in selection_warnings:
             st.warning(w)
@@ -1228,31 +1242,31 @@ with tab_today:
             ctl_l, ctl_r = st.columns([3, 2])
             with ctl_l:
                 st.caption(
-                    "关闭右侧开关：**静态复盘**三列卡片；开启后切换为 **实盘信号** 纵向大图，两模块互斥。"
+                    "关闭右侧开关：**静态复盘**卡片；开启后切换为 **实盘信号** 纵向大图，两模块互斥。"
                 )
             with ctl_r:
                 st.toggle(
                     "⚡ 临场实盘监控",
                     key="realtime_mode",
-                    help="开启后进入实盘大图模式；关闭后仅显示最近交易日三列静态卡。",
+                    help="开启后进入实盘大图模式；关闭后仅显示最近信号日静态卡。",
                 )
 
             if not st.session_state.get("realtime_mode", False):
                 st.markdown(
-                    '<div class="quant-section-heading">📅 最近交易日推荐</div>',
+                    '<div class="quant-section-heading">⚡ 短线规则推荐</div>',
                     unsafe_allow_html=True,
                 )
-                hist_cols = st.columns(3)
-                for i in range(3):
+                n_show = len(today_df)
+                hist_cols = st.columns(n_show)
+                for i in range(n_show):
                     with hist_cols[i]:
-                        if i < len(today_df):
-                            render_static_summary_card(today_df.iloc[i], col_index=i)
+                        render_static_summary_card(today_df.iloc[i], col_index=i)
             else:
                 st.markdown(
                     '<div class="quant-section-heading">⚡ 实盘信号动态监控</div>',
                     unsafe_allow_html=True,
                 )
-                from src.realtime_monitor import run_top3_monitor_cycle
+                from src.realtime_monitor import run_monitor_cycle_for_targets
                 from src.utils import is_a_share_intraday_session
 
                 in_session = is_a_share_intraday_session()
@@ -1281,17 +1295,22 @@ with tab_today:
                         "当前非连续竞价时段：暂停写入新信号；仍可查看分时与已入库买点（若有数据）。"
                     )
 
-                panels = run_top3_monitor_cycle(
-                    persist=in_session,
-                    allow_off_session_display=not in_session,
-                )
-                if not panels:
-                    st.warning("暂无 Top3 选股数据，无法渲染监控面板。")
+                targets = fetch_short_selections_for_monitor()
+                if not targets:
+                    st.warning("暂无短线推荐数据，无法渲染监控面板。")
                 else:
-                    for panel in panels:
-                        render_realtime_monitor_panel(panel, in_session=in_session)
-                    del panels
-                    gc.collect()
+                    panels = run_monitor_cycle_for_targets(
+                        targets,
+                        persist=in_session,
+                        allow_off_session_display=not in_session,
+                    )
+                    if not panels:
+                        st.warning("暂无短线推荐数据，无法渲染监控面板。")
+                    else:
+                        for panel in panels:
+                            render_realtime_monitor_panel(panel, in_session=in_session)
+                        del panels
+                        gc.collect()
 
         if not t3.empty and st.session_state.selected_stock:
             st.markdown("---")

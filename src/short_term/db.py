@@ -577,3 +577,43 @@ def load_short_orders_for_buy_date(
     )
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def fetch_short_selections_for_monitor(
+    conn: sqlite3.Connection | None = None,
+    trade_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """最新信号日短线 TopN（实盘监控用，字段对齐 ``fetch_top3_selections_for_monitor``）。"""
+    from .config import SHORT_TOP_N
+
+    def _fetch(c: sqlite3.Connection) -> list[dict[str, Any]]:
+        ensure_short_term_tables(c)
+        td = str(trade_date).strip()[:10] if trade_date else ""
+        if not td:
+            row = c.execute(
+                "SELECT MAX(trade_date) FROM short_daily_selections"
+            ).fetchone()
+            if row is None or row[0] is None:
+                return []
+            td = str(row[0]).strip()[:10]
+        cur = c.execute(
+            """
+            SELECT rank, stock_code, stock_name,
+                   COALESCE(final_score, rule_score) AS score,
+                   close_price
+            FROM short_daily_selections
+            WHERE trade_date = ? AND rank BETWEEN 1 AND ?
+            ORDER BY rank ASC
+            """,
+            (td, int(SHORT_TOP_N)),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    if conn is not None:
+        return _fetch(conn)
+    from src.config import DB_PATH
+    from src.database import get_connection
+
+    with get_connection(DB_PATH) as c:
+        return _fetch(c)
