@@ -1,22 +1,5 @@
 {
-  "trade_date": "2026-06-15",
-  "generated_at": "2026-06-15T21:43:27",
-  "stocks": [
-    {
-      "rank": 1,
-      "code": "000519",
-      "name": "中兵红箭",
-      "close_price": 19.56,
-      "score": 0.6,
-      "selection_reason": "1. 核心因子 [factor_turnover_stability] 处于截面优势地位；2. 核心因子 [factor_return_1d] 处于截面优势地位；3. 量能表现温和平衡，买卖盘力量处于良性交织状态。"
-    },
-    {
-      "rank": 2,
-      "code": "000021",
-      "name": "深科技",
-      "close_price": 39.47,
-      "score": 0.4,
-      "selection_reason": "1. 核心因子 [factor_momentum_10d] 处于截面优势地位；2. 核心因子 [factor_return_1d] 处于截面优势地位；3. 现价处于一年高低区间中的相对位置，偏高表示中期趋势底色较强。"
-    }
-  ]
+  "trade_date": "2026-08-04",
+  "generated_at": "2026-08-04T20:22:20",
+  "stocks": []
 }
